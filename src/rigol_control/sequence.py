@@ -1,10 +1,46 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Generic, Sequence, TypeVar
 
 
 T = TypeVar("T")
+MAX_SCAN_POINTS = 10_000
+
+
+def linear_scan_points(
+    start: float,
+    step: float,
+    point_count: int,
+    *,
+    maximum: int = MAX_SCAN_POINTS,
+) -> tuple[float, ...]:
+    """Build an inclusive-start linear scan without binary-float accumulation."""
+
+    if isinstance(point_count, bool) or not isinstance(point_count, int):
+        raise ValueError("扫描点数必须是整数")
+    if point_count < 1:
+        raise ValueError("扫描点数至少为 1")
+    if point_count > maximum:
+        raise ValueError(f"扫描点数不能超过 {maximum}")
+    try:
+        start_decimal = Decimal(str(start))
+        step_decimal = Decimal(str(step))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("扫描起点和步长必须是有效数值") from exc
+    if not start_decimal.is_finite() or not step_decimal.is_finite():
+        raise ValueError("扫描起点和步长必须是有限数值")
+
+    points: list[float] = []
+    for index in range(point_count):
+        value = start_decimal + step_decimal * index
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"第 {index + 1} 个扫描点超出可表示范围")
+        points.append(number)
+    return tuple(points)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,4 +81,3 @@ class CyclicSequence(Generic[T]):
         if applied_count > received_count:
             raise ValueError("已下发计数不能大于已接收触发计数")
         return [self.for_trigger(number) for number in range(applied_count + 1, received_count + 1)]
-

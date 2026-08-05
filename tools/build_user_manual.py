@@ -241,7 +241,7 @@ def cover_story(style_map):
         feature_table,
         Spacer(1, 13 * mm),
         Table(
-            [[Paragraph("版本 0.2.0", small), Paragraph("2026-08-05", small)]],
+            [[Paragraph("版本 0.2.1", small), Paragraph("2026-08-05", small)]],
             colWidths=[80 * mm, 80 * mm],
             style=TableStyle([("ALIGN", (1, 0), (1, 0), "RIGHT")]),
         ),
@@ -454,7 +454,7 @@ def draw_header_footer(canvas, document) -> None:
         canvas.drawString(MARGIN_X, PAGE_HEIGHT - 9.3 * mm, "DG4000 + NI 多设备联动控制软件使用说明")
     canvas.setFont("CN", 7.5)
     canvas.setFillColor(MUTED)
-    canvas.drawString(MARGIN_X, 8 * mm, "版本 0.2.0")
+    canvas.drawString(MARGIN_X, 8 * mm, "版本 0.2.1")
     canvas.drawRightString(PAGE_WIDTH - MARGIN_X, 8 * mm, f"第 {page} 页")
     canvas.restoreState()
 

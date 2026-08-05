@@ -100,7 +100,7 @@ class DeviceCenterWindow(QMainWindow):
         path.setToolTip(f"保存位置：{self.repository.path}")
         footer.addWidget(path)
         footer.addStretch()
-        version = QLabel("DG4000 + NI 联动控制 · v0.2")
+        version = QLabel("DG4000 + NI 联动控制 · v0.2.1")
         version.setObjectName("Muted")
         footer.addWidget(version)
         outer.addLayout(footer)

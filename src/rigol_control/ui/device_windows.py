@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -33,6 +34,7 @@ from ..drivers.dg4000 import BasicWaveform, DG4000Driver, StepParameter
 from ..drivers.ni_counter import NIDaqEdgeCounter
 from ..drivers.scpi import ScpiSession
 from ..models import DeviceKind, DeviceRecord
+from ..sequence import MAX_SCAN_POINTS, linear_scan_points
 from ..services import DeviceProbeService, ProbeResult, ProbeState
 from ..trigger import ControllerState, TriggerSnapshot, TriggerStepController
 from ..virtual_lab import is_virtual_resource
@@ -70,6 +72,23 @@ def value_spin(value: float, minimum: float, maximum: float, suffix: str, decima
     control = QDoubleSpinBox()
     control.setDecimals(decimals)
     control.setRange(minimum, maximum)
+    control.setValue(value)
+    control.setSuffix(f" {suffix}")
+    control.setKeyboardTracking(False)
+    return control
+
+
+class CompactDoubleSpinBox(QDoubleSpinBox):
+    """Keep high edit precision without filling the UI with trailing zeroes."""
+
+    def textFromValue(self, value: float) -> str:
+        return f"{value:.12g}"
+
+
+def scan_value_spin(value: float, suffix: str) -> CompactDoubleSpinBox:
+    control = CompactDoubleSpinBox()
+    control.setDecimals(9)
+    control.setRange(-1e15, 1e15)
     control.setValue(value)
     control.setSuffix(f" {suffix}")
     control.setKeyboardTracking(False)
@@ -620,6 +639,7 @@ class DG4000Window(BaseDeviceWindow):
         form.addRow("PFI 触发端子", self.step_terminal)
         form.addRow("触发边沿", self.step_edge)
         command = QLabel(":SOUR1:FREQ")
+        self.step_command = command
         command.setStyleSheet("font-family:Consolas; color:#55d9cc;")
         form.addRow("SCPI 模板", command)
         if is_virtual_resource(self.record.resource) and self.connection_manager is not None:
@@ -638,14 +658,37 @@ class DG4000Window(BaseDeviceWindow):
                 )
             )
             form.addRow("模拟下发延迟", self.simulation_delay)
-        update_command = lambda: command.setText(
-            self.step_target.currentData().command(self.step_channel.currentData())
-        )
-        self.step_target.currentIndexChanged.connect(update_command)
-        self.step_channel.currentIndexChanged.connect(update_command)
+        self.step_channel.currentIndexChanged.connect(self._update_step_command)
         config_layout.addLayout(form)
 
         sequence_panel, sequence_layout = panel("循环序列")
+        generator = QGridLayout()
+        generator.setHorizontalSpacing(10)
+        generator.setVerticalSpacing(5)
+        self.scan_start = scan_value_spin(1000, "Hz")
+        self.scan_step = scan_value_spin(1000, "Hz")
+        self.scan_point_count = QSpinBox()
+        self.scan_point_count.setRange(1, MAX_SCAN_POINTS)
+        self.scan_point_count.setValue(4)
+        self.scan_point_count.setSuffix(" 点")
+        self.scan_point_count.setToolTip(
+            f"自动生成最多 {MAX_SCAN_POINTS} 个点；允许正步长、负步长和零步长"
+        )
+        generate_scan = QPushButton("生成扫描表")
+        generate_scan.setObjectName("PrimaryButton")
+        generate_scan.clicked.connect(self._generate_scan_table)
+        generator.addWidget(QLabel("扫描起点"), 0, 0)
+        generator.addWidget(QLabel("扫描步长"), 0, 1)
+        generator.addWidget(QLabel("扫描点数"), 0, 2)
+        generator.addWidget(self.scan_start, 1, 0)
+        generator.addWidget(self.scan_step, 1, 1)
+        generator.addWidget(self.scan_point_count, 1, 2)
+        generator.addWidget(generate_scan, 1, 3)
+        generator.setColumnStretch(0, 2)
+        generator.setColumnStretch(1, 2)
+        generator.setColumnStretch(2, 1)
+        sequence_layout.addLayout(generator)
+
         toolbar = QHBoxLayout()
         add_point = QPushButton("添加点")
         remove_point = QPushButton("删除选中")
@@ -659,10 +702,19 @@ class DG4000Window(BaseDeviceWindow):
         self.step_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.step_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.step_table.setAlternatingRowColors(True)
-        for index, value in enumerate((1000, 2000, 5000, 10000)):
-            self._append_sequence_row(self.step_table, value, "起始点（第一个触发）" if index == 0 else "")
+        self._generate_scan_table(show_message=False)
         add_point.clicked.connect(lambda: self._append_sequence_row(self.step_table, 1000, ""))
         remove_point.clicked.connect(lambda: self._remove_sequence_rows(self.step_table))
+        self.step_target.currentIndexChanged.connect(self._step_parameter_changed)
+        self._scan_settings: dict[StepParameter, tuple[float, float]] = {
+            StepParameter.FREQUENCY: (1000, 1000),
+            StepParameter.AMPLITUDE: (1, 0.1),
+            StepParameter.PHASE: (0, 45),
+            StepParameter.PSK_PHASE: (0, 45),
+            StepParameter.FSK_FREQUENCY: (1000, 1000),
+        }
+        self._active_scan_parameter = self.step_target.currentData()
+        self._update_step_command()
         sequence_layout.addWidget(self.step_table)
         config.setMinimumWidth(370)
         upper = QHBoxLayout()
@@ -702,6 +754,51 @@ class DG4000Window(BaseDeviceWindow):
         actions.addWidget(note)
         layout.addLayout(actions)
         return page
+
+    def _update_step_command(self, _index: int = -1) -> None:
+        self.step_command.setText(
+            self.step_target.currentData().command(self.step_channel.currentData())
+        )
+
+    def _step_parameter_changed(self, _index: int = -1) -> None:
+        previous = getattr(self, "_active_scan_parameter", None)
+        if previous is not None:
+            self._scan_settings[previous] = (self.scan_start.value(), self.scan_step.value())
+        current = self.step_target.currentData()
+        start, step = self._scan_settings[current]
+        unit = current.unit
+        self.scan_start.setSuffix(f" {unit}")
+        self.scan_step.setSuffix(f" {unit}")
+        self.scan_start.setValue(start)
+        self.scan_step.setValue(step)
+        self._active_scan_parameter = current
+        self._update_step_command()
+
+    def _generate_scan_table(self, _checked: bool = False, *, show_message: bool = True) -> None:
+        try:
+            values = linear_scan_points(
+                self.scan_start.value(),
+                self.scan_step.value(),
+                self.scan_point_count.value(),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法生成扫描表", str(exc))
+            return
+        self.step_table.setUpdatesEnabled(False)
+        try:
+            self.step_table.setRowCount(0)
+            for index, value in enumerate(values):
+                note = "起始点（第一个触发）" if index == 0 else ""
+                self._append_sequence_row(self.step_table, value, note)
+        finally:
+            self.step_table.setUpdatesEnabled(True)
+            self.step_table.viewport().update()
+        if show_message:
+            end = values[-1]
+            self.statusBar().showMessage(
+                f"已生成 {len(values)} 个扫描点：{values[0]:.12g} → {end:.12g}",
+                5000,
+            )
 
     def _sequence_values(self) -> list[float]:
         values: list[float] = []
@@ -817,7 +914,7 @@ class DG4000Window(BaseDeviceWindow):
         number = QTableWidgetItem(str(row + 1))
         number.setFlags(number.flags() & ~Qt.ItemFlag.ItemIsEditable)
         table.setItem(row, 0, number)
-        table.setItem(row, 1, QTableWidgetItem(f"{value:g}"))
+        table.setItem(row, 1, QTableWidgetItem(f"{value:.12g}"))
         table.setItem(row, 2, QTableWidgetItem(note))
 
     @staticmethod

@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import QApplication
 
 from rigol_control.app import create_application
 from rigol_control.connections import DeviceConnectionManager
+from rigol_control.drivers.dg4000 import StepParameter
 from rigol_control.models import DeviceKind, DeviceRecord
 from rigol_control.repository import DeviceRepository
 from rigol_control.services import DiscoveredResource
@@ -162,6 +163,21 @@ class UiSmokeTests(unittest.TestCase):
         dg_window = home.open_windows[dg.id]
         ni_window = home.open_windows[ni.id]
         dg_window._select_page(4)
+        dg_window.step_target.setCurrentIndex(
+            dg_window.step_target.findData(StepParameter.AMPLITUDE)
+        )
+        self.assertEqual(dg_window.scan_start.suffix(), " Vpp")
+        self.assertEqual(dg_window.scan_start.value(), 1)
+        self.assertEqual(dg_window.scan_step.value(), 0.1)
+        dg_window.step_target.setCurrentIndex(
+            dg_window.step_target.findData(StepParameter.FREQUENCY)
+        )
+        dg_window.scan_start.setValue(100)
+        dg_window.scan_step.setValue(25)
+        dg_window.scan_point_count.setValue(4)
+        dg_window._generate_scan_table()
+        self.assertEqual(dg_window._sequence_values(), [100, 125, 150, 175])
+        self.assertEqual(dg_window.step_table.item(0, 2).text(), "起始点（第一个触发）")
         dg_window._start_trigger()
         self.assertTrue(
             self._wait_for(
@@ -179,6 +195,10 @@ class UiSmokeTests(unittest.TestCase):
         )
         self.assertEqual(dg_window.trigger_metrics["received"].text(), "6")
         self.assertEqual(dg_window.trigger_metrics["applied"].text(), "6")
+        self.assertEqual(
+            manager.virtual_lab.generator_snapshot(dg.resource).channels[0].frequency_hz,
+            125,
+        )
         home.close()
         self.app.processEvents()
 

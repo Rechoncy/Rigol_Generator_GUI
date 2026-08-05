@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rigol-generator-gui"
-version = "0.2.0"
+version = "0.2.1"
 description = "DG4000 and NI DAQ multi-device control center"
 requires-python = ">=3.10"
 dependencies = [
