@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QObject, QThreadPool, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -16,6 +21,8 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -29,15 +36,31 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..analog import (
+    AnalogAcquisitionController,
+    AnalogAcquisitionState,
+    AnalogAcquisitionUpdate,
+)
 from ..connections import ConnectionInfo, DeviceConnectionManager
-from ..drivers.dg4000 import BasicWaveform, DG4000Driver, StepParameter
+from ..drivers.dg4000 import BasicWaveform, DG4000Driver, StepParameter, StepValue
+from ..drivers.ni_analog import AnalogInputConfig, NIDaqAnalogInput
 from ..drivers.ni_counter import NIDaqEdgeCounter
 from ..drivers.scpi import ScpiSession
 from ..models import DeviceKind, DeviceRecord
-from ..sequence import MAX_SCAN_POINTS, linear_scan_points
+from ..scan import (
+    MAX_SCAN_AXES,
+    ScanAxis,
+    ScanMode,
+    ScanPoint,
+    generate_scan_points,
+    scan_point_count,
+)
+from ..sequence import MAX_SCAN_POINTS
 from ..services import DeviceProbeService, ProbeResult, ProbeState
 from ..trigger import ControllerState, TriggerSnapshot, TriggerStepController
+from ..units import default_unit, from_base, to_base, unit_spec, unit_specs
 from ..virtual_lab import is_virtual_resource
+from .waveform import WaveformPlot
 from .widgets import CallTask, metric_card
 
 
@@ -85,17 +108,105 @@ class CompactDoubleSpinBox(QDoubleSpinBox):
         return f"{value:.12g}"
 
 
-def scan_value_spin(value: float, suffix: str) -> CompactDoubleSpinBox:
-    control = CompactDoubleSpinBox()
-    control.setDecimals(9)
-    control.setRange(-1e15, 1e15)
-    control.setValue(value)
-    control.setSuffix(f" {suffix}")
-    control.setKeyboardTracking(False)
-    return control
+class UnitValueWidget(QWidget):
+    """A compact decimal editor whose selectable unit preserves the base value."""
+
+    def __init__(
+        self,
+        value: float,
+        minimum: float,
+        maximum: float,
+        family: str,
+        unit_key: str | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.family = family
+        self.minimum_base = float(minimum)
+        self.maximum_base = float(maximum)
+        self.spin = CompactDoubleSpinBox()
+        self.spin.setDecimals(9)
+        self.spin.setKeyboardTracking(False)
+        self.unit_combo = QComboBox()
+        for spec in unit_specs(family):
+            self.unit_combo.addItem(spec.symbol, spec.key)
+        self._active_unit = unit_key or default_unit(family)
+        index = self.unit_combo.findData(self._active_unit)
+        if index < 0:
+            raise ValueError(f"{self._active_unit} 不是 {family} 支持的单位")
+        self.unit_combo.setCurrentIndex(index)
+        self._apply_display_range()
+        self.setValue(value)
+        self.unit_combo.currentIndexChanged.connect(self._unit_changed)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self.spin, 1)
+        layout.addWidget(self.unit_combo)
+
+    def _apply_display_range(self) -> None:
+        self.spin.setRange(
+            from_base(self.minimum_base, self.family, self._active_unit),
+            from_base(self.maximum_base, self.family, self._active_unit),
+        )
+
+    def _unit_changed(self, _index: int) -> None:
+        base_value = to_base(self.spin.value(), self.family, self._active_unit)
+        self._active_unit = self.unit_combo.currentData()
+        self._apply_display_range()
+        self.spin.setValue(from_base(base_value, self.family, self._active_unit))
+
+    def value(self) -> float:
+        return to_base(self.spin.value(), self.family, self._active_unit)
+
+    def display_value(self) -> float:
+        return self.spin.value()
+
+    def setValue(self, base_value: float) -> None:
+        self.spin.setValue(from_base(base_value, self.family, self._active_unit))
+
+    def current_unit(self) -> str:
+        return self._active_unit
+
+    def set_unit(self, unit_key: str) -> None:
+        index = self.unit_combo.findData(unit_key)
+        if index < 0:
+            raise ValueError(f"{unit_key} 不是 {self.family} 支持的单位")
+        self.unit_combo.setCurrentIndex(index)
+
+
+def unit_value_spin(
+    value: float,
+    minimum: float,
+    maximum: float,
+    family: str,
+    unit_key: str | None = None,
+) -> UnitValueWidget:
+    return UnitValueWidget(value, minimum, maximum, family, unit_key)
+
+
+@dataclass(slots=True)
+class ScanAxisControls:
+    frame: QFrame
+    number: QLabel
+    parameter: QComboBox
+    channel: QComboBox
+    unit: QComboBox
+    start: CompactDoubleSpinBox
+    step: CompactDoubleSpinBox
+    count: QSpinBox
+    move_up: QPushButton
+    move_down: QPushButton
+    remove: QPushButton
+    active_parameter: StepParameter
+    active_unit: str
 
 
 class TriggerBridge(QObject):
+    updated = pyqtSignal(object)
+
+
+class AnalogBridge(QObject):
     updated = pyqtSignal(object)
 
 
@@ -195,6 +306,7 @@ class DG4000Window(BaseDeviceWindow):
             else DG4000Driver(ScpiSession(record.resource))
         )
         self.controller: TriggerStepController | None = None
+        self._trigger_lease_owner = f"single-trigger:{record.id}"
         self.trigger_bridge = TriggerBridge()
         self.trigger_bridge.updated.connect(self._trigger_updated)
         self._last_trigger_error: str | None = None
@@ -285,10 +397,11 @@ class DG4000Window(BaseDeviceWindow):
         snapshot = self.connection_manager.virtual_lab.generator_snapshot(self.record.resource)
         lines = []
         for channel in snapshot.channels:
+            load_text = "High-Z" if channel.load_ohms is None else f"{channel.load_ohms} Ω"
             lines.append(
                 f"CH{channel.channel}: {channel.function}  {channel.frequency_hz:g} Hz  "
                 f"{channel.amplitude_vpp:g} Vpp  {channel.phase_deg:g}°  "
-                f"输出={'ON' if channel.output else 'OFF'}  "
+                f"负载={load_text}  输出={'ON' if channel.output else 'OFF'}  "
                 f"{channel.modulation_type}={'ON' if channel.modulation_enabled else 'OFF'}  "
                 f"PSK={channel.psk_phase_deg:g}°  FSK={channel.fsk_frequency_hz:g} Hz"
             )
@@ -359,7 +472,10 @@ class DG4000Window(BaseDeviceWindow):
         return False
 
     def _channel_page(self) -> QWidget:
-        page, layout = page_shell("通道与基本波形", "配置两个输出通道的波形、频率、幅度、偏置和初相位。")
+        page, layout = page_shell(
+            "通道与基本波形",
+            "配置两个输出通道的波形、频率、幅度、偏置、初相位和负载阻抗。",
+        )
         tabs = QTabWidget()
         for channel in (1, 2):
             tab = QWidget()
@@ -368,15 +484,41 @@ class DG4000Window(BaseDeviceWindow):
             form = QFormLayout()
             waveform = QComboBox()
             waveform.addItems(["正弦波", "方波", "锯齿波", "脉冲", "噪声", "任意波"])
-            frequency = value_spin(1000, 1e-6, 160e6, "Hz")
-            amplitude = value_spin(1.0, 0.001, 20.0, "Vpp", 4)
-            offset = value_spin(0, -10, 10, "V", 4)
-            phase = value_spin(0, 0, 360, "°", 3)
+            frequency = unit_value_spin(1000, 1e-6, 160e6, "frequency", "kHz")
+            amplitude = unit_value_spin(1.0, 0.001, 20.0, "amplitude", "Vpp")
+            offset = unit_value_spin(0, -10, 10, "voltage", "V")
+            phase = unit_value_spin(0, 0, 360, "angle", "deg")
+            load = QComboBox()
+            load.addItem("高阻（INFINITY）", None)
+            load.addItem("50 Ω", 50)
+            load.addItem("75 Ω", 75)
+            load.addItem("600 Ω", 600)
+            load.addItem("自定义", "CUSTOM")
+            load.setToolTip(
+                "对应 :OUTP<n>:LOAD；用于匹配实际负载并校准仪器显示幅度，不改变输出级固有源阻抗。"
+            )
+            custom_load = QSpinBox()
+            custom_load.setRange(1, 10_000)
+            custom_load.setValue(50)
+            custom_load.setSuffix(" Ω")
+            custom_load.setEnabled(False)
+            load.currentIndexChanged.connect(
+                lambda _index, combo=load, control=custom_load: control.setEnabled(
+                    combo.currentData() == "CUSTOM"
+                )
+            )
+            load_row = QWidget()
+            load_layout = QHBoxLayout(load_row)
+            load_layout.setContentsMargins(0, 0, 0, 0)
+            load_layout.setSpacing(6)
+            load_layout.addWidget(load, 1)
+            load_layout.addWidget(custom_load)
             form.addRow("波形", waveform)
             form.addRow("频率", frequency)
             form.addRow("幅度", amplitude)
             form.addRow("直流偏置", offset)
             form.addRow("初相位", phase)
+            form.addRow("负载阻抗", load_row)
             output = QCheckBox("启用通道输出")
             form.addRow("输出", output)
             self.channel_controls[channel] = {
@@ -385,6 +527,8 @@ class DG4000Window(BaseDeviceWindow):
                 "amplitude": amplitude,
                 "offset": offset,
                 "phase": phase,
+                "load": load,
+                "custom_load": custom_load,
                 "output": output,
             }
             settings_layout.addLayout(form)
@@ -411,9 +555,16 @@ class DG4000Window(BaseDeviceWindow):
         )
         output = controls["output"].isChecked()
 
+        load_data = controls["load"].currentData()
+        load_ohms = controls["custom_load"].value() if load_data == "CUSTOM" else load_data
+
         def apply() -> None:
-            self.driver.configure_basic(channel, waveform)
-            self.driver.set_output(channel, output)
+            self.driver.configure_channel(
+                channel,
+                waveform,
+                load_ohms=load_ohms,
+                enabled=output,
+            )
 
         self.submit(
             apply,
@@ -437,20 +588,32 @@ class DG4000Window(BaseDeviceWindow):
             source.addItems(["内部", "外部"])
             shape = QComboBox()
             shape.addItems(["正弦", "方波", "三角波", "上锯齿", "下锯齿", "噪声"])
-            internal_frequency = value_spin(100, 0.001, 1e6, "Hz")
+            internal_frequency = unit_value_spin(100, 0.001, 1e6, "frequency", "Hz")
             form.addRow("输出通道", modulation_channel)
             form.addRow("调制源", source)
             form.addRow("内部波形", shape)
             form.addRow("调制频率", internal_frequency)
             if mode == "FSK":
-                parameter = value_spin(2000, 1e-6, 160e6, "Hz")
+                parameter = unit_value_spin(2000, 1e-6, 160e6, "frequency", "kHz")
                 form.addRow("跳跃频率", parameter)
             elif mode == "PSK":
-                parameter = value_spin(180, 0, 360, "°", 3)
+                parameter = unit_value_spin(180, 0, 360, "angle", "deg")
                 form.addRow("调制相位", parameter)
             elif mode == "AM":
                 parameter = value_spin(50, 0, 120, "%", 2)
                 form.addRow("调制度", parameter)
+            elif mode == "FM":
+                parameter = unit_value_spin(10, 0, 1e8, "frequency", "kHz")
+                form.addRow("频偏", parameter)
+            elif mode == "PM":
+                parameter = unit_value_spin(10, 0, 360, "angle", "deg")
+                form.addRow("相偏", parameter)
+            elif mode == "ASK":
+                parameter = unit_value_spin(1, 0, 20, "amplitude", "Vpp")
+                form.addRow("键控幅度", parameter)
+            elif mode == "PWM":
+                parameter = unit_value_spin(10e-6, 0, 1, "time", "us")
+                form.addRow("脉宽偏移", parameter)
             else:
                 parameter = value_spin(10, 0, 1e8, "", 3)
                 form.addRow("偏移/深度", parameter)
@@ -508,9 +671,9 @@ class DG4000Window(BaseDeviceWindow):
         form = QFormLayout()
         mode = QComboBox()
         mode.addItems(["线性", "对数", "步进"])
-        sweep_start = value_spin(1000, 1e-6, 160e6, "Hz")
-        sweep_stop = value_spin(10000, 1e-6, 160e6, "Hz")
-        sweep_time = value_spin(1, 0.001, 500, "s", 3)
+        sweep_start = unit_value_spin(1000, 1e-6, 160e6, "frequency", "kHz")
+        sweep_stop = unit_value_spin(10000, 1e-6, 160e6, "frequency", "kHz")
+        sweep_time = unit_value_spin(1, 0.001, 500, "time", "s")
         form.addRow("扫频类型", mode)
         form.addRow("起始频率", sweep_start)
         form.addRow("终止频率", sweep_stop)
@@ -540,8 +703,8 @@ class DG4000Window(BaseDeviceWindow):
         count.setValue(10)
         burst_form.addRow("模式", burst_mode)
         burst_form.addRow("周期数", count)
-        burst_period = value_spin(0.1, 1e-6, 500, "s")
-        burst_phase = value_spin(0, 0, 360, "°", 3)
+        burst_period = unit_value_spin(0.1, 1e-6, 500, "time", "ms")
+        burst_phase = unit_value_spin(0, 0, 360, "angle", "deg")
         burst_form.addRow("周期", burst_period)
         burst_form.addRow("起始相位", burst_phase)
         burst_form_layout.addLayout(burst_form)
@@ -560,9 +723,9 @@ class DG4000Window(BaseDeviceWindow):
     def _apply_sweep(
         self,
         mode: QComboBox,
-        start: QDoubleSpinBox,
-        stop: QDoubleSpinBox,
-        duration: QDoubleSpinBox,
+        start: UnitValueWidget,
+        stop: UnitValueWidget,
+        duration: UnitValueWidget,
         trigger: QComboBox,
     ) -> None:
         if not self._require_connection():
@@ -586,8 +749,8 @@ class DG4000Window(BaseDeviceWindow):
         self,
         mode: QComboBox,
         count: QSpinBox,
-        period: QDoubleSpinBox,
-        phase: QDoubleSpinBox,
+        period: UnitValueWidget,
+        phase: UnitValueWidget,
     ) -> None:
         if not self._require_connection():
             return
@@ -607,13 +770,10 @@ class DG4000Window(BaseDeviceWindow):
     def _trigger_step_page(self) -> QWidget:
         page, layout = page_shell(
             "NI 触发步进",
-            "NI 只负责检测外部触发；每次计数增加后，软件按序向 DG4000 下发新的 SCPI 参数。第一个触发应用起始点，末点后自动循环。",
+            "每个扫描点可联动多个 DG4000 参数。本联动任务中的 NI 只检测外部触发；第一个触发应用联合起始点，末点后自动循环。",
         )
         config, config_layout = panel("任务配置")
         form = QFormLayout()
-        self.step_target = QComboBox()
-        for parameter in StepParameter:
-            self.step_target.addItem(parameter.label, parameter)
         self.ni_source = QComboBox()
         if self.ni_devices:
             for device in self.ni_devices:
@@ -621,9 +781,6 @@ class DG4000Window(BaseDeviceWindow):
         else:
             self.ni_source.addItem("请先在设备中心添加 NI 采集卡", None)
             self.ni_source.setEnabled(False)
-        self.step_channel = QComboBox()
-        self.step_channel.addItem("CH1", 1)
-        self.step_channel.addItem("CH2", 2)
         self.step_counter = QComboBox()
         for index in range(4):
             self.step_counter.addItem(f"ctr{index}", f"ctr{index}")
@@ -632,16 +789,26 @@ class DG4000Window(BaseDeviceWindow):
         self.step_terminal.addItems([f"PFI{index}" for index in range(16)])
         self.step_edge = QComboBox()
         self.step_edge.addItems(["上升沿", "下降沿"])
-        form.addRow("步进参数", self.step_target)
-        form.addRow("DG4000 通道", self.step_channel)
+        self.scan_mode = QComboBox()
+        for mode in ScanMode:
+            self.scan_mode.addItem(mode.label, mode)
+        self.scan_mode.setToolTip(
+            "同步联动：各轴第 n 点组成联合点，要求点数相同。\n"
+            "组合扫描：生成所有轴的笛卡尔积，最后一个轴变化最快。"
+        )
+        self.scan_mode.currentIndexChanged.connect(self._scan_configuration_changed)
         form.addRow("NI 计数设备", self.ni_source)
         form.addRow("NI 计数器", self.step_counter)
         form.addRow("PFI 触发端子", self.step_terminal)
         form.addRow("触发边沿", self.step_edge)
-        command = QLabel(":SOUR1:FREQ")
-        self.step_command = command
-        command.setStyleSheet("font-family:Consolas; color:#55d9cc;")
-        form.addRow("SCPI 模板", command)
+        form.addRow("轴联动方式", self.scan_mode)
+        self.step_command = QLabel("由扫描轴生成")
+        self.step_command.setWordWrap(True)
+        self.step_command.setStyleSheet("font-family:Consolas; color:#55d9cc;")
+        form.addRow("每点 SCPI", self.step_command)
+        self.scan_summary = QLabel()
+        self.scan_summary.setWordWrap(True)
+        form.addRow("点表预检", self.scan_summary)
         if is_virtual_resource(self.record.resource) and self.connection_manager is not None:
             self.simulation_delay = QSpinBox()
             self.simulation_delay.setRange(0, 2000)
@@ -658,65 +825,50 @@ class DG4000Window(BaseDeviceWindow):
                 )
             )
             form.addRow("模拟下发延迟", self.simulation_delay)
-        self.step_channel.currentIndexChanged.connect(self._update_step_command)
         config_layout.addLayout(form)
 
-        sequence_panel, sequence_layout = panel("循环序列")
-        generator = QGridLayout()
-        generator.setHorizontalSpacing(10)
-        generator.setVerticalSpacing(5)
-        self.scan_start = scan_value_spin(1000, "Hz")
-        self.scan_step = scan_value_spin(1000, "Hz")
-        self.scan_point_count = QSpinBox()
-        self.scan_point_count.setRange(1, MAX_SCAN_POINTS)
-        self.scan_point_count.setValue(4)
-        self.scan_point_count.setSuffix(" 点")
-        self.scan_point_count.setToolTip(
-            f"自动生成最多 {MAX_SCAN_POINTS} 个点；允许正步长、负步长和零步长"
-        )
-        generate_scan = QPushButton("生成扫描表")
-        generate_scan.setObjectName("PrimaryButton")
-        generate_scan.clicked.connect(self._generate_scan_table)
-        generator.addWidget(QLabel("扫描起点"), 0, 0)
-        generator.addWidget(QLabel("扫描步长"), 0, 1)
-        generator.addWidget(QLabel("扫描点数"), 0, 2)
-        generator.addWidget(self.scan_start, 1, 0)
-        generator.addWidget(self.scan_step, 1, 1)
-        generator.addWidget(self.scan_point_count, 1, 2)
-        generator.addWidget(generate_scan, 1, 3)
-        generator.setColumnStretch(0, 2)
-        generator.setColumnStretch(1, 2)
-        generator.setColumnStretch(2, 1)
-        sequence_layout.addLayout(generator)
+        sequence_panel, sequence_layout = panel("多轴扫描与联合点表")
+        axis_toolbar = QHBoxLayout()
+        self.add_scan_axis_button = QPushButton("＋ 增加扫描轴")
+        self.add_scan_axis_button.clicked.connect(self._add_scan_axis)
+        self.generate_scan_button = QPushButton("生成联合点表")
+        self.generate_scan_button.setObjectName("PrimaryButton")
+        self.generate_scan_button.clicked.connect(self._generate_scan_table)
+        axis_toolbar.addWidget(self.add_scan_axis_button)
+        axis_toolbar.addStretch()
+        axis_toolbar.addWidget(self.generate_scan_button)
+        sequence_layout.addLayout(axis_toolbar)
 
-        toolbar = QHBoxLayout()
-        add_point = QPushButton("添加点")
-        remove_point = QPushButton("删除选中")
-        toolbar.addWidget(add_point)
-        toolbar.addWidget(remove_point)
-        toolbar.addStretch()
-        sequence_layout.addLayout(toolbar)
+        self.scan_axes: list[ScanAxisControls] = []
+        self.scan_axis_tabs = QTabWidget()
+        self.scan_axis_tabs.setFixedHeight(165)
+        sequence_layout.addWidget(self.scan_axis_tabs)
+
+        point_toolbar = QHBoxLayout()
+        self.add_scan_point_button = QPushButton("添加联合点")
+        self.remove_scan_point_button = QPushButton("删除选中")
+        self.add_scan_point_button.clicked.connect(self._add_manual_scan_point)
+        self.remove_scan_point_button.clicked.connect(self._remove_sequence_rows)
+        point_toolbar.addWidget(self.add_scan_point_button)
+        point_toolbar.addWidget(self.remove_scan_point_button)
+        point_toolbar.addStretch()
+        point_note = QLabel("表格数值使用各轴所选单位，可直接输入小数")
+        point_note.setObjectName("Muted")
+        point_toolbar.addWidget(point_note)
+        sequence_layout.addLayout(point_toolbar)
+
         self.step_table = QTableWidget(0, 3)
-        self.step_table.setHorizontalHeaderLabels(["序号", "参数值", "说明"])
-        self.step_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.step_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.step_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.step_table.setMinimumHeight(125)
         self.step_table.setAlternatingRowColors(True)
-        self._generate_scan_table(show_message=False)
-        add_point.clicked.connect(lambda: self._append_sequence_row(self.step_table, 1000, ""))
-        remove_point.clicked.connect(lambda: self._remove_sequence_rows(self.step_table))
-        self.step_target.currentIndexChanged.connect(self._step_parameter_changed)
-        self._scan_settings: dict[StepParameter, tuple[float, float]] = {
-            StepParameter.FREQUENCY: (1000, 1000),
-            StepParameter.AMPLITUDE: (1, 0.1),
-            StepParameter.PHASE: (0, 45),
-            StepParameter.PSK_PHASE: (0, 45),
-            StepParameter.FSK_FREQUENCY: (1000, 1000),
-        }
-        self._active_scan_parameter = self.step_target.currentData()
-        self._update_step_command()
+        self.step_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._scan_table_axes: tuple[ScanAxis, ...] = ()
+        self._scan_table_mode: ScanMode | None = None
         sequence_layout.addWidget(self.step_table)
-        config.setMinimumWidth(370)
+        self._add_scan_axis(StepParameter.FREQUENCY, 1, refresh=False)
+        self._scan_configuration_changed()
+        self._generate_scan_table(show_message=False)
+
+        config.setMinimumWidth(340)
         upper = QHBoxLayout()
         upper.setSpacing(14)
         upper.addWidget(config, 1)
@@ -755,62 +907,370 @@ class DG4000Window(BaseDeviceWindow):
         layout.addLayout(actions)
         return page
 
-    def _update_step_command(self, _index: int = -1) -> None:
-        self.step_command.setText(
-            self.step_target.currentData().command(self.step_channel.currentData())
+    @staticmethod
+    def _axis_defaults(parameter: StepParameter) -> tuple[str, float, float, int]:
+        return {
+            StepParameter.FREQUENCY: ("kHz", 1.0, 1.0, 4),
+            StepParameter.AMPLITUDE: ("Vpp", 1.0, 0.1, 4),
+            StepParameter.PHASE: ("deg", 0.0, 45.0, 4),
+            StepParameter.PSK_PHASE: ("deg", 0.0, 45.0, 4),
+            StepParameter.FSK_FREQUENCY: ("kHz", 2.0, 1.0, 4),
+        }[parameter]
+
+    def _new_scan_axis_controls(
+        self,
+        parameter: StepParameter,
+        channel: int,
+    ) -> ScanAxisControls:
+        frame = QFrame()
+        frame.setObjectName("MetricCard")
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(10, 8, 10, 9)
+        outer.setSpacing(6)
+        header = QHBoxLayout()
+        number = QLabel()
+        number.setStyleSheet("font-weight:700; color:#55d9cc;")
+        parameter_box = QComboBox()
+        for item in StepParameter:
+            parameter_box.addItem(item.label, item)
+        parameter_box.setCurrentIndex(parameter_box.findData(parameter))
+        channel_box = QComboBox()
+        channel_box.addItem("CH1", 1)
+        channel_box.addItem("CH2", 2)
+        channel_box.setCurrentIndex(channel_box.findData(channel))
+        unit_box = QComboBox()
+        unit_key, start_value, step_value, count_value = self._axis_defaults(parameter)
+        for spec in unit_specs(parameter.unit_family):
+            unit_box.addItem(spec.symbol, spec.key)
+        unit_box.setCurrentIndex(unit_box.findData(unit_key))
+        move_up = QPushButton("↑")
+        move_down = QPushButton("↓")
+        remove = QPushButton("删除")
+        remove.setObjectName("DangerButton")
+        for button in (move_up, move_down):
+            button.setFixedWidth(34)
+        header.addWidget(number)
+        header.addWidget(parameter_box, 1)
+        header.addWidget(channel_box)
+        header.addWidget(unit_box)
+        header.addWidget(move_up)
+        header.addWidget(move_down)
+        header.addWidget(remove)
+        outer.addLayout(header)
+
+        fields = QGridLayout()
+        fields.setHorizontalSpacing(8)
+        fields.setVerticalSpacing(3)
+        start = CompactDoubleSpinBox()
+        step = CompactDoubleSpinBox()
+        for control in (start, step):
+            control.setDecimals(9)
+            control.setRange(-1e15, 1e15)
+            control.setKeyboardTracking(False)
+        start.setValue(start_value)
+        step.setValue(step_value)
+        count = QSpinBox()
+        count.setRange(1, MAX_SCAN_POINTS)
+        count.setValue(count_value)
+        count.setSuffix(" 点")
+        fields.addWidget(QLabel("扫描起点"), 0, 0)
+        fields.addWidget(QLabel("扫描步长"), 0, 1)
+        fields.addWidget(QLabel("扫描点数"), 0, 2)
+        fields.addWidget(start, 1, 0)
+        fields.addWidget(step, 1, 1)
+        fields.addWidget(count, 1, 2)
+        fields.setColumnStretch(0, 2)
+        fields.setColumnStretch(1, 2)
+        fields.setColumnStretch(2, 1)
+        outer.addLayout(fields)
+
+        controls = ScanAxisControls(
+            frame=frame,
+            number=number,
+            parameter=parameter_box,
+            channel=channel_box,
+            unit=unit_box,
+            start=start,
+            step=step,
+            count=count,
+            move_up=move_up,
+            move_down=move_down,
+            remove=remove,
+            active_parameter=parameter,
+            active_unit=unit_key,
+        )
+        parameter_box.currentIndexChanged.connect(
+            lambda _index, axis=controls: self._axis_parameter_changed(axis)
+        )
+        channel_box.currentIndexChanged.connect(
+            lambda _index, axis=controls: self._axis_channel_changed(axis)
+        )
+        unit_box.currentIndexChanged.connect(
+            lambda _index, axis=controls: self._axis_unit_changed(axis)
+        )
+        start.valueChanged.connect(self._scan_configuration_changed)
+        step.valueChanged.connect(self._scan_configuration_changed)
+        count.valueChanged.connect(self._scan_configuration_changed)
+        move_up.clicked.connect(lambda _checked=False, axis=controls: self._move_scan_axis(axis, -1))
+        move_down.clicked.connect(lambda _checked=False, axis=controls: self._move_scan_axis(axis, 1))
+        remove.clicked.connect(lambda _checked=False, axis=controls: self._remove_scan_axis(axis))
+        return controls
+
+    def _add_scan_axis(
+        self,
+        parameter: StepParameter | bool | None = None,
+        channel: int | None = None,
+        *,
+        refresh: bool = True,
+    ) -> None:
+        if isinstance(parameter, bool):
+            parameter = None
+        if len(self.scan_axes) >= MAX_SCAN_AXES:
+            QMessageBox.information(self, "扫描轴已满", f"最多支持 {MAX_SCAN_AXES} 个扫描轴。")
+            return
+        used = {
+            (axis.channel.currentData(), axis.parameter.currentData()) for axis in self.scan_axes
+        }
+        if parameter is None:
+            target = next(
+                (
+                    (candidate_channel, candidate_parameter)
+                    for candidate_channel in (1, 2)
+                    for candidate_parameter in StepParameter
+                    if (candidate_channel, candidate_parameter) not in used
+                ),
+                None,
+            )
+            if target is None:
+                QMessageBox.information(self, "没有可用轴", "所有通道和参数组合都已使用。")
+                return
+            channel, parameter = target
+        controls = self._new_scan_axis_controls(parameter, channel or 1)
+        self.scan_axes.append(controls)
+        self._rebuild_scan_axes_layout()
+        self.scan_axis_tabs.setCurrentWidget(controls.frame)
+        if refresh:
+            self._scan_configuration_changed()
+
+    def _remove_scan_axis(self, axis: ScanAxisControls) -> None:
+        if len(self.scan_axes) <= 1:
+            QMessageBox.information(self, "保留扫描轴", "至少需要一个扫描轴。")
+            return
+        self.scan_axes.remove(axis)
+        axis.frame.deleteLater()
+        self._rebuild_scan_axes_layout()
+        self._scan_configuration_changed()
+
+    def _move_scan_axis(self, axis: ScanAxisControls, offset: int) -> None:
+        index = self.scan_axes.index(axis)
+        destination = index + offset
+        if destination < 0 or destination >= len(self.scan_axes):
+            return
+        self.scan_axes[index], self.scan_axes[destination] = (
+            self.scan_axes[destination],
+            self.scan_axes[index],
+        )
+        self._rebuild_scan_axes_layout()
+        self._scan_configuration_changed()
+
+    def _rebuild_scan_axes_layout(self) -> None:
+        selected = self.scan_axis_tabs.currentWidget()
+        while self.scan_axis_tabs.count():
+            self.scan_axis_tabs.removeTab(0)
+        for index, axis in enumerate(self.scan_axes, start=1):
+            axis.number.setText(f"轴 {index}")
+            axis.move_up.setEnabled(index > 1)
+            axis.move_down.setEnabled(index < len(self.scan_axes))
+            self.scan_axis_tabs.addTab(
+                axis.frame,
+                f"轴 {index} · CH{axis.channel.currentData()} {axis.parameter.currentData().short_label}",
+            )
+        if selected in [axis.frame for axis in self.scan_axes]:
+            self.scan_axis_tabs.setCurrentWidget(selected)
+        elif self.scan_axes:
+            self.scan_axis_tabs.setCurrentIndex(len(self.scan_axes) - 1)
+
+    def _axis_parameter_changed(self, axis: ScanAxisControls) -> None:
+        parameter = axis.parameter.currentData()
+        unit_key, start, step, count = self._axis_defaults(parameter)
+        axis.unit.blockSignals(True)
+        axis.unit.clear()
+        for spec in unit_specs(parameter.unit_family):
+            axis.unit.addItem(spec.symbol, spec.key)
+        axis.unit.setCurrentIndex(axis.unit.findData(unit_key))
+        axis.unit.blockSignals(False)
+        axis.active_parameter = parameter
+        axis.active_unit = unit_key
+        axis.start.setValue(start)
+        axis.step.setValue(step)
+        axis.count.setValue(count)
+        self._rebuild_scan_axes_layout()
+        self._scan_configuration_changed()
+
+    def _axis_channel_changed(self, axis: ScanAxisControls) -> None:
+        self._rebuild_scan_axes_layout()
+        self.scan_axis_tabs.setCurrentWidget(axis.frame)
+        self._scan_configuration_changed()
+
+    def _axis_unit_changed(self, axis: ScanAxisControls) -> None:
+        new_unit = axis.unit.currentData()
+        if not new_unit or new_unit == axis.active_unit:
+            return
+        family = axis.active_parameter.unit_family
+        start_base = to_base(axis.start.value(), family, axis.active_unit)
+        step_base = to_base(axis.step.value(), family, axis.active_unit)
+        axis.active_unit = new_unit
+        axis.start.setValue(from_base(start_base, family, new_unit))
+        axis.step.setValue(from_base(step_base, family, new_unit))
+        self._scan_configuration_changed()
+
+    def _scan_axis_models(self) -> tuple[ScanAxis, ...]:
+        return tuple(
+            ScanAxis(
+                parameter=axis.parameter.currentData(),
+                channel=axis.channel.currentData(),
+                unit_key=axis.unit.currentData(),
+                start=axis.start.value(),
+                step=axis.step.value(),
+                count=axis.count.value(),
+            )
+            for axis in self.scan_axes
         )
 
-    def _step_parameter_changed(self, _index: int = -1) -> None:
-        previous = getattr(self, "_active_scan_parameter", None)
-        if previous is not None:
-            self._scan_settings[previous] = (self.scan_start.value(), self.scan_step.value())
-        current = self.step_target.currentData()
-        start, step = self._scan_settings[current]
-        unit = current.unit
-        self.scan_start.setSuffix(f" {unit}")
-        self.scan_step.setSuffix(f" {unit}")
-        self.scan_start.setValue(start)
-        self.scan_step.setValue(step)
-        self._active_scan_parameter = current
-        self._update_step_command()
+    def _scan_configuration_changed(self, _value: Any = None) -> None:
+        try:
+            axes = self._scan_axis_models()
+            mode = self.scan_mode.currentData()
+            total = scan_point_count(axes, mode)
+        except ValueError as exc:
+            self.scan_summary.setText(str(exc))
+            self.scan_summary.setStyleSheet("color:#ff9397;")
+            self.generate_scan_button.setEnabled(False)
+            return
+        commands = [axis.parameter.command(axis.channel) for axis in axes]
+        self.step_command.setText("\n".join(commands))
+        mode_note = "最后一轴变化最快" if mode is ScanMode.CARTESIAN else "各轴同序号联动"
+        self.scan_summary.setText(
+            f"预计 {total} 个联合点 · 每触发 {len(axes)} 条 SCPI · {mode_note}"
+        )
+        self.scan_summary.setStyleSheet("color:#54d6a3;")
+        self.generate_scan_button.setEnabled(True)
 
     def _generate_scan_table(self, _checked: bool = False, *, show_message: bool = True) -> None:
         try:
-            values = linear_scan_points(
-                self.scan_start.value(),
-                self.scan_step.value(),
-                self.scan_point_count.value(),
-            )
+            axes = self._scan_axis_models()
+            mode = self.scan_mode.currentData()
+            points = generate_scan_points(axes, mode)
         except ValueError as exc:
             QMessageBox.warning(self, "无法生成扫描表", str(exc))
             return
+        headers = ["序号"]
+        for index, axis in enumerate(axes, start=1):
+            symbol = unit_spec(axis.parameter.unit_family, axis.unit_key).symbol
+            headers.append(f"轴{index} CH{axis.channel} {axis.parameter.short_label} ({symbol})")
+        headers.append("说明")
+        self.step_table.setColumnCount(len(headers))
+        self.step_table.setHorizontalHeaderLabels(headers)
+        self.step_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        for column in range(1, len(headers) - 1):
+            self.step_table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.Stretch
+            )
+        self.step_table.horizontalHeader().setSectionResizeMode(
+            len(headers) - 1, QHeaderView.ResizeMode.Stretch
+        )
         self.step_table.setUpdatesEnabled(False)
         try:
             self.step_table.setRowCount(0)
-            for index, value in enumerate(values):
+            for index, point in enumerate(points):
                 note = "起始点（第一个触发）" if index == 0 else ""
-                self._append_sequence_row(self.step_table, value, note)
+                self._append_scan_point_row(
+                    [
+                        item.display_value if item.display_value is not None else item.value
+                        for item in point.values
+                    ],
+                    note,
+                )
         finally:
             self.step_table.setUpdatesEnabled(True)
             self.step_table.viewport().update()
+        self._scan_table_axes = axes
+        self._scan_table_mode = mode
         if show_message:
-            end = values[-1]
             self.statusBar().showMessage(
-                f"已生成 {len(values)} 个扫描点：{values[0]:.12g} → {end:.12g}",
+                f"已生成 {len(points)} 个联合扫描点，每点联动 {len(axes)} 个参数",
                 5000,
             )
 
-    def _sequence_values(self) -> list[float]:
-        values: list[float] = []
+    def _sequence_points(self) -> list[ScanPoint]:
+        axes = self._scan_axis_models()
+        mode = self.scan_mode.currentData()
+        if axes != self._scan_table_axes or mode is not self._scan_table_mode:
+            raise ValueError("扫描轴配置已改变，请重新生成联合点表")
+        if self.step_table.rowCount() < 1:
+            raise ValueError("至少需要一个联合扫描点")
+        points: list[ScanPoint] = []
         for row in range(self.step_table.rowCount()):
-            item = self.step_table.item(row, 1)
-            try:
-                values.append(float(item.text().strip()))
-            except (AttributeError, ValueError) as exc:
-                raise ValueError(f"第 {row + 1} 个步进点不是有效数值") from exc
-        if not values:
-            raise ValueError("至少需要一个步进点")
-        return values
+            values: list[StepValue] = []
+            for axis_index, axis in enumerate(axes):
+                item = self.step_table.item(row, axis_index + 1)
+                try:
+                    display_value = float(item.text().strip())
+                    base_value = to_base(
+                        display_value,
+                        axis.parameter.unit_family,
+                        axis.unit_key,
+                    )
+                except (AttributeError, ValueError) as exc:
+                    raise ValueError(
+                        f"第 {row + 1} 行、轴 {axis_index + 1} 不是有效数值"
+                    ) from exc
+                values.append(
+                    StepValue(
+                        parameter=axis.parameter,
+                        channel=axis.channel,
+                        value=base_value,
+                        display_value=display_value,
+                        unit_key=axis.unit_key,
+                    )
+                )
+            points.append(ScanPoint(tuple(values)))
+        return points
+
+    def _sequence_values(self) -> list[float]:
+        points = self._sequence_points()
+        if len(points[0].values) != 1:
+            raise ValueError("当前为多轴点表，请使用联合扫描点")
+        return [point.values[0].value for point in points]
+
+    def _append_scan_point_row(self, display_values: list[float], note: str) -> None:
+        row = self.step_table.rowCount()
+        self.step_table.insertRow(row)
+        number = QTableWidgetItem(str(row + 1))
+        number.setFlags(number.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.step_table.setItem(row, 0, number)
+        for column, value in enumerate(display_values, start=1):
+            self.step_table.setItem(row, column, QTableWidgetItem(f"{value:.12g}"))
+        self.step_table.setItem(row, len(display_values) + 1, QTableWidgetItem(note))
+
+    def _add_manual_scan_point(self) -> None:
+        if not self._scan_table_axes:
+            QMessageBox.information(self, "尚未生成", "请先生成联合点表。")
+            return
+        if self.step_table.rowCount() >= MAX_SCAN_POINTS:
+            QMessageBox.information(self, "点数已满", f"最多支持 {MAX_SCAN_POINTS} 个点。")
+            return
+        if self.step_table.rowCount():
+            last = self.step_table.rowCount() - 1
+            values = [
+                float(self.step_table.item(last, column + 1).text())
+                for column in range(len(self._scan_table_axes))
+            ]
+        else:
+            values = [axis.start for axis in self._scan_table_axes]
+        self._append_scan_point_row(values, "")
 
     def _start_trigger(self) -> None:
         if not self._require_connection():
@@ -821,37 +1281,51 @@ class DG4000Window(BaseDeviceWindow):
             QMessageBox.warning(self, "缺少 NI 设备", "请先在设备中心添加并选择 NI 采集卡。")
             return
         try:
-            values = self._sequence_values()
+            points = self._sequence_points()
         except ValueError as exc:
             QMessageBox.warning(self, "序列无效", str(exc))
             return
-        counter = (
-            self.connection_manager.counter_for(
-                ni_record,
-                counter=self.step_counter.currentData(),
-                terminal=self.step_terminal.currentText(),
-                rising=self.step_edge.currentText() == "上升沿",
+        if self.connection_manager is not None:
+            try:
+                self.connection_manager.acquire_devices(
+                    self._trigger_lease_owner,
+                    (self.record.id, ni_record.id),
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "设备正忙", str(exc))
+                return
+        try:
+            counter = (
+                self.connection_manager.counter_for(
+                    ni_record,
+                    counter=self.step_counter.currentData(),
+                    terminal=self.step_terminal.currentText(),
+                    rising=self.step_edge.currentText() == "上升沿",
+                )
+                if self.connection_manager is not None
+                else NIDaqEdgeCounter(
+                    ni_record.resource,
+                    counter=self.step_counter.currentData(),
+                    terminal=self.step_terminal.currentText(),
+                    rising=self.step_edge.currentText() == "上升沿",
+                )
             )
-            if self.connection_manager is not None
-            else NIDaqEdgeCounter(
-                ni_record.resource,
-                counter=self.step_counter.currentData(),
-                terminal=self.step_terminal.currentText(),
-                rising=self.step_edge.currentText() == "上升沿",
+            controller = TriggerStepController(
+                counter,
+                self.driver,
+                scan_points=points,
             )
-        )
-        controller = TriggerStepController(
-            counter,
-            self.driver,
-            self.step_target.currentData(),
-            self.step_channel.currentData(),
-            values,
-        )
+        except Exception as exc:
+            if self.connection_manager is not None:
+                self.connection_manager.release_devices(self._trigger_lease_owner)
+            QMessageBox.warning(self, "无法创建触发任务", str(exc))
+            return
         controller.add_callback(self.trigger_bridge.updated.emit)
         self.controller = controller
         self._last_trigger_error = None
         self.trigger_start.setEnabled(False)
         self.trigger_start.setText("启动中…")
+        self._set_scan_editing_enabled(False)
         self.submit(
             controller.start,
             on_success=lambda _=None: self.statusBar().showMessage("NI 触发步进已启动", 4000),
@@ -859,10 +1333,13 @@ class DG4000Window(BaseDeviceWindow):
         )
 
     def _trigger_start_failed(self, message: str) -> None:
+        if self.connection_manager is not None:
+            self.connection_manager.release_devices(self._trigger_lease_owner)
         self.controller = None
         self.trigger_start.setText("启动联动")
         self.trigger_start.setEnabled(True)
         self.trigger_stop.setEnabled(False)
+        self._set_scan_editing_enabled(True)
         self._show_hardware_error(message)
 
     def _stop_trigger(self) -> None:
@@ -872,9 +1349,12 @@ class DG4000Window(BaseDeviceWindow):
         self.trigger_stop.setEnabled(False)
 
         def stopped(_result: Any = None) -> None:
+            if self.connection_manager is not None:
+                self.connection_manager.release_devices(self._trigger_lease_owner)
             self.controller = None
             self.trigger_start.setText("启动联动")
             self.trigger_start.setEnabled(True)
+            self._set_scan_editing_enabled(True)
             self.statusBar().showMessage("触发步进已停止", 4000)
 
         self.submit(controller.stop, on_success=stopped)
@@ -885,10 +1365,25 @@ class DG4000Window(BaseDeviceWindow):
         self.trigger_metrics["backlog"].setText(str(snapshot.backlog))
         if snapshot.current_index is None:
             self.trigger_metrics["current"].setText("—")
+            self.trigger_metrics["current"].setToolTip("")
         else:
-            self.trigger_metrics["current"].setText(
-                f"#{snapshot.current_index + 1} · {snapshot.current_value:g}"
-            )
+            details = []
+            for item in snapshot.current_values:
+                display_value = item.display_value if item.display_value is not None else item.value
+                unit_key = item.unit_key or default_unit(item.parameter.unit_family)
+                symbol = unit_spec(item.parameter.unit_family, unit_key).symbol
+                details.append(
+                    f"CH{item.channel} {item.parameter.label} = {display_value:.12g} {symbol}"
+                )
+            if len(details) == 1:
+                self.trigger_metrics["current"].setText(
+                    f"#{snapshot.current_index + 1} · {details[0].split(' = ', 1)[1]}"
+                )
+            else:
+                self.trigger_metrics["current"].setText(
+                    f"#{snapshot.current_index + 1} · {len(details)} 轴"
+                )
+            self.trigger_metrics["current"].setToolTip("\n".join(details))
         running = snapshot.state in {ControllerState.STARTING, ControllerState.RUNNING}
         self.trigger_stop.setEnabled(running or snapshot.state is ControllerState.ERROR)
         if snapshot.state is ControllerState.RUNNING:
@@ -898,6 +1393,8 @@ class DG4000Window(BaseDeviceWindow):
         if snapshot.error and snapshot.error != self._last_trigger_error:
             self._last_trigger_error = snapshot.error
             self.statusBar().showMessage(snapshot.error, 10000)
+            if self.connection_manager is not None:
+                self.connection_manager.release_devices(self._trigger_lease_owner)
 
     def _clear_trigger_display(self) -> None:
         if self.controller and self.controller.snapshot().state is ControllerState.RUNNING:
@@ -906,29 +1403,38 @@ class DG4000Window(BaseDeviceWindow):
         for key in ("received", "applied", "backlog"):
             self.trigger_metrics[key].setText("0")
         self.trigger_metrics["current"].setText("—")
+        self.trigger_metrics["current"].setToolTip("")
 
-    @staticmethod
-    def _append_sequence_row(table: QTableWidget, value: float, note: str) -> None:
-        row = table.rowCount()
-        table.insertRow(row)
-        number = QTableWidgetItem(str(row + 1))
-        number.setFlags(number.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        table.setItem(row, 0, number)
-        table.setItem(row, 1, QTableWidgetItem(f"{value:.12g}"))
-        table.setItem(row, 2, QTableWidgetItem(note))
+    def _set_scan_editing_enabled(self, enabled: bool) -> None:
+        self.scan_mode.setEnabled(enabled)
+        self.add_scan_axis_button.setEnabled(enabled)
+        self.generate_scan_button.setEnabled(enabled)
+        self.add_scan_point_button.setEnabled(enabled)
+        self.remove_scan_point_button.setEnabled(enabled)
+        for axis in self.scan_axes:
+            axis.frame.setEnabled(enabled)
+        if enabled:
+            self.step_table.setEditTriggers(
+                QAbstractItemView.EditTrigger.DoubleClicked
+                | QAbstractItemView.EditTrigger.EditKeyPressed
+                | QAbstractItemView.EditTrigger.AnyKeyPressed
+            )
+            self._scan_configuration_changed()
+        else:
+            self.step_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
-    @staticmethod
-    def _remove_sequence_rows(table: QTableWidget) -> None:
-        rows = sorted({index.row() for index in table.selectedIndexes()}, reverse=True)
-        if not rows and table.currentRow() >= 0:
-            rows = [table.currentRow()]
+    def _remove_sequence_rows(self) -> None:
+        rows = sorted({index.row() for index in self.step_table.selectedIndexes()}, reverse=True)
+        if not rows and self.step_table.currentRow() >= 0:
+            rows = [self.step_table.currentRow()]
         for row in rows:
-            if table.rowCount() > 1:
-                table.removeRow(row)
-        for row in range(table.rowCount()):
-            table.item(row, 0).setText(str(row + 1))
-            if row == 0 and not table.item(row, 2).text():
-                table.item(row, 2).setText("起始点（第一个触发）")
+            if self.step_table.rowCount() > 1:
+                self.step_table.removeRow(row)
+        note_column = self.step_table.columnCount() - 1
+        for row in range(self.step_table.rowCount()):
+            self.step_table.item(row, 0).setText(str(row + 1))
+            if row == 0 and not self.step_table.item(row, note_column).text():
+                self.step_table.item(row, note_column).setText("起始点（第一个触发）")
 
     def _system_page(self) -> QWidget:
         page, layout = page_shell("存储与系统", "管理仪器状态文件、SCPI 控制台、显示和系统命令。")
@@ -991,6 +1497,8 @@ class DG4000Window(BaseDeviceWindow):
         if self.controller is not None:
             self.controller.stop()
             self.controller = None
+        if self.connection_manager is not None:
+            self.connection_manager.release_devices(self._trigger_lease_owner)
         if self.driver.is_connected and self.connection_manager is None:
             try:
                 self.driver.disconnect()
@@ -1007,11 +1515,17 @@ class NIDeviceWindow(BaseDeviceWindow):
     ) -> None:
         self.probe_service = DeviceProbeService()
         self.connection_manager = connection_manager
+        self._ni_lease_owner = f"ni-window:{record.id}"
         self.test_counter: NIDaqEdgeCounter | None = None
         self.counter_read_pending = False
+        self.analog_controller: AnalogAcquisitionController | None = None
+        self.analog_bridge = AnalogBridge()
+        self.analog_bridge.updated.connect(self._analog_updated)
+        self._last_analog_error: str | None = None
         navigation = [
             ("总览", self._overview_page),
             ("触发输入", self._trigger_page),
+            ("模拟输入", self._analog_input_page),
             ("计数器", self._counter_page),
             ("路由", self._routing_page),
             ("诊断", self._diagnostics_page),
@@ -1021,7 +1535,10 @@ class NIDeviceWindow(BaseDeviceWindow):
             self._ni_connected(self.connection_manager.info(record))
 
     def _overview_page(self) -> QWidget:
-        page, layout = page_shell("NI 采集卡总览", "该设备只承担外部触发检测与计数，不采集 DG4000 输出，也不通过 AO 控制参数。")
+        page, layout = page_shell(
+            "NI 采集卡总览",
+            "支持外部触发计数和独立模拟电压采集；不通过 AO 电压控制 DG4000 参数。",
+        )
         metrics = QHBoxLayout()
         for caption, value, color in (
             ("设备状态", "未连接", "#f0b95d"),
@@ -1036,7 +1553,7 @@ class NIDeviceWindow(BaseDeviceWindow):
         form = QFormLayout()
         form.addRow("NI 设备名", QLabel(self.record.resource))
         form.addRow("连接方式", QLabel(self.record.connection or "NI-DAQmx 本机设备"))
-        form.addRow("用途", QLabel("外部边沿触发计数 → 通知 SCPI 下发队列"))
+        form.addRow("用途", QLabel("外部边沿触发联动；独立模拟输入、绘图与 CSV 保存"))
         self.ni_identity = QLabel("检测后读取产品类型和序列号")
         self.ni_identity.setWordWrap(True)
         form.addRow("驱动报告", self.ni_identity)
@@ -1162,6 +1679,7 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.driver_status.style().unpolish(self.driver_status)
         self.driver_status.style().polish(self.driver_status)
         self.statusBar().showMessage("NI 设备已由 NI-DAQmx 识别", 5000)
+        self._refresh_analog_channels()
 
     def _ni_connection_failed(self, message: str) -> None:
         self.ni_connect_button.setEnabled(True)
@@ -1172,6 +1690,13 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.ni_disconnect_button.setEnabled(False)
         if self.test_counter is not None:
             self._stop_ni_counter()
+        if self.analog_controller is not None and self.analog_controller.snapshot().state in {
+            AnalogAcquisitionState.STARTING,
+            AnalogAcquisitionState.RUNNING,
+            AnalogAcquisitionState.ERROR,
+        }:
+            self.analog_controller.stop()
+            self._analog_stopped()
         if self.connection_manager is None:
             self._ni_disconnected()
             return
@@ -1192,7 +1717,10 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.statusBar().showMessage("NI 设备连接已释放", 4000)
 
     def _trigger_page(self) -> QWidget:
-        page, layout = page_shell("触发输入", "选择接收外部触发的 PFI 端子和有效边沿；不配置模拟输入或模拟输出。")
+        page, layout = page_shell(
+            "触发输入",
+            "选择接收外部触发的 PFI 端子和有效边沿；模拟输入在独立页面配置。",
+        )
         settings, settings_layout = panel("数字边沿")
         form = QFormLayout()
         terminal = QComboBox()
@@ -1217,6 +1745,434 @@ class NIDeviceWindow(BaseDeviceWindow):
         layout.addWidget(note)
         layout.addStretch()
         return page
+
+    def _analog_input_page(self) -> QWidget:
+        page, layout = page_shell(
+            "模拟输入采集",
+            "使用 NI-DAQmx 硬件定时连续采集电压，实时绘图，并将当前保留数据保存为 CSV。",
+        )
+
+        upper = QHBoxLayout()
+        upper.setSpacing(14)
+        settings, settings_layout = panel("采集配置")
+        settings.setMinimumWidth(375)
+        self.ai_config_tabs = QTabWidget()
+        acquisition_tab = QWidget()
+        form = QFormLayout(acquisition_tab)
+        self.ai_channel_list = QListWidget()
+        self.ai_channel_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.MultiSelection
+        )
+        self.ai_channel_list.setMaximumHeight(105)
+        default_channels = (
+            tuple(f"{self.record.resource}/ai{index}" for index in range(4))
+            if is_virtual_resource(self.record.resource)
+            else tuple(f"{self.record.resource}/ai{index}" for index in range(8))
+        )
+        self._set_analog_channel_items(default_channels)
+        self.ai_terminal_mode = QComboBox()
+        for label, value in (
+            ("设备默认", "DEFAULT"),
+            ("RSE 单端参考地", "RSE"),
+            ("NRSE 非参考单端", "NRSE"),
+            ("DIFF 差分", "DIFF"),
+            ("伪差分", "PSEUDODIFF"),
+        ):
+            self.ai_terminal_mode.addItem(label, value)
+        self.ai_sample_rate = unit_value_spin(
+            10_000, 1, 5_000_000, "frequency", "kHz"
+        )
+        self.ai_minimum = unit_value_spin(-10, -100, 99.999999, "voltage", "V")
+        self.ai_maximum = unit_value_spin(10, -99.999999, 100, "voltage", "V")
+        self.ai_block_size = QSpinBox()
+        self.ai_block_size.setRange(1, 1_000_000)
+        self.ai_block_size.setValue(1000)
+        self.ai_block_size.setSingleStep(100)
+        self.ai_block_size.setSuffix(" 点/通道")
+        self.ai_retained_samples = QSpinBox()
+        self.ai_retained_samples.setRange(1_000, 5_000_000)
+        self.ai_retained_samples.setValue(500_000)
+        self.ai_retained_samples.setSingleStep(10_000)
+        self.ai_retained_samples.setSuffix(" 点/通道")
+        form.addRow("模拟通道（可多选）", self.ai_channel_list)
+        form.addRow("端接方式", self.ai_terminal_mode)
+        form.addRow("采样率", self.ai_sample_rate)
+        form.addRow("量程下限", self.ai_minimum)
+        form.addRow("量程上限", self.ai_maximum)
+        form.addRow("每次读取", self.ai_block_size)
+        form.addRow("内存保留上限", self.ai_retained_samples)
+        self.ai_config_tabs.addTab(acquisition_tab, "采集任务")
+
+        self.analog_config_widgets = [
+            self.ai_channel_list,
+            self.ai_terminal_mode,
+            self.ai_sample_rate,
+            self.ai_minimum,
+            self.ai_maximum,
+            self.ai_block_size,
+            self.ai_retained_samples,
+        ]
+
+        if is_virtual_resource(self.record.resource):
+            virtual_tab = QWidget()
+            virtual_form = QFormLayout(virtual_tab)
+            self.ai_virtual_frequency = unit_value_spin(
+                50, 0, 1_000_000, "frequency", "Hz"
+            )
+            self.ai_virtual_amplitude = unit_value_spin(1, 0, 100, "voltage", "V")
+            self.ai_virtual_offset = unit_value_spin(0, -100, 100, "voltage", "V")
+            self.ai_virtual_noise = unit_value_spin(0.01, 0, 10, "voltage", "mV")
+            virtual_form.addRow("正弦频率", self.ai_virtual_frequency)
+            virtual_form.addRow("峰值幅度", self.ai_virtual_amplitude)
+            virtual_form.addRow("直流偏置", self.ai_virtual_offset)
+            virtual_form.addRow("噪声峰值", self.ai_virtual_noise)
+            virtual_note = QLabel("各通道具有 45° 相位差，便于验证多通道绘图。")
+            virtual_note.setObjectName("Muted")
+            virtual_note.setWordWrap(True)
+            virtual_form.addRow(virtual_note)
+            self.ai_config_tabs.addTab(virtual_tab, "虚拟信号源")
+            self.analog_config_widgets.extend(
+                [
+                    self.ai_virtual_frequency,
+                    self.ai_virtual_amplitude,
+                    self.ai_virtual_offset,
+                    self.ai_virtual_noise,
+                ]
+            )
+        settings_layout.addWidget(self.ai_config_tabs, 1)
+
+        self.ai_start = QPushButton("开始采集")
+        self.ai_start.setObjectName("PrimaryButton")
+        self.ai_stop = QPushButton("停止")
+        self.ai_stop.setEnabled(False)
+        self.ai_clear = QPushButton("清空数据")
+        self.ai_save_csv = QPushButton("保存 CSV")
+        self.ai_save_csv.setEnabled(False)
+        self.ai_start.clicked.connect(self._start_analog_input)
+        self.ai_stop.clicked.connect(self._stop_analog_input)
+        self.ai_clear.clicked.connect(self._clear_analog_data)
+        self.ai_save_csv.clicked.connect(self._save_analog_csv)
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.ai_start)
+        action_row.addWidget(self.ai_stop)
+        action_row.addWidget(self.ai_clear)
+        action_row.addWidget(self.ai_save_csv)
+        settings_layout.addLayout(action_row)
+
+        plot_panel, plot_layout = panel("实时波形")
+        self.ai_plot = WaveformPlot()
+        plot_layout.addWidget(self.ai_plot, 1)
+        plot_actions = QHBoxLayout()
+        self.ai_plot_status = QLabel("● 等待采集")
+        self.ai_plot_status.setObjectName("StatusPending")
+        self.ai_save_png = QPushButton("保存波形图片")
+        self.ai_save_png.clicked.connect(self._save_analog_png)
+        plot_actions.addWidget(self.ai_plot_status)
+        plot_actions.addStretch()
+        plot_actions.addWidget(self.ai_save_png)
+        plot_layout.addLayout(plot_actions)
+        upper.addWidget(settings, 1)
+        upper.addWidget(plot_panel, 2)
+        layout.addLayout(upper, 1)
+
+        metrics = QHBoxLayout()
+        self.ai_metrics: dict[str, QLabel] = {}
+        for key, caption, value, color in (
+            ("channels", "采集通道", "0", "#8f7cff"),
+            ("samples", "每通道总点数", "0", "#55d9cc"),
+            ("duration", "采集时长", "0 s", "#f0b95d"),
+            ("retained", "保留 / 丢弃", "0 / 0", "#e7ebf4"),
+        ):
+            card, number = metric_card(caption, value, color)
+            self.ai_metrics[key] = number
+            metrics.addWidget(card)
+        layout.addLayout(metrics)
+        self.ai_statistics = QLabel("最近数据块统计：—")
+        self.ai_statistics.setObjectName("Muted")
+        self.ai_statistics.setWordWrap(True)
+        layout.addWidget(self.ai_statistics)
+        return page
+
+    def _set_analog_channel_items(self, channel_names: tuple[str, ...]) -> None:
+        if not hasattr(self, "ai_channel_list"):
+            return
+        selected = {
+            item.data(Qt.ItemDataRole.UserRole)
+            for item in self.ai_channel_list.selectedItems()
+        }
+        self.ai_channel_list.clear()
+        for index, channel in enumerate(channel_names):
+            item = QListWidgetItem(channel)
+            item.setData(Qt.ItemDataRole.UserRole, channel)
+            self.ai_channel_list.addItem(item)
+            item.setSelected(channel in selected or (not selected and index == 0))
+        if self.ai_channel_list.count() and not self.ai_channel_list.selectedItems():
+            self.ai_channel_list.item(0).setSelected(True)
+
+    def _refresh_analog_channels(self) -> None:
+        if not hasattr(self, "ai_channel_list"):
+            return
+
+        def completed(channels: Any) -> None:
+            normalized = tuple(str(channel) for channel in channels)
+            if normalized:
+                self._set_analog_channel_items(normalized)
+                self.statusBar().showMessage(
+                    f"检测到 {len(normalized)} 个模拟输入通道", 4000
+                )
+            else:
+                self._set_analog_channel_items(())
+                self.statusBar().showMessage("该 NI 设备未报告模拟输入通道", 8000)
+
+        if self.connection_manager is not None:
+            operation = lambda: self.connection_manager.analog_channels_for(self.record)
+        else:
+            operation = lambda: NIDaqAnalogInput.available_channels(self.record.resource)
+        self.submit(operation, on_success=completed, on_error=self._analog_channel_error)
+
+    def _analog_channel_error(self, message: str) -> None:
+        self.statusBar().showMessage(f"模拟输入通道检测失败：{message}", 8000)
+
+    def _analog_config(self) -> AnalogInputConfig:
+        channels = tuple(
+            item.data(Qt.ItemDataRole.UserRole) or item.text()
+            for item in self.ai_channel_list.selectedItems()
+        )
+        config = AnalogInputConfig(
+            channels=channels,
+            sample_rate_hz=self.ai_sample_rate.value(),
+            samples_per_read=self.ai_block_size.value(),
+            minimum_v=self.ai_minimum.value(),
+            maximum_v=self.ai_maximum.value(),
+            terminal_mode=self.ai_terminal_mode.currentData(),
+        )
+        config.validate()
+        return config
+
+    def _start_analog_input(self) -> None:
+        connected = (
+            self.connection_manager.is_connected(self.record)
+            if self.connection_manager is not None
+            else self.ni_disconnect_button.isEnabled()
+        )
+        if not connected:
+            QMessageBox.information(self, "NI 尚未连接", "请先在总览页连接 NI 设备。")
+            return
+        try:
+            if self.connection_manager is not None:
+                self.connection_manager.acquire_devices(
+                    self._ni_lease_owner, (self.record.id,)
+                )
+            config = self._analog_config()
+            if self.connection_manager is not None:
+                reader = self.connection_manager.analog_input_for(
+                    self.record,
+                    config,
+                    signal_frequency_hz=(
+                        self.ai_virtual_frequency.value()
+                        if hasattr(self, "ai_virtual_frequency")
+                        else 50.0
+                    ),
+                    amplitude_v=(
+                        self.ai_virtual_amplitude.value()
+                        if hasattr(self, "ai_virtual_amplitude")
+                        else 1.0
+                    ),
+                    offset_v=(
+                        self.ai_virtual_offset.value()
+                        if hasattr(self, "ai_virtual_offset")
+                        else 0.0
+                    ),
+                    noise_v=(
+                        self.ai_virtual_noise.value()
+                        if hasattr(self, "ai_virtual_noise")
+                        else 0.01
+                    ),
+                )
+            else:
+                reader = NIDaqAnalogInput(self.record.resource, config)
+            controller = AnalogAcquisitionController(
+                reader,
+                maximum_retained_samples=self.ai_retained_samples.value(),
+            )
+        except Exception as exc:
+            self._release_ni_lease_if_idle()
+            QMessageBox.warning(self, "采集配置无效", str(exc))
+            return
+
+        controller.add_callback(self.analog_bridge.updated.emit)
+        self.analog_controller = controller
+        self._last_analog_error = None
+        self.ai_plot.clear()
+        self.ai_start.setEnabled(False)
+        self.ai_start.setText("启动中…")
+        self.ai_stop.setEnabled(False)
+        self.ai_save_csv.setEnabled(False)
+        self._set_analog_config_enabled(False)
+        self.submit(
+            controller.start,
+            on_success=lambda _=None: self.statusBar().showMessage(
+                "NI 模拟输入采集已启动", 4000
+            ),
+            on_error=self._analog_start_failed,
+        )
+
+    def _analog_start_failed(self, message: str) -> None:
+        self.ai_start.setText("开始采集")
+        self.ai_start.setEnabled(True)
+        self.ai_stop.setEnabled(False)
+        self._set_analog_config_enabled(True)
+        self._release_ni_lease_if_idle()
+        self._show_hardware_error(message)
+
+    def _stop_analog_input(self) -> None:
+        controller = self.analog_controller
+        if controller is None:
+            return
+        self.ai_stop.setEnabled(False)
+        self.submit(controller.stop, on_success=self._analog_stopped)
+
+    def _analog_stopped(self, _result: Any = None) -> None:
+        self.ai_start.setText("开始采集")
+        self.ai_start.setEnabled(True)
+        self.ai_stop.setEnabled(False)
+        self._set_analog_config_enabled(True)
+        controller = self.analog_controller
+        has_data = bool(controller and controller.snapshot().retained_samples)
+        self.ai_save_csv.setEnabled(has_data)
+        self._release_ni_lease_if_idle()
+        self.statusBar().showMessage("NI 模拟输入采集已停止，数据仍保留", 4000)
+
+    def _analog_updated(self, update: AnalogAcquisitionUpdate) -> None:
+        snapshot = update.snapshot
+        if update.block is not None:
+            self.ai_plot.append_block(update.block)
+        self.ai_metrics["channels"].setText(str(len(snapshot.channel_names)))
+        self.ai_metrics["samples"].setText(str(snapshot.total_samples))
+        self.ai_metrics["duration"].setText(f"{snapshot.duration_seconds:.6g} s")
+        self.ai_metrics["retained"].setText(
+            f"{snapshot.retained_samples} / {snapshot.dropped_samples}"
+        )
+        if snapshot.channel_names and snapshot.minimum_v:
+            details = []
+            for name, minimum, maximum, rms in zip(
+                snapshot.channel_names,
+                snapshot.minimum_v,
+                snapshot.maximum_v,
+                snapshot.rms_v,
+            ):
+                details.append(
+                    f"{name.split('/')[-1]}: min {minimum:.6g} V, "
+                    f"max {maximum:.6g} V, RMS {rms:.6g} V"
+                )
+            self.ai_statistics.setText("最近数据块统计：" + "；".join(details))
+
+        state_text = {
+            AnalogAcquisitionState.STOPPED: "● 已停止",
+            AnalogAcquisitionState.STARTING: "● 启动中",
+            AnalogAcquisitionState.RUNNING: "● 正在采集",
+            AnalogAcquisitionState.STOPPING: "● 正在停止",
+            AnalogAcquisitionState.ERROR: "● 采集错误",
+        }[snapshot.state]
+        self.ai_plot_status.setText(state_text)
+        online = snapshot.state is AnalogAcquisitionState.RUNNING
+        self.ai_plot_status.setObjectName(
+            "StatusOnline"
+            if online
+            else (
+                "StatusOffline"
+                if snapshot.state is AnalogAcquisitionState.ERROR
+                else "StatusPending"
+            )
+        )
+        self.ai_plot_status.style().unpolish(self.ai_plot_status)
+        self.ai_plot_status.style().polish(self.ai_plot_status)
+        self.ai_stop.setEnabled(online)
+        if snapshot.state is AnalogAcquisitionState.RUNNING:
+            self.ai_start.setText("采集中")
+        elif snapshot.state is AnalogAcquisitionState.ERROR:
+            self.ai_start.setText("开始采集")
+            self.ai_start.setEnabled(True)
+            self._set_analog_config_enabled(True)
+            self._release_ni_lease_if_idle()
+        self.ai_save_csv.setEnabled(
+            snapshot.retained_samples > 0
+            and snapshot.state not in {
+                AnalogAcquisitionState.STARTING,
+                AnalogAcquisitionState.RUNNING,
+                AnalogAcquisitionState.STOPPING,
+            }
+        )
+        if snapshot.error and snapshot.error != self._last_analog_error:
+            self._last_analog_error = snapshot.error
+            self.statusBar().showMessage(snapshot.error, 10000)
+
+    def _set_analog_config_enabled(self, enabled: bool) -> None:
+        for widget in self.analog_config_widgets:
+            widget.setEnabled(enabled)
+        self.ai_clear.setEnabled(enabled)
+
+    def _clear_analog_data(self) -> None:
+        controller = self.analog_controller
+        if controller is not None:
+            try:
+                controller.clear()
+            except RuntimeError as exc:
+                QMessageBox.information(self, "采集正在运行", str(exc))
+                return
+        self.ai_plot.clear()
+        self.ai_metrics["channels"].setText("0")
+        self.ai_metrics["samples"].setText("0")
+        self.ai_metrics["duration"].setText("0 s")
+        self.ai_metrics["retained"].setText("0 / 0")
+        self.ai_statistics.setText("最近数据块统计：—")
+        self.ai_save_csv.setEnabled(False)
+
+    def _save_analog_csv(self) -> None:
+        controller = self.analog_controller
+        if controller is None or controller.snapshot().retained_samples == 0:
+            QMessageBox.information(self, "没有数据", "请先完成一次模拟输入采集。")
+            return
+        default_name = f"NI_AI_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "保存模拟输入数据",
+            str(Path.cwd() / default_name),
+            "CSV 数据 (*.csv)",
+        )
+        if not path:
+            return
+        destination = Path(path)
+        if destination.suffix.lower() != ".csv":
+            destination = destination.with_suffix(destination.suffix + ".csv")
+        self.ai_save_csv.setEnabled(False)
+        self.submit(
+            lambda: controller.save_csv(destination),
+            on_success=lambda result: self._analog_csv_saved(result),
+            on_error=lambda message: (
+                self.ai_save_csv.setEnabled(True),
+                self._show_hardware_error(message),
+            ),
+        )
+
+    def _analog_csv_saved(self, path: Any) -> None:
+        self.ai_save_csv.setEnabled(True)
+        self.statusBar().showMessage(f"模拟输入数据已保存：{path}", 8000)
+
+    def _save_analog_png(self) -> None:
+        default_name = f"NI_AI_Waveform_{datetime.now():%Y%m%d_%H%M%S}.png"
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "保存波形图片",
+            str(Path.cwd() / default_name),
+            "PNG 图片 (*.png)",
+        )
+        if path:
+            destination = Path(path)
+            if destination.suffix.lower() != ".png":
+                destination = destination.with_suffix(destination.suffix + ".png")
+            if self.ai_plot.save_png(destination):
+                self.statusBar().showMessage(f"波形图片已保存：{destination}", 8000)
 
     def _counter_page(self) -> QWidget:
         page, layout = page_shell("计数器", "为联动任务选择硬件边沿计数器并查看单调递增的触发总数。")
@@ -1260,21 +2216,31 @@ class NIDeviceWindow(BaseDeviceWindow):
     def _start_ni_counter(self, counter: QComboBox, terminal: QComboBox, edge: QComboBox) -> None:
         if self.test_counter is not None:
             return
-        self.test_counter = (
-            self.connection_manager.counter_for(
-                self.record,
-                counter=counter.currentText(),
-                terminal=terminal.currentText(),
-                rising=edge.currentText() == "上升沿",
+        try:
+            if self.connection_manager is not None:
+                self.connection_manager.acquire_devices(
+                    self._ni_lease_owner, (self.record.id,)
+                )
+            self.test_counter = (
+                self.connection_manager.counter_for(
+                    self.record,
+                    counter=counter.currentText(),
+                    terminal=terminal.currentText(),
+                    rising=edge.currentText() == "上升沿",
+                )
+                if self.connection_manager is not None
+                else NIDaqEdgeCounter(
+                    self.record.resource,
+                    counter=counter.currentText(),
+                    terminal=terminal.currentText(),
+                    rising=edge.currentText() == "上升沿",
+                )
             )
-            if self.connection_manager is not None
-            else NIDaqEdgeCounter(
-                self.record.resource,
-                counter=counter.currentText(),
-                terminal=terminal.currentText(),
-                rising=edge.currentText() == "上升沿",
-            )
-        )
+        except Exception as exc:
+            self.test_counter = None
+            self._release_ni_lease_if_idle()
+            QMessageBox.warning(self, "无法创建计数任务", str(exc))
+            return
         self.ni_counter_start.setEnabled(False)
 
         def started(_result: Any = None) -> None:
@@ -1285,6 +2251,7 @@ class NIDeviceWindow(BaseDeviceWindow):
         def failed(message: str) -> None:
             self.test_counter = None
             self.ni_counter_start.setEnabled(True)
+            self._release_ni_lease_if_idle()
             self._show_hardware_error(message)
 
         self.submit(self.test_counter.start, on_success=started, on_error=failed)
@@ -1313,9 +2280,23 @@ class NIDeviceWindow(BaseDeviceWindow):
 
         def stopped(_result: Any = None) -> None:
             self.ni_counter_start.setEnabled(True)
+            self._release_ni_lease_if_idle()
             self.statusBar().showMessage("NI 计数已停止", 4000)
 
         self.submit(counter.stop, on_success=stopped)
+
+    def _release_ni_lease_if_idle(self) -> None:
+        if self.connection_manager is None or self.test_counter is not None:
+            return
+        analog_busy = False
+        if self.analog_controller is not None:
+            analog_busy = self.analog_controller.snapshot().state in {
+                AnalogAcquisitionState.STARTING,
+                AnalogAcquisitionState.RUNNING,
+                AnalogAcquisitionState.STOPPING,
+            }
+        if not analog_busy:
+            self.connection_manager.release_devices(self._ni_lease_owner)
 
     def _routing_page(self) -> QWidget:
         page, layout = page_shell("端子与路由", "记录外部触发接线并检查 PFI/计数器端子映射。")
@@ -1346,6 +2327,11 @@ class NIDeviceWindow(BaseDeviceWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._stop_virtual_continuous()
+        if self.analog_controller is not None:
+            try:
+                self.analog_controller.stop()
+            except Exception:
+                pass
         if self.test_counter is not None:
             self.ni_counter_timer.stop()
             try:
@@ -1353,6 +2339,8 @@ class NIDeviceWindow(BaseDeviceWindow):
             except Exception:
                 pass
             self.test_counter = None
+        if self.connection_manager is not None:
+            self.connection_manager.release_devices(self._ni_lease_owner)
         super().closeEvent(event)
 
 

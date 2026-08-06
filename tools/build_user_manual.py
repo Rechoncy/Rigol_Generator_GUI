@@ -210,9 +210,9 @@ def cover_story(style_map):
     )
     features = [
         [Paragraph("多设备", style_map["table_head"]), Paragraph("首页统一管理、共享连接、独立设置窗口", style_map["table_head"])],
-        [Paragraph("触发步进", style_map["table"]), Paragraph("频率、幅度、相位、PSK 相位、FSK 频率", style_map["table"])],
-        [Paragraph("虚拟实验室", style_map["table"]), Paragraph("无硬件体验单次、批量、连续触发和积压追平", style_map["table"])],
-        [Paragraph("实机接口", style_map["table"]), Paragraph("PyVISA + NI-DAQmx，NI 只进行硬件累计边沿计数", style_map["table"])],
+        [Paragraph("跨设备扫描", style_map["table"]), Paragraph("一个 NI 驱动多台 DG、任务保存、完成屏障和 CSV 运行日志", style_map["table"])],
+        [Paragraph("负载与采集", style_map["table"]), Paragraph("DG4000 负载阻抗、NI 多通道模拟输入、实时绘图与 CSV", style_map["table"])],
+        [Paragraph("虚拟实验室", style_map["table"]), Paragraph("无硬件体验触发联动、积压追平和模拟波形采集", style_map["table"])],
     ]
     feature_table = Table(features, colWidths=[37 * mm, 123 * mm])
     feature_table.setStyle(
@@ -241,7 +241,7 @@ def cover_story(style_map):
         feature_table,
         Spacer(1, 13 * mm),
         Table(
-            [[Paragraph("版本 0.2.1", small), Paragraph("2026-08-05", small)]],
+            [[Paragraph("版本 0.5.0", small), Paragraph("2026-08-06", small)]],
             colWidths=[80 * mm, 80 * mm],
             style=TableStyle([("ALIGN", (1, 0), (1, 0), "RIGHT")]),
         ),
@@ -454,7 +454,7 @@ def draw_header_footer(canvas, document) -> None:
         canvas.drawString(MARGIN_X, PAGE_HEIGHT - 9.3 * mm, "DG4000 + NI 多设备联动控制软件使用说明")
     canvas.setFont("CN", 7.5)
     canvas.setFillColor(MUTED)
-    canvas.drawString(MARGIN_X, 8 * mm, "版本 0.2.1")
+    canvas.drawString(MARGIN_X, 8 * mm, "版本 0.5.0")
     canvas.drawRightString(PAGE_WIDTH - MARGIN_X, 8 * mm, f"第 {page} 页")
     canvas.restoreState()
 
@@ -473,7 +473,7 @@ def build() -> Path:
         bottomMargin=MARGIN_BOTTOM,
         title="DG4000 + NI 多设备联动控制软件使用说明",
         author="Rigol Generator GUI Project",
-        subject="设备管理、虚拟实验室、触发步进和实机联调",
+        subject="设备管理、跨设备联合扫描、运行日志、负载阻抗、模拟采集、虚拟实验室和实机联调",
     )
     document.build(story, onFirstPage=draw_header_footer, onLaterPages=draw_header_footer)
     reader = PdfReader(str(OUTPUT))

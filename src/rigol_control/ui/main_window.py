@@ -19,9 +19,10 @@ from ..connections import ConnectionInfo, DeviceConnectionManager
 from ..models import DeviceKind, DeviceRecord
 from ..repository import DeviceRepository, DuplicateDeviceError
 from ..services import DeviceProbeService, ProbeResult
-from ..virtual_lab import VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
+from ..virtual_lab import VIRTUAL_DG2_RESOURCE, VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
 from .device_windows import BaseDeviceWindow, create_device_window
 from .dialogs import DeviceDialog
+from .linkage_window import LinkageTaskWindow
 from .widgets import AddDeviceCard, CallTask, DeviceCard, ProbeTask
 
 
@@ -41,6 +42,7 @@ class DeviceCenterWindow(QMainWindow):
         self.probe_tasks: dict[str, ProbeTask] = {}
         self.connection_tasks: dict[str, CallTask] = {}
         self.open_windows: dict[str, BaseDeviceWindow] = {}
+        self.linkage_window: LinkageTaskWindow | None = None
         self._last_columns = 0
 
         self.setWindowTitle("实验室设备中心")
@@ -71,14 +73,18 @@ class DeviceCenterWindow(QMainWindow):
         refresh = QPushButton("刷新状态")
         refresh.clicked.connect(self.probe_all)
         virtual = QPushButton("虚拟实验室")
-        virtual.setToolTip("创建并连接一套无需硬件的 DG4000 + NI 模拟设备")
+        virtual.setToolTip("创建并连接两台虚拟 DG4000 和一台虚拟 NI")
         virtual.clicked.connect(self.create_virtual_lab)
+        linkage = QPushButton("跨设备联动")
+        linkage.setToolTip("使用一个 NI 触发源统一驱动多台 DG4000 的联合扫描")
+        linkage.clicked.connect(self.open_linkage_tasks)
         add = QPushButton("＋ 添加设备")
         add.setObjectName("PrimaryButton")
         add.clicked.connect(self.add_device)
         header_layout.addWidget(self.count_label)
         header_layout.addWidget(refresh)
         header_layout.addWidget(virtual)
+        header_layout.addWidget(linkage)
         header_layout.addWidget(add)
         outer.addWidget(header)
 
@@ -100,7 +106,7 @@ class DeviceCenterWindow(QMainWindow):
         path.setToolTip(f"保存位置：{self.repository.path}")
         footer.addWidget(path)
         footer.addStretch()
-        version = QLabel("DG4000 + NI 联动控制 · v0.2.1")
+        version = QLabel("DG4000 + NI 联动控制 · v0.5.0")
         version.setObjectName("Muted")
         footer.addWidget(version)
         outer.addLayout(footer)
@@ -178,6 +184,11 @@ class DeviceCenterWindow(QMainWindow):
                 VIRTUAL_DG_RESOURCE,
             ),
             (
+                DeviceKind.DG4000,
+                "虚拟 DG4162-B",
+                VIRTUAL_DG2_RESOURCE,
+            ),
+            (
                 DeviceKind.NI_DAQ,
                 "虚拟 NI USB-6363",
                 VIRTUAL_NI_RESOURCE,
@@ -210,6 +221,25 @@ class DeviceCenterWindow(QMainWindow):
         self.reload_devices()
         for device_id in virtual_ids:
             QTimer.singleShot(0, lambda key=device_id: self.connect_device(key))
+
+    def open_linkage_tasks(self) -> None:
+        if self.linkage_window is not None:
+            self.linkage_window.showNormal()
+            self.linkage_window.raise_()
+            self.linkage_window.activateWindow()
+            return
+        self.linkage_window = LinkageTaskWindow(
+            self.repository,
+            self.connection_manager,
+            parent=None,
+        )
+        self.linkage_window.destroyed.connect(self._linkage_window_destroyed)
+        self.linkage_window.show()
+        self.linkage_window.raise_()
+        self.linkage_window.activateWindow()
+
+    def _linkage_window_destroyed(self, _object=None) -> None:
+        self.linkage_window = None
 
     def edit_device(self, device_id: str) -> None:
         record = self.repository.get(device_id)
@@ -372,5 +402,8 @@ class DeviceCenterWindow(QMainWindow):
         self.connection_timer.stop()
         for window in list(self.open_windows.values()):
             window.close()
+        if self.linkage_window is not None:
+            self.linkage_window.close()
+            self.linkage_window = None
         self.connection_manager.close_all()
         super().closeEvent(event)

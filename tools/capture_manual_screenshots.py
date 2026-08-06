@@ -13,11 +13,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from rigol_control.app import create_application
 from rigol_control.connections import DeviceConnectionManager
+from rigol_control.drivers.dg4000 import StepParameter
 from rigol_control.models import DeviceKind
 from rigol_control.repository import DeviceRepository
 from rigol_control.ui.dialogs import DeviceDialog
 from rigol_control.ui.main_window import DeviceCenterWindow
-from rigol_control.virtual_lab import VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
+from rigol_control.virtual_lab import VIRTUAL_DG2_RESOURCE, VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
 
 
 OUTPUT = ROOT / "tmp" / "pdfs" / "screenshots"
@@ -60,7 +61,7 @@ def main() -> int:
     home.create_virtual_lab()
     wait(
         app,
-        lambda: len(repository.list()) == 2
+        lambda: len(repository.list()) == 3
         and all(manager.is_connected(record) for record in repository.list()),
     )
     capture(home, "01-device-center.png", app)
@@ -74,6 +75,7 @@ def main() -> int:
     records = repository.list()
     dg = next(record for record in records if record.resource == VIRTUAL_DG_RESOURCE)
     ni = next(record for record in records if record.resource == VIRTUAL_NI_RESOURCE)
+    dg2 = next(record for record in records if record.resource == VIRTUAL_DG2_RESOURCE)
     home.open_device(dg.id)
     home.open_device(ni.id)
     wait(app, lambda: dg.id in home.open_windows and ni.id in home.open_windows)
@@ -90,6 +92,8 @@ def main() -> int:
     capture(ni_window, "05-virtual-ni-trigger-console.png", app)
 
     dg_window._select_page(4)
+    dg_window._add_scan_axis()
+    dg_window._generate_scan_table(show_message=False)
     dg_window.simulation_delay.setValue(80)
     dg_window._start_trigger()
     wait(
@@ -109,6 +113,53 @@ def main() -> int:
 
     dg_window._stop_trigger()
     wait(app, lambda: dg_window.controller is None)
+
+    home.open_linkage_tasks()
+    linkage = home.linkage_window
+    linkage.resize(1320, 850)
+    first_axis = linkage.axis_editors[0]
+    first_axis.device.setCurrentIndex(first_axis.device.findData(dg.id))
+    first_axis.start.setValue(1)
+    first_axis.step.setValue(1)
+    first_axis.count.setValue(4)
+    linkage._add_axis()
+    second_axis = linkage.axis_editors[1]
+    second_axis.device.setCurrentIndex(second_axis.device.findData(dg2.id))
+    second_axis.parameter.setCurrentIndex(
+        second_axis.parameter.findData(StepParameter.AMPLITUDE)
+    )
+    second_axis.start.setValue(0.5)
+    second_axis.step.setValue(0.25)
+    second_axis.count.setValue(4)
+    linkage._generate_table(show_message=False)
+    linkage._start()
+    wait(
+        app,
+        lambda: linkage.controller is not None
+        and linkage.controller.snapshot().state.value == "running",
+    )
+    linkage._emit_virtual(5)
+    wait(app, lambda: linkage.controller.snapshot().applied_count == 5, timeout=5.0)
+    linkage.scroll.verticalScrollBar().setValue(
+        linkage.scroll.verticalScrollBar().maximum()
+    )
+    capture(linkage, "09-cross-device-linkage.png", app)
+    linkage._stop()
+
+    ni_window._select_page(2)
+    ni_window.ai_channel_list.item(1).setSelected(True)
+    ni_window.ai_sample_rate.setValue(10_000)
+    ni_window.ai_block_size.setValue(500)
+    ni_window._start_analog_input()
+    wait(
+        app,
+        lambda: ni_window.analog_controller is not None
+        and ni_window.analog_controller.snapshot().total_samples >= 2500
+        and ni_window.ai_plot.displayed_samples >= 2000,
+    )
+    capture(ni_window, "08-ni-analog-input.png", app)
+    ni_window._stop_analog_input()
+    wait(app, lambda: ni_window.analog_controller.snapshot().state.value == "stopped")
     home.close()
     app.processEvents()
     print(f"已生成 {len(list(OUTPUT.glob('*.png')))} 张截图：{OUTPUT}")

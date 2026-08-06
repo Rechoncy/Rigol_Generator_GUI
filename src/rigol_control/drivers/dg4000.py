@@ -34,6 +34,26 @@ class StepParameter(str, Enum):
             StepParameter.FSK_FREQUENCY: "Hz",
         }[self]
 
+    @property
+    def unit_family(self) -> str:
+        return {
+            StepParameter.FREQUENCY: "frequency",
+            StepParameter.AMPLITUDE: "amplitude",
+            StepParameter.PHASE: "angle",
+            StepParameter.PSK_PHASE: "angle",
+            StepParameter.FSK_FREQUENCY: "frequency",
+        }[self]
+
+    @property
+    def short_label(self) -> str:
+        return {
+            StepParameter.FREQUENCY: "频率",
+            StepParameter.AMPLITUDE: "幅度",
+            StepParameter.PHASE: "相位",
+            StepParameter.PSK_PHASE: "PSK 相位",
+            StepParameter.FSK_FREQUENCY: "FSK 频率",
+        }[self]
+
     def command(self, channel: int) -> str:
         validate_channel(channel)
         return {
@@ -43,6 +63,15 @@ class StepParameter(str, Enum):
             StepParameter.PSK_PHASE: f":SOUR{channel}:MOD:PSK:PHAS",
             StepParameter.FSK_FREQUENCY: f":SOUR{channel}:MOD:FSK:FREQ",
         }[self]
+
+
+@dataclass(frozen=True, slots=True)
+class StepValue:
+    parameter: StepParameter
+    channel: int
+    value: float
+    display_value: float | None = None
+    unit_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +93,18 @@ def finite_number(value: float) -> str:
     if not math.isfinite(number):
         raise ValueError("下发参数必须是有限数值")
     return format(number, ".12g")
+
+
+def output_load_value(load_ohms: int | None) -> str:
+    """Format the DG4000 LOAD/IMPEDANCE argument documented as 1..10000 ohm."""
+
+    if load_ohms is None:
+        return "INFINITY"
+    if isinstance(load_ohms, bool) or not isinstance(load_ohms, int):
+        raise ValueError("输出负载阻抗必须是 1 至 10000 Ω 的整数或高阻")
+    if not 1 <= load_ohms <= 10_000:
+        raise ValueError("输出负载阻抗必须在 1 至 10000 Ω 之间")
+    return str(load_ohms)
 
 
 class DG4000Driver:
@@ -121,6 +162,10 @@ class DG4000Driver:
         validate_channel(channel)
         self.write(f":OUTP{channel} {'ON' if enabled else 'OFF'}")
 
+    def set_output_load(self, channel: int, load_ohms: int | None) -> None:
+        validate_channel(channel)
+        self.write(f":OUTP{channel}:LOAD {output_load_value(load_ohms)}")
+
     def configure_basic(self, channel: int, waveform: BasicWaveform) -> None:
         validate_channel(channel)
         function = self.FUNCTIONS.get(waveform.function.upper(), self.FUNCTIONS.get(waveform.function))
@@ -133,6 +178,34 @@ class DG4000Driver:
                 f":SOUR{channel}:VOLT {finite_number(waveform.amplitude_vpp)}",
                 f":SOUR{channel}:VOLT:OFFS {finite_number(waveform.offset_v)}",
                 f":SOUR{channel}:PHAS {finite_number(waveform.phase_deg)}",
+            ]
+        )
+
+    def configure_channel(
+        self,
+        channel: int,
+        waveform: BasicWaveform,
+        *,
+        load_ohms: int | None,
+        enabled: bool,
+    ) -> None:
+        """Apply load, waveform and output state as one serialized SCPI batch."""
+
+        validate_channel(channel)
+        function = self.FUNCTIONS.get(
+            waveform.function.upper(), self.FUNCTIONS.get(waveform.function)
+        )
+        if function is None:
+            raise ValueError(f"不支持的基本波形：{waveform.function}")
+        self.session.write_many(
+            [
+                f":OUTP{channel}:LOAD {output_load_value(load_ohms)}",
+                f":SOUR{channel}:FUNC {function}",
+                f":SOUR{channel}:FREQ {finite_number(waveform.frequency_hz)}",
+                f":SOUR{channel}:VOLT {finite_number(waveform.amplitude_vpp)}",
+                f":SOUR{channel}:VOLT:OFFS {finite_number(waveform.offset_v)}",
+                f":SOUR{channel}:PHAS {finite_number(waveform.phase_deg)}",
+                f":OUTP{channel} {'ON' if enabled else 'OFF'}",
             ]
         )
 
@@ -191,3 +264,13 @@ class DG4000Driver:
 
     def apply_step(self, parameter: StepParameter, channel: int, value: float) -> None:
         self.write(f"{parameter.command(channel)} {finite_number(value)}")
+
+    def apply_steps(self, values: list[StepValue] | tuple[StepValue, ...]) -> None:
+        if not values:
+            raise ValueError("联合扫描点至少需要一个参数")
+        self.write_many(
+            [
+                f"{item.parameter.command(item.channel)} {finite_number(item.value)}"
+                for item in values
+            ]
+        )

@@ -6,7 +6,8 @@ from enum import Enum
 from threading import Condition, Event, RLock, Thread, current_thread
 from typing import Protocol
 
-from .drivers.dg4000 import StepParameter
+from .drivers.dg4000 import StepParameter, StepValue
+from .scan import ScanPoint
 from .sequence import CyclicSequence
 
 
@@ -20,6 +21,8 @@ class EdgeCounter(Protocol):
 
 class StepWriter(Protocol):
     def apply_step(self, parameter: StepParameter, channel: int, value: float) -> None: ...
+
+    def apply_steps(self, values: list[StepValue] | tuple[StepValue, ...]) -> None: ...
 
 
 class ControllerState(str, Enum):
@@ -38,6 +41,7 @@ class TriggerSnapshot:
     current_index: int | None
     current_value: float | None
     error: str | None
+    current_values: tuple[StepValue, ...] = ()
 
     @property
     def backlog(self) -> int:
@@ -60,10 +64,11 @@ class TriggerStepController:
         self,
         counter: EdgeCounter,
         writer: StepWriter,
-        parameter: StepParameter,
-        channel: int,
-        points: list[float] | tuple[float, ...],
+        parameter: StepParameter | None = None,
+        channel: int | None = None,
+        points: list[float] | tuple[float, ...] | None = None,
         *,
+        scan_points: list[ScanPoint] | tuple[ScanPoint, ...] | None = None,
         monitor_poll_seconds: float = 0.002,
     ) -> None:
         if monitor_poll_seconds <= 0:
@@ -72,7 +77,17 @@ class TriggerStepController:
         self.writer = writer
         self.parameter = parameter
         self.channel = channel
-        self.sequence = CyclicSequence(points)
+        if scan_points is not None:
+            if parameter is not None or channel is not None or points is not None:
+                raise ValueError("联合扫描点不能与旧式单轴参数同时指定")
+            normalized_points = tuple(scan_points)
+        else:
+            if parameter is None or channel is None or points is None:
+                raise ValueError("单轴触发步进必须指定参数、通道和点表")
+            normalized_points = tuple(
+                ScanPoint((StepValue(parameter, channel, float(value)),)) for value in points
+            )
+        self.sequence = CyclicSequence(normalized_points)
         self.monitor_poll_seconds = monitor_poll_seconds
 
         self._lock = RLock()
@@ -83,6 +98,7 @@ class TriggerStepController:
         self._applied_count = 0
         self._current_index: int | None = None
         self._current_value: float | None = None
+        self._current_values: tuple[StepValue, ...] = ()
         self._error: str | None = None
         self._callbacks: list[UpdateCallback] = []
         self._monitor_thread: Thread | None = None
@@ -107,6 +123,7 @@ class TriggerStepController:
                 current_index=self._current_index,
                 current_value=self._current_value,
                 error=self._error,
+                current_values=self._current_values,
             )
 
     def start(self) -> None:
@@ -118,6 +135,7 @@ class TriggerStepController:
             self._applied_count = 0
             self._current_index = None
             self._current_value = None
+            self._current_values = ()
             self._error = None
             self._stop_event.clear()
         self._publish()
@@ -199,16 +217,19 @@ class TriggerStepController:
                         return
                     trigger_number = self._applied_count + 1
                     position = self.sequence.for_trigger(trigger_number)
-                self.writer.apply_step(
-                    self.parameter,
-                    self.channel,
-                    float(position.value),
-                )
+                values = position.value.values
+                apply_many = getattr(self.writer, "apply_steps", None)
+                if callable(apply_many):
+                    apply_many(values)
+                else:
+                    for item in values:
+                        self.writer.apply_step(item.parameter, item.channel, item.value)
                 with self._condition:
                     # Only the sole writer thread mutates applied_count.
                     self._applied_count = trigger_number
                     self._current_index = position.index
-                    self._current_value = float(position.value)
+                    self._current_value = values[0].value
+                    self._current_values = values
                 self._publish()
         except Exception as exc:
             self._fail(f"向 DG4000 下发步进参数失败：{exc}")
@@ -238,4 +259,3 @@ class TriggerStepController:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.stop()
-

@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+import math
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from threading import Event, RLock, Thread, current_thread
+from typing import Protocol
+
+from .drivers.ni_analog import AnalogDataset, AnalogInputBlock, save_analog_csv
+
+
+class AnalogInputReader(Protocol):
+    def start(self) -> None: ...
+
+    def read(self) -> AnalogInputBlock: ...
+
+    def stop(self) -> None: ...
+
+
+class AnalogAcquisitionState(str, Enum):
+    STOPPED = "stopped"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class AnalogAcquisitionSnapshot:
+    state: AnalogAcquisitionState
+    channel_names: tuple[str, ...]
+    sample_rate_hz: float
+    total_samples: int
+    retained_samples: int
+    dropped_samples: int
+    minimum_v: tuple[float, ...] = ()
+    maximum_v: tuple[float, ...] = ()
+    rms_v: tuple[float, ...] = ()
+    error: str | None = None
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.total_samples / self.sample_rate_hz if self.sample_rate_hz > 0 else 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class AnalogAcquisitionUpdate:
+    snapshot: AnalogAcquisitionSnapshot
+    block: AnalogInputBlock | None = None
+
+
+class AnalogAcquisitionController:
+    """Continuously reads analog blocks and retains a bounded, exportable history."""
+
+    def __init__(self, reader: AnalogInputReader, *, maximum_retained_samples: int = 500_000) -> None:
+        if not 1_000 <= maximum_retained_samples <= 5_000_000:
+            raise ValueError("内存保留点数必须在 1000 至 5000000 之间")
+        self.reader = reader
+        self.maximum_retained_samples = maximum_retained_samples
+        self._lock = RLock()
+        self._stop_event = Event()
+        self._thread: Thread | None = None
+        self._state = AnalogAcquisitionState.STOPPED
+        self._channel_names: tuple[str, ...] = ()
+        self._sample_rate_hz = 0.0
+        self._total_samples = 0
+        self._buffers: tuple[deque[float], ...] = ()
+        self._minimum_v: tuple[float, ...] = ()
+        self._maximum_v: tuple[float, ...] = ()
+        self._rms_v: tuple[float, ...] = ()
+        self._error: str | None = None
+        self._callbacks = []
+
+    def add_callback(self, callback) -> None:
+        with self._lock:
+            self._callbacks.append(callback)
+
+    def snapshot(self) -> AnalogAcquisitionSnapshot:
+        with self._lock:
+            retained = len(self._buffers[0]) if self._buffers else 0
+            return AnalogAcquisitionSnapshot(
+                state=self._state,
+                channel_names=self._channel_names,
+                sample_rate_hz=self._sample_rate_hz,
+                total_samples=self._total_samples,
+                retained_samples=retained,
+                dropped_samples=max(0, self._total_samples - retained),
+                minimum_v=self._minimum_v,
+                maximum_v=self._maximum_v,
+                rms_v=self._rms_v,
+                error=self._error,
+            )
+
+    def start(self) -> None:
+        with self._lock:
+            if self._state in {AnalogAcquisitionState.STARTING, AnalogAcquisitionState.RUNNING}:
+                raise RuntimeError("模拟输入采集已经运行")
+            self._state = AnalogAcquisitionState.STARTING
+            self._channel_names = ()
+            self._sample_rate_hz = 0.0
+            self._total_samples = 0
+            self._buffers = ()
+            self._minimum_v = ()
+            self._maximum_v = ()
+            self._rms_v = ()
+            self._error = None
+            self._stop_event.clear()
+        self._publish(None)
+        try:
+            self.reader.start()
+        except Exception as exc:
+            self._fail(f"启动模拟输入失败：{exc}")
+            raise
+        with self._lock:
+            self._state = AnalogAcquisitionState.RUNNING
+            self._thread = Thread(target=self._read_loop, name="ni-analog-input", daemon=True)
+            thread = self._thread
+        thread.start()
+        self._publish(None)
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._state is AnalogAcquisitionState.STOPPED:
+                return
+            self._state = AnalogAcquisitionState.STOPPING
+            self._stop_event.set()
+            thread = self._thread
+        self._publish(None)
+        try:
+            self.reader.stop()
+        finally:
+            if thread is not None and thread is not current_thread():
+                thread.join(timeout=5.0)
+            with self._lock:
+                self._thread = None
+                self._state = AnalogAcquisitionState.STOPPED
+            self._publish(None)
+
+    def clear(self) -> None:
+        with self._lock:
+            if self._state in {AnalogAcquisitionState.STARTING, AnalogAcquisitionState.RUNNING}:
+                raise RuntimeError("请先停止模拟输入采集再清空数据")
+            self._total_samples = 0
+            self._buffers = ()
+            self._channel_names = ()
+            self._minimum_v = ()
+            self._maximum_v = ()
+            self._rms_v = ()
+            self._error = None
+        self._publish(None)
+
+    def dataset(self) -> AnalogDataset:
+        with self._lock:
+            retained = len(self._buffers[0]) if self._buffers else 0
+            return AnalogDataset(
+                channel_names=self._channel_names,
+                sample_rate_hz=self._sample_rate_hz,
+                first_sample_index=max(0, self._total_samples - retained),
+                samples=tuple(tuple(values) for values in self._buffers),
+            )
+
+    def save_csv(self, path: str | Path) -> Path:
+        return save_analog_csv(path, self.dataset())
+
+    def _read_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                block = self.reader.read()
+                if self._stop_event.is_set():
+                    break
+                self._accept_block(block)
+                self._publish(block)
+        except Exception as exc:
+            if not self._stop_event.is_set():
+                self._fail(f"模拟输入采集失败：{exc}")
+        finally:
+            try:
+                self.reader.stop()
+            except Exception:
+                pass
+
+    def _accept_block(self, block: AnalogInputBlock) -> None:
+        if block.sample_count == 0:
+            return
+        with self._lock:
+            if not self._channel_names:
+                self._channel_names = block.channel_names
+                self._sample_rate_hz = block.sample_rate_hz
+                self._buffers = tuple(
+                    deque(maxlen=self.maximum_retained_samples) for _ in block.channel_names
+                )
+            if block.channel_names != self._channel_names:
+                raise RuntimeError("采集过程中模拟输入通道发生变化")
+            if not math.isclose(block.sample_rate_hz, self._sample_rate_hz):
+                raise RuntimeError("采集过程中采样率发生变化")
+            for buffer, values in zip(self._buffers, block.samples):
+                buffer.extend(values)
+            self._total_samples += block.sample_count
+            self._minimum_v = tuple(min(values) for values in block.samples)
+            self._maximum_v = tuple(max(values) for values in block.samples)
+            self._rms_v = tuple(
+                math.sqrt(sum(value * value for value in values) / len(values))
+                for values in block.samples
+            )
+
+    def _fail(self, message: str) -> None:
+        with self._lock:
+            self._state = AnalogAcquisitionState.ERROR
+            self._error = message
+            self._stop_event.set()
+        self._publish(None)
+
+    def _publish(self, block: AnalogInputBlock | None) -> None:
+        update = AnalogAcquisitionUpdate(self.snapshot(), block)
+        with self._lock:
+            callbacks = tuple(self._callbacks)
+        for callback in callbacks:
+            callback(update)

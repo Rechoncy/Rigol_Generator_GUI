@@ -13,11 +13,13 @@ from rigol_control.connections import DeviceConnectionManager
 from rigol_control.drivers.dg4000 import StepParameter
 from rigol_control.models import DeviceKind, DeviceRecord
 from rigol_control.repository import DeviceRepository
+from rigol_control.scan import ScanMode
+from rigol_control.trigger import ControllerState
 from rigol_control.services import DiscoveredResource
 from rigol_control.ui.device_windows import DG4000Window, NIDeviceWindow
 from rigol_control.ui.dialogs import DeviceDialog
 from rigol_control.ui.main_window import DeviceCenterWindow
-from rigol_control.virtual_lab import VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
+from rigol_control.virtual_lab import VIRTUAL_DG2_RESOURCE, VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
 
 
 class UiSmokeTests(unittest.TestCase):
@@ -151,33 +153,52 @@ class UiSmokeTests(unittest.TestCase):
         home.create_virtual_lab()
         self.assertTrue(
             self._wait_for(
-                lambda: len(repository.list()) == 2
+                lambda: len(repository.list()) == 3
                 and all(manager.is_connected(item) for item in repository.list())
             )
         )
         records = repository.list()
         dg = next(item for item in records if item.resource == VIRTUAL_DG_RESOURCE)
         ni = next(item for item in records if item.resource == VIRTUAL_NI_RESOURCE)
+        self.assertTrue(any(item.resource == VIRTUAL_DG2_RESOURCE for item in records))
         home.open_device(dg.id)
         home.open_device(ni.id)
         dg_window = home.open_windows[dg.id]
         ni_window = home.open_windows[ni.id]
+        frequency_control = dg_window.channel_controls[1]["frequency"]
+        self.assertEqual(frequency_control.current_unit(), "kHz")
+        self.assertEqual(frequency_control.value(), 1000)
+        frequency_control.set_unit("MHz")
+        self.assertEqual(frequency_control.display_value(), 0.001)
+        self.assertEqual(frequency_control.value(), 1000)
+        channel_controls = dg_window.channel_controls[1]
+        channel_controls["load"].setCurrentIndex(
+            channel_controls["load"].findData(50)
+        )
+        dg_window._apply_channel(1)
+        self.assertTrue(
+            self._wait_for(
+                lambda: manager.virtual_lab.generator_snapshot(dg.resource)
+                .channels[0]
+                .load_ohms
+                == 50
+            )
+        )
         dg_window._select_page(4)
-        dg_window.step_target.setCurrentIndex(
-            dg_window.step_target.findData(StepParameter.AMPLITUDE)
-        )
-        self.assertEqual(dg_window.scan_start.suffix(), " Vpp")
-        self.assertEqual(dg_window.scan_start.value(), 1)
-        self.assertEqual(dg_window.scan_step.value(), 0.1)
-        dg_window.step_target.setCurrentIndex(
-            dg_window.step_target.findData(StepParameter.FREQUENCY)
-        )
-        dg_window.scan_start.setValue(100)
-        dg_window.scan_step.setValue(25)
-        dg_window.scan_point_count.setValue(4)
+        frequency_axis = dg_window.scan_axes[0]
+        frequency_axis.start.setValue(0.1)
+        frequency_axis.step.setValue(0.1)
+        frequency_axis.count.setValue(4)
+        dg_window._add_scan_axis(StepParameter.AMPLITUDE, 1)
+        amplitude_axis = dg_window.scan_axes[1]
+        amplitude_axis.unit.setCurrentIndex(amplitude_axis.unit.findData("mVpp"))
+        amplitude_axis.start.setValue(500)
+        amplitude_axis.step.setValue(250)
+        amplitude_axis.count.setValue(4)
         dg_window._generate_scan_table()
-        self.assertEqual(dg_window._sequence_values(), [100, 125, 150, 175])
-        self.assertEqual(dg_window.step_table.item(0, 2).text(), "起始点（第一个触发）")
+        points = dg_window._sequence_points()
+        self.assertEqual([item.value for item in points[1].values], [200, 0.75])
+        self.assertEqual(dg_window.step_table.item(0, 3).text(), "起始点（第一个触发）")
         dg_window._start_trigger()
         self.assertTrue(
             self._wait_for(
@@ -197,9 +218,136 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(dg_window.trigger_metrics["applied"].text(), "6")
         self.assertEqual(
             manager.virtual_lab.generator_snapshot(dg.resource).channels[0].frequency_hz,
-            125,
+            200,
+        )
+        self.assertEqual(
+            manager.virtual_lab.generator_snapshot(dg.resource).channels[0].amplitude_vpp,
+            0.75,
         )
         home.close()
+        self.app.processEvents()
+
+    def test_virtual_analog_input_plots_and_exports_multichannel_data(self) -> None:
+        manager = DeviceConnectionManager()
+        record = DeviceRecord.create(
+            kind=DeviceKind.NI_DAQ,
+            name="虚拟 NI",
+            resource=VIRTUAL_NI_RESOURCE,
+            connection="内置模拟器",
+        )
+        manager.connect(record)
+        window = NIDeviceWindow(record, manager)
+        window.show()
+        window._select_page(2)
+        window.ai_channel_list.item(1).setSelected(True)
+        window.ai_sample_rate.setValue(20_000)
+        window.ai_block_size.setValue(200)
+        window._start_analog_input()
+        self.assertTrue(
+            self._wait_for(
+                lambda: window.analog_controller is not None
+                and window.analog_controller.snapshot().total_samples >= 400,
+                timeout=2.0,
+            )
+        )
+        self.assertTrue(
+            self._wait_for(lambda: window.ai_plot.displayed_samples >= 400)
+        )
+        self.assertGreaterEqual(window.ai_plot.displayed_samples, 400)
+        self.assertEqual(window.ai_metrics["channels"].text(), "2")
+        window._stop_analog_input()
+        self.assertTrue(
+            self._wait_for(
+                lambda: window.analog_controller.snapshot().state.value == "stopped"
+                and window.ai_start.isEnabled()
+            )
+        )
+        path = Path(self.temporary.name) / "ui-analog.csv"
+        window.analog_controller.save_csv(path)
+        self.assertTrue(path.exists())
+        self.assertGreater(path.stat().st_size, 1000)
+        window.close()
+        self.app.processEvents()
+
+    def test_cross_device_task_window_drives_two_virtual_generators(self) -> None:
+        repository = DeviceRepository(Path(self.temporary.name) / "cross-device")
+        manager = DeviceConnectionManager()
+        home = DeviceCenterWindow(repository, manager)
+        home.create_virtual_lab()
+        self.assertTrue(
+            self._wait_for(
+                lambda: len(repository.list()) == 3
+                and all(manager.is_connected(item) for item in repository.list())
+            )
+        )
+        home.open_linkage_tasks()
+        window = home.linkage_window
+        self.assertIsNotNone(window)
+        generators = sorted(
+            [item for item in repository.list() if item.kind is DeviceKind.DG4000],
+            key=lambda item: item.resource,
+        )
+        first = window.axis_editors[0]
+        first.device.setCurrentIndex(first.device.findData(generators[0].id))
+        first.start.setValue(1)
+        first.step.setValue(1)
+        first.count.setValue(2)
+        window._add_axis()
+        second = window.axis_editors[1]
+        second.device.setCurrentIndex(second.device.findData(generators[1].id))
+        second.parameter.setCurrentIndex(second.parameter.findData(StepParameter.AMPLITUDE))
+        second.start.setValue(0.5)
+        second.step.setValue(0.25)
+        second.count.setValue(2)
+        window._generate_table(show_message=False)
+        self.assertEqual(window.point_table.rowCount(), 2)
+        window._save_task()
+        self.assertTrue(window.task_repository.path.exists())
+        window._start()
+        self.assertTrue(
+            self._wait_for(
+                lambda: window.controller is not None
+                and window.controller.snapshot().state is ControllerState.RUNNING
+            )
+        )
+        window._emit_virtual(3)
+        self.assertTrue(
+            self._wait_for(lambda: window.controller.snapshot().applied_count == 3)
+        )
+        self.assertEqual(
+            manager.virtual_lab.generator_snapshot(generators[0].resource)
+            .channels[0]
+            .frequency_hz,
+            1000,
+        )
+        self.assertEqual(
+            manager.virtual_lab.generator_snapshot(generators[1].resource)
+            .channels[0]
+            .amplitude_vpp,
+            0.5,
+        )
+        log_path = Path(window.log_path.text().split("：", 1)[1])
+        self.assertTrue(log_path.exists())
+        window._stop()
+        self.assertIsNone(manager.lease_owner(generators[0].id))
+        home.close()
+        self.app.processEvents()
+
+    def test_cartesian_axis_preflight_and_table_generation(self) -> None:
+        manager = DeviceConnectionManager()
+        window = DG4000Window(self.dg, [self.dg, self.ni], manager)
+        window._add_scan_axis(StepParameter.AMPLITUDE, 1)
+        window.scan_axes[1].count.setValue(3)
+        self.assertFalse(window.generate_scan_button.isEnabled())
+        self.assertIn("点数相同", window.scan_summary.text())
+
+        window.scan_mode.setCurrentIndex(window.scan_mode.findData(ScanMode.CARTESIAN))
+        self.assertTrue(window.generate_scan_button.isEnabled())
+        self.assertIn("12 个联合点", window.scan_summary.text())
+        window._generate_scan_table(show_message=False)
+        self.assertEqual(window.step_table.rowCount(), 12)
+        self.assertEqual(len(window._sequence_points()), 12)
+        window.close()
         self.app.processEvents()
 
     def _wait_for(self, predicate, timeout=1.0):

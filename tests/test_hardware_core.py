@@ -2,7 +2,14 @@ import threading
 import time
 import unittest
 
-from rigol_control.drivers.dg4000 import BasicWaveform, DG4000Driver, StepParameter
+from rigol_control.drivers.dg4000 import (
+    BasicWaveform,
+    DG4000Driver,
+    StepParameter,
+    StepValue,
+    output_load_value,
+)
+from rigol_control.scan import ScanAxis, ScanMode, generate_scan_points
 from rigol_control.drivers.scpi import ScpiSession
 from rigol_control.trigger import ControllerState, TriggerStepController
 
@@ -55,6 +62,7 @@ class FakeCounter:
 class RecordingWriter:
     def __init__(self, delay: float = 0.0) -> None:
         self.values = []
+        self.batches = []
         self.delay = delay
         self.lock = threading.Lock()
 
@@ -63,6 +71,14 @@ class RecordingWriter:
             time.sleep(self.delay)
         with self.lock:
             self.values.append((parameter, channel, value))
+
+    def apply_steps(self, values) -> None:
+        if self.delay:
+            time.sleep(self.delay)
+        with self.lock:
+            batch = tuple(values)
+            self.batches.append(batch)
+            self.values.extend((item.parameter, item.channel, item.value) for item in batch)
 
 
 def wait_until(predicate, timeout: float = 1.0) -> bool:
@@ -83,7 +99,6 @@ class ScpiDriverTests(unittest.TestCase):
         self.assertIn("DG4162", identity)
         driver.configure_basic(1, BasicWaveform("SIN", 1000, 2.5, 0.1, 45))
         driver.apply_step(StepParameter.PSK_PHASE, 2, 180)
-        driver.write(":DISP:BRIG 80")  # Any manual command remains reachable.
         self.assertEqual(
             backend.writes[:5],
             [
@@ -95,9 +110,38 @@ class ScpiDriverTests(unittest.TestCase):
             ],
         )
         self.assertEqual(backend.writes[5], ":SOUR2:MOD:PSK:PHAS 180")
-        self.assertEqual(backend.writes[6], ":DISP:BRIG 80")
+        driver.apply_steps(
+            (
+                StepValue(StepParameter.FREQUENCY, 1, 2000),
+                StepValue(StepParameter.AMPLITUDE, 1, 1.5),
+            )
+        )
+        driver.write(":DISP:BRIG 80")  # Any manual command remains reachable.
+        self.assertEqual(backend.writes[6:8], [":SOUR1:FREQ 2000", ":SOUR1:VOLT 1.5"])
+        self.assertEqual(backend.writes[8], ":DISP:BRIG 80")
         driver.disconnect()
         self.assertTrue(backend.closed)
+
+    def test_output_load_supports_high_impedance_and_manual_range(self) -> None:
+        self.assertEqual(output_load_value(None), "INFINITY")
+        self.assertEqual(output_load_value(50), "50")
+        with self.assertRaises(ValueError):
+            output_load_value(0)
+        with self.assertRaises(ValueError):
+            output_load_value(50.5)
+
+        backend = FakeScpiBackend()
+        session = ScpiSession("USB0::TEST", backend_factory=lambda resource, timeout: backend)
+        driver = DG4000Driver(session)
+        driver.connect()
+        driver.configure_channel(
+            2,
+            BasicWaveform("SIN", 2000, 1.5, 0.1, 30),
+            load_ohms=75,
+            enabled=True,
+        )
+        self.assertEqual(backend.writes[0], ":OUTP2:LOAD 75")
+        self.assertEqual(backend.writes[-1], ":OUTP2 ON")
 
     def test_all_requested_step_targets_use_manual_commands(self) -> None:
         expected = {
@@ -113,6 +157,31 @@ class ScpiDriverTests(unittest.TestCase):
 
 
 class TriggerControllerTests(unittest.TestCase):
+    def test_multi_axis_point_is_written_as_one_ordered_batch(self) -> None:
+        counter = FakeCounter()
+        writer = RecordingWriter()
+        points = generate_scan_points(
+            [
+                ScanAxis(StepParameter.FREQUENCY, 1, "kHz", 1, 1, 2),
+                ScanAxis(StepParameter.AMPLITUDE, 1, "Vpp", 1, 0.5, 2),
+            ],
+            ScanMode.SYNCHRONOUS,
+        )
+        controller = TriggerStepController(
+            counter,
+            writer,
+            scan_points=points,
+            monitor_poll_seconds=0.001,
+        )
+        controller.start()
+        counter.add_edges(2)
+        self.assertTrue(wait_until(lambda: controller.snapshot().applied_count == 2))
+        snapshot = controller.snapshot()
+        controller.stop()
+
+        self.assertEqual(len(writer.batches), 2)
+        self.assertEqual([item.value for item in writer.batches[1]], [2000, 1.5])
+        self.assertEqual(len(snapshot.current_values), 2)
     def test_count_jump_is_not_lost_and_first_trigger_is_start_point(self) -> None:
         counter = FakeCounter()
         writer = RecordingWriter(delay=0.001)

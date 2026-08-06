@@ -5,14 +5,24 @@ from dataclasses import dataclass
 from threading import RLock
 
 from .drivers.dg4000 import DG4000Driver
+from .drivers.ni_analog import AnalogInputConfig, NIDaqAnalogInput
 from .drivers.ni_counter import NIDaqEdgeCounter
 from .drivers.scpi import ScpiSession
 from .models import DeviceKind, DeviceRecord
 from .services import DeviceProbeService, ProbeState
-from .virtual_lab import VirtualEdgeCounter, VirtualLab, is_virtual_resource
+from .virtual_lab import (
+    VirtualAnalogInput,
+    VirtualEdgeCounter,
+    VirtualLab,
+    is_virtual_resource,
+)
 
 
 class DeviceConnectionError(RuntimeError):
+    pass
+
+
+class DeviceBusyError(RuntimeError):
     pass
 
 
@@ -45,6 +55,7 @@ class DeviceConnectionManager:
         self._scpi_connected: set[str] = set()
         self._ni_connected: set[str] = set()
         self._identities: dict[str, str] = {}
+        self._leases: dict[str, str] = {}
         self._lock = RLock()
 
     def connect(self, record: DeviceRecord) -> ConnectionInfo:
@@ -80,6 +91,10 @@ class DeviceConnectionManager:
         return ConnectionInfo(record.id, True, identity, "VISA 会话已连接")
 
     def disconnect(self, record: DeviceRecord) -> ConnectionInfo:
+        with self._lock:
+            owner = self._leases.get(record.id)
+        if owner is not None:
+            raise DeviceBusyError(f"设备“{record.name}”正被联动任务占用，停止任务后才能断开")
         if record.kind is DeviceKind.NI_DAQ:
             with self._lock:
                 self._ni_connected.discard(record.id)
@@ -113,6 +128,38 @@ class DeviceConnectionManager:
 
     def is_connected(self, record: DeviceRecord) -> bool:
         return self.info(record).connected
+
+    def acquire_devices(self, owner: str, device_ids: list[str] | tuple[str, ...]) -> None:
+        """Atomically reserve devices for one running hardware task."""
+
+        normalized = tuple(dict.fromkeys(item.strip() for item in device_ids if item.strip()))
+        if not owner.strip():
+            raise ValueError("设备占用者不能为空")
+        if not normalized:
+            raise ValueError("至少需要占用一台设备")
+        with self._lock:
+            conflicts = [
+                device_id
+                for device_id in normalized
+                if device_id in self._leases and self._leases[device_id] != owner
+            ]
+            if conflicts:
+                raise DeviceBusyError(
+                    "以下设备已被其他任务占用：" + ", ".join(conflicts)
+                )
+            for device_id in normalized:
+                self._leases[device_id] = owner
+
+    def release_devices(self, owner: str) -> None:
+        with self._lock:
+            for device_id in [
+                key for key, current_owner in self._leases.items() if current_owner == owner
+            ]:
+                self._leases.pop(device_id, None)
+
+    def lease_owner(self, device_id: str) -> str | None:
+        with self._lock:
+            return self._leases.get(device_id)
 
     def session_for(self, record: DeviceRecord) -> ScpiSession:
         if record.kind is DeviceKind.NI_DAQ:
@@ -155,6 +202,36 @@ class DeviceConnectionManager:
             rising=rising,
         )
 
+    def analog_channels_for(self, record: DeviceRecord) -> tuple[str, ...]:
+        if record.kind is not DeviceKind.NI_DAQ:
+            raise ValueError("只有 NI DAQ 设备可读取模拟输入通道")
+        if is_virtual_resource(record.resource):
+            return tuple(f"{record.resource}/ai{index}" for index in range(4))
+        return NIDaqAnalogInput.available_channels(record.resource)
+
+    def analog_input_for(
+        self,
+        record: DeviceRecord,
+        config: AnalogInputConfig,
+        *,
+        signal_frequency_hz: float = 50.0,
+        amplitude_v: float = 1.0,
+        offset_v: float = 0.0,
+        noise_v: float = 0.01,
+    ) -> NIDaqAnalogInput | VirtualAnalogInput:
+        if record.kind is not DeviceKind.NI_DAQ:
+            raise ValueError("只有 NI DAQ 设备可创建模拟输入任务")
+        if is_virtual_resource(record.resource):
+            return self.virtual_lab.analog_input_for(
+                record.resource,
+                config,
+                signal_frequency_hz=signal_frequency_hz,
+                amplitude_v=amplitude_v,
+                offset_v=offset_v,
+                noise_v=noise_v,
+            )
+        return NIDaqAnalogInput(record.resource, config)
+
     def forget(self, record: DeviceRecord) -> None:
         self.disconnect(record)
         with self._lock:
@@ -171,6 +248,7 @@ class DeviceConnectionManager:
             self._scpi_connected.clear()
             self._ni_connected.clear()
             self._identities.clear()
+            self._leases.clear()
         for session in sessions:
             try:
                 session.disconnect()

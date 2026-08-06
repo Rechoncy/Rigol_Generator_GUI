@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import re
+import math
+import random
 import time
 from collections import deque
 from dataclasses import dataclass
-from threading import RLock
+from threading import Event, RLock
+
+from .drivers.ni_analog import AnalogInputBlock, AnalogInputConfig
 
 
 VIRTUAL_DG_RESOURCE = "SIM::DG4000::1"
+VIRTUAL_DG2_RESOURCE = "SIM::DG4000::2"
 VIRTUAL_NI_RESOURCE = "SIM::NI_DAQ::1"
 
 
@@ -28,6 +33,7 @@ class VirtualChannelSnapshot:
     modulation_type: str
     psk_phase_deg: float
     fsk_frequency_hz: float
+    load_ohms: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +69,7 @@ class VirtualGenerator:
             "modulation_type": "AM",
             "psk_phase_deg": 180.0,
             "fsk_frequency_hz": 2000.0,
+            "load_ohms": None,
         }
 
     def reset(self) -> None:
@@ -112,6 +119,10 @@ class VirtualGenerator:
             return self.values.get(path, "0")
 
     def _apply_known(self, path: str, value: str) -> None:
+        load_match = re.fullmatch(r"OUTP(?:UT)?(1|2):(?:LOAD|IMP(?:EDANCE)?)", path)
+        if load_match:
+            self.channels[int(load_match.group(1))]["load_ohms"] = self._load(value)
+            return
         output_match = re.fullmatch(r"OUTP(?:UT)?(1|2)(?::STAT(?:E)?)?", path)
         if output_match:
             self.channels[int(output_match.group(1))]["output"] = self._on(value)
@@ -142,6 +153,10 @@ class VirtualGenerator:
             channel["fsk_frequency_hz"] = numeric
 
     def _query_known(self, path: str) -> str | None:
+        load_match = re.fullmatch(r"OUTP(?:UT)?(1|2):(?:LOAD|IMP(?:EDANCE)?)", path)
+        if load_match:
+            load = self.channels[int(load_match.group(1))]["load_ohms"]
+            return "INFINITY" if load is None else str(load)
         output_match = re.fullmatch(r"OUTP(?:UT)?(1|2)(?::STAT(?:E)?)?", path)
         if output_match:
             return "ON" if self.channels[int(output_match.group(1))]["output"] else "OFF"
@@ -197,6 +212,18 @@ class VirtualGenerator:
     @staticmethod
     def _on(value: str) -> bool:
         return value.strip().upper() in {"1", "ON", "TRUE"}
+
+    @staticmethod
+    def _load(value: str) -> int | None:
+        normalized = value.strip().upper()
+        if normalized in {"INF", "INFINITY", "MAX", "MAXIMUM"}:
+            return None
+        if normalized in {"MIN", "MINIMUM"}:
+            return 1
+        try:
+            return int(float(normalized))
+        except ValueError:
+            return None
 
 
 class VirtualScpiSession:
@@ -266,6 +293,90 @@ class VirtualEdgeCounter:
             self._running = False
 
 
+class VirtualAnalogInput:
+    """Real-time virtual voltage input for plotting and data-export tests."""
+
+    def __init__(
+        self,
+        config: AnalogInputConfig,
+        *,
+        signal_frequency_hz: float = 50.0,
+        amplitude_v: float = 1.0,
+        offset_v: float = 0.0,
+        noise_v: float = 0.01,
+    ) -> None:
+        self.config = config
+        self.signal_frequency_hz = float(signal_frequency_hz)
+        self.amplitude_v = float(amplitude_v)
+        self.offset_v = float(offset_v)
+        self.noise_v = float(noise_v)
+        self._next_sample_index = 0
+        self._stop_event = Event()
+        self._running = False
+        self._random = random.Random(4000)
+
+    def start(self) -> None:
+        self.config.validate()
+        if not all(
+            math.isfinite(value)
+            for value in (
+                self.signal_frequency_hz,
+                self.amplitude_v,
+                self.offset_v,
+                self.noise_v,
+            )
+        ):
+            raise ValueError("虚拟信号参数必须是有限数值")
+        if self.signal_frequency_hz < 0 or self.amplitude_v < 0 or self.noise_v < 0:
+            raise ValueError("虚拟信号频率、幅度和噪声不能为负数")
+        if self._running:
+            raise RuntimeError("虚拟模拟输入已经运行")
+        self._next_sample_index = 0
+        self._random.seed(4000)
+        self._stop_event.clear()
+        self._running = True
+
+    def read(self) -> AnalogInputBlock:
+        if not self._running:
+            raise RuntimeError("虚拟模拟输入尚未启动")
+        duration = self.config.samples_per_read / self.config.sample_rate_hz
+        if self._stop_event.wait(timeout=duration) or not self._running:
+            raise RuntimeError("虚拟模拟输入已停止")
+        first = self._next_sample_index
+        data = []
+        span = self.config.maximum_v - self.config.minimum_v
+        for channel_index, _channel in enumerate(self.config.channels):
+            phase = channel_index * math.pi / 4.0
+            values = []
+            for offset in range(self.config.samples_per_read):
+                sample_index = first + offset
+                angle = (
+                    2.0
+                    * math.pi
+                    * self.signal_frequency_hz
+                    * sample_index
+                    / self.config.sample_rate_hz
+                    + phase
+                )
+                noise = self._random.uniform(-self.noise_v, self.noise_v)
+                value = self.offset_v + self.amplitude_v * math.sin(angle) + noise
+                values.append(
+                    min(self.config.maximum_v, max(self.config.minimum_v, value))
+                )
+            data.append(tuple(values))
+        self._next_sample_index += self.config.samples_per_read
+        return AnalogInputBlock(
+            channel_names=self.config.channels,
+            sample_rate_hz=self.config.sample_rate_hz,
+            first_sample_index=first,
+            samples=tuple(data),
+        )
+
+    def stop(self) -> None:
+        self._running = False
+        self._stop_event.set()
+
+
 class VirtualLab:
     def __init__(self) -> None:
         self._generators: dict[str, VirtualGenerator] = {}
@@ -285,6 +396,26 @@ class VirtualLab:
         with self._lock:
             self._trigger_totals.setdefault(resource, 0)
         return VirtualEdgeCounter(self, resource)
+
+    def analog_input_for(
+        self,
+        resource: str,
+        config: AnalogInputConfig,
+        *,
+        signal_frequency_hz: float = 50.0,
+        amplitude_v: float = 1.0,
+        offset_v: float = 0.0,
+        noise_v: float = 0.01,
+    ) -> VirtualAnalogInput:
+        with self._lock:
+            self._trigger_totals.setdefault(resource, 0)
+        return VirtualAnalogInput(
+            config,
+            signal_frequency_hz=signal_frequency_hz,
+            amplitude_v=amplitude_v,
+            offset_v=offset_v,
+            noise_v=noise_v,
+        )
 
     def emit_trigger(self, resource: str, count: int = 1) -> int:
         if count < 1:
