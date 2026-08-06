@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from pathlib import Path
-
 from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QPaintEvent, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QWidget
@@ -34,7 +32,7 @@ class WaveformPlot(QWidget):
         self._buffers: tuple[deque[float], ...] = ()
         self.setMinimumHeight(330)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
-        self.setToolTip("实时显示最近的数据；CSV 保存使用控制器保留的完整内存数据。")
+        self.setToolTip("实时显示所有已勾选通道的最近数据；连续文本由采集器逐块写入磁盘。")
 
     @property
     def displayed_samples(self) -> int:
@@ -61,11 +59,6 @@ class WaveformPlot(QWidget):
         retained = self.displayed_samples
         self.first_sample_index = block.first_sample_index + block.sample_count - retained
         self.update()
-
-    def save_png(self, path: str | Path) -> bool:
-        destination = Path(path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        return self.grab().save(str(destination), "PNG")
 
     def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)

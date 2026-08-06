@@ -139,7 +139,9 @@ class LinkageAxisEditor(QFrame):
         self.start.valueChanged.connect(self.changed.emit)
         self.step.valueChanged.connect(self.changed.emit)
         self.count.valueChanged.connect(self.changed.emit)
-        remove.clicked.connect(lambda: self.remove_requested.emit(self))
+        remove.clicked.connect(
+            lambda _checked=False: self.remove_requested.emit(self)
+        )
 
         if axis is None:
             self._populate_units("kHz")
@@ -276,7 +278,10 @@ class LinkageTaskWindow(QMainWindow):
         if self.generators:
             self._add_axis()
         self._reload_tasks()
-        self._configuration_changed()
+        if self.task_selector.currentData():
+            self._load_selected_task(show_message=False)
+        else:
+            self._configuration_changed()
 
     def _task_panel(self) -> QFrame:
         frame, layout = _panel("任务与触发源")
@@ -284,21 +289,30 @@ class LinkageTaskWindow(QMainWindow):
         self.task_selector = QComboBox()
         self.task_selector.setMinimumWidth(260)
         self.load_task_button = QPushButton("加载")
-        self.load_task_button.clicked.connect(self._load_selected_task)
+        self.load_task_button.clicked.connect(
+            lambda _checked=False: self._load_selected_task()
+        )
         self.new_task_button = QPushButton("新建")
-        self.new_task_button.clicked.connect(self._new_task)
+        self.new_task_button.clicked.connect(lambda _checked=False: self._new_task())
         self.save_task_button = QPushButton("保存任务")
         self.save_task_button.setObjectName("PrimaryButton")
-        self.save_task_button.clicked.connect(self._save_task)
+        self.save_task_button.clicked.connect(lambda _checked=False: self._save_task())
         self.delete_task_button = QPushButton("删除任务")
         self.delete_task_button.setObjectName("DangerButton")
-        self.delete_task_button.clicked.connect(self._delete_task)
+        self.delete_task_button.clicked.connect(lambda _checked=False: self._delete_task())
         task_row.addWidget(self.task_selector, 1)
         task_row.addWidget(self.load_task_button)
         task_row.addWidget(self.new_task_button)
         task_row.addWidget(self.save_task_button)
         task_row.addWidget(self.delete_task_button)
         layout.addLayout(task_row)
+        save_scope = QLabel(
+            "保存范围：NI 触发设备、计数器/PFI/边沿、扫描模式、每个轴绑定的 DG/通道/参数/单位、"
+            "起点/步长/点数，以及手工修改后的完整联合点表。保存后下次打开自动恢复。"
+        )
+        save_scope.setObjectName("Muted")
+        save_scope.setWordWrap(True)
+        layout.addWidget(save_scope)
 
         form = QFormLayout()
         self.task_name = QLineEdit("跨设备扫描 1")
@@ -338,7 +352,9 @@ class LinkageTaskWindow(QMainWindow):
         frame, layout = _panel("跨设备扫描轴")
         toolbar = QHBoxLayout()
         self.add_axis_button = QPushButton("＋ 增加扫描轴")
-        self.add_axis_button.clicked.connect(self._add_axis)
+        self.add_axis_button.clicked.connect(
+            lambda _checked=False: self._add_axis()
+        )
         self.generate_button = QPushButton("生成联合点表")
         self.generate_button.setObjectName("PrimaryButton")
         self.generate_button.clicked.connect(self._generate_table)
@@ -433,7 +449,11 @@ class LinkageTaskWindow(QMainWindow):
         layout.addWidget(self.log_path)
         return frame
 
-    def _add_axis(self, axis: LinkageAxis | None = None) -> None:
+    def _add_axis(self, axis: LinkageAxis | bool | None = None) -> None:
+        # QPushButton.clicked carries a bool. Keep this guard as a defensive
+        # boundary even though the UI connection above now discards it.
+        if isinstance(axis, bool):
+            axis = None
         if len(self.axis_editors) >= MAX_SCAN_AXES:
             QMessageBox.information(self, "扫描轴已满", f"最多支持 {MAX_SCAN_AXES} 个扫描轴。")
             return
@@ -591,21 +611,29 @@ class LinkageTaskWindow(QMainWindow):
     def _reload_tasks(self, *, select_id: str | None = None) -> None:
         try:
             tasks = self.task_repository.list()
+            active_task_id = self.task_repository.active_task_id()
         except RuntimeError as exc:
             QMessageBox.warning(self, "无法读取联动任务", str(exc))
             tasks = []
+            active_task_id = None
         self.task_selector.clear()
         if not tasks:
             self.task_selector.addItem("尚未保存任务", None)
         else:
             for task in tasks:
                 self.task_selector.addItem(task.name, task.id)
-        if select_id:
-            index = self.task_selector.findData(select_id)
+        selected_task_id = select_id or active_task_id
+        if selected_task_id:
+            index = self.task_selector.findData(selected_task_id)
             if index >= 0:
                 self.task_selector.setCurrentIndex(index)
 
-    def _load_selected_task(self) -> None:
+    def _load_selected_task(
+        self,
+        _checked: bool = False,
+        *,
+        show_message: bool = True,
+    ) -> None:
         task_id = self.task_selector.currentData()
         if not task_id:
             return
@@ -613,6 +641,11 @@ class LinkageTaskWindow(QMainWindow):
             task = next(item for item in self.task_repository.list() if item.id == task_id)
         except (RuntimeError, StopIteration) as exc:
             QMessageBox.warning(self, "无法加载联动任务", str(exc))
+            return
+        try:
+            self._validate_saved_bindings(task)
+        except ValueError as exc:
+            QMessageBox.warning(self, "设备绑定不可用", str(exc))
             return
         self._current_task_id = task.id
         self.task_name.setText(task.name)
@@ -631,6 +664,39 @@ class LinkageTaskWindow(QMainWindow):
         self._table_mode = task.scan_mode
         self._fill_point_table(task.axes, task.points)
         self._configuration_changed()
+        self.task_repository.set_active_task(task.id)
+        if show_message:
+            self.statusBar().showMessage(
+                f"已恢复实验“{task.name}”：{len(task.axes)} 个设备参数轴、"
+                f"{len(task.points)} 个联合点",
+                6000,
+            )
+
+    def _validate_saved_bindings(self, task: LinkageTaskRecord) -> None:
+        current = {item.id: item for item in self.repository.list()}
+        referenced_ids = list(
+            dict.fromkeys([task.ni_device_id, *(axis.device_id for axis in task.axes)])
+        )
+        missing_ids = [device_id for device_id in referenced_ids if device_id not in current]
+        if missing_ids:
+            raise ValueError(
+                "保存的实验引用了已删除的设备："
+                + "、".join(missing_ids)
+                + "。不会自动改绑到其他设备，请重新选择并保存任务。"
+            )
+        if current[task.ni_device_id].kind is not DeviceKind.NI_DAQ:
+            raise ValueError("保存的 NI 绑定当前已不是 NI 采集卡，请重新选择并保存任务。")
+        invalid_dg = list(
+            dict.fromkeys(
+                current[axis.device_id].name
+                for axis in task.axes
+                if current[axis.device_id].kind is not DeviceKind.DG4000
+            )
+        )
+        if invalid_dg:
+            raise ValueError(
+                "以下保存绑定当前已不是 DG4000：" + "、".join(invalid_dg)
+            )
 
     def _new_task(self) -> None:
         if self.controller is not None:
@@ -668,6 +734,8 @@ class LinkageTaskWindow(QMainWindow):
         if self._current_task_id == task_id:
             self._current_task_id = None
         self._reload_tasks()
+        if self.task_selector.currentData():
+            self._load_selected_task(show_message=False)
 
     def _required_records(self) -> tuple[DeviceRecord, ...]:
         axes = self._axes()

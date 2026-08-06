@@ -30,7 +30,7 @@ class AnalogAcquisitionTests(unittest.TestCase):
 
     def test_virtual_multichannel_acquisition_retention_and_csv(self) -> None:
         config = AnalogInputConfig(
-            channels=("SIM::NI_DAQ::1/ai0", "SIM::NI_DAQ::1/ai1"),
+            channels=tuple(f"SIM::NI_DAQ::1/ai{index}" for index in range(4)),
             sample_rate_hz=100_000,
             samples_per_read=200,
             minimum_v=-2,
@@ -57,7 +57,7 @@ class AnalogAcquisitionTests(unittest.TestCase):
         self.assertEqual(snapshot.retained_samples, 1000)
         self.assertEqual(snapshot.dropped_samples, snapshot.total_samples - 1000)
         self.assertEqual(dataset.first_sample_index, snapshot.dropped_samples)
-        self.assertEqual(len(dataset.samples), 2)
+        self.assertEqual(len(dataset.samples), 4)
         self.assertEqual(len(dataset.samples[0]), 1000)
         self.assertTrue(any(block is not None for block in blocks))
 
@@ -133,6 +133,53 @@ class AnalogAcquisitionTests(unittest.TestCase):
         )
         self.assertEqual(block.samples, ((0.1, 0.2), (0.3, 0.4)))
         self.assertTrue(task.closed)
+
+    def test_continuous_text_stream_keeps_all_samples_beyond_memory_limit(self) -> None:
+        config = AnalogInputConfig(
+            channels=tuple(f"SIM::NI_DAQ::1/ai{index}" for index in range(4)),
+            sample_rate_hz=100_000,
+            samples_per_read=250,
+            minimum_v=-2,
+            maximum_v=2,
+            terminal_mode="DIFF",
+        )
+        reader = VirtualAnalogInput(config, signal_frequency_hz=500, noise_v=0)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "continuous.csv"
+            controller = AnalogAcquisitionController(
+                reader,
+                maximum_retained_samples=1000,
+                stream_path=path,
+            )
+            controller.start()
+            self.assertTrue(
+                wait_until(
+                    lambda: controller.snapshot().saved_samples >= 25_000,
+                    timeout=5.0,
+                )
+            )
+            running = controller.snapshot()
+            self.assertTrue(running.streaming)
+            self.assertLessEqual(running.saved_samples, running.total_samples)
+            self.assertGreater(path.stat().st_size, 1000)
+            controller.stop()
+
+            snapshot = controller.snapshot()
+            with path.open("r", encoding="utf-8-sig", newline="") as stream:
+                rows = list(csv.reader(stream))
+
+        self.assertFalse(snapshot.streaming)
+        self.assertEqual(snapshot.saved_samples, snapshot.total_samples)
+        self.assertEqual(snapshot.retained_samples, 1000)
+        self.assertGreater(snapshot.dropped_samples, 0)
+        self.assertEqual(rows[0][1], "RigolGeneratorControl Continuous Analog Input CSV v2")
+        self.assertEqual(rows[4], ["# continuous_recording", "true"])
+        self.assertEqual(rows[5][:2], ["sample_index", "elapsed_s"])
+        self.assertEqual(rows[5][2:], list(config.channels))
+        self.assertEqual(len(rows), 6 + snapshot.total_samples)
+        self.assertTrue(all(len(row) == 6 for row in rows[6:]))
+        indices = [int(row[0]) for row in rows[6:]]
+        self.assertEqual(indices, list(range(snapshot.total_samples)))
 
 
 if __name__ == "__main__":

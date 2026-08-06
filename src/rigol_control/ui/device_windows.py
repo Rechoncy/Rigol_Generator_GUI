@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QObject, QThreadPool, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QThreadPool, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -21,8 +21,6 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -42,11 +40,18 @@ from ..analog import (
     AnalogAcquisitionUpdate,
 )
 from ..connections import ConnectionInfo, DeviceConnectionManager
-from ..drivers.dg4000 import BasicWaveform, DG4000Driver, StepParameter, StepValue
+from ..drivers.dg4000 import (
+    BasicWaveform,
+    DG4000Driver,
+    StepParameter,
+    StepValue,
+    output_load_value,
+)
 from ..drivers.ni_analog import AnalogInputConfig, NIDaqAnalogInput
 from ..drivers.ni_counter import NIDaqEdgeCounter
 from ..drivers.scpi import ScpiSession
 from ..models import DeviceKind, DeviceRecord
+from ..repository import default_data_dir
 from ..scan import (
     MAX_SCAN_AXES,
     ScanAxis,
@@ -106,6 +111,81 @@ class CompactDoubleSpinBox(QDoubleSpinBox):
 
     def textFromValue(self, value: float) -> str:
         return f"{value:.12g}"
+
+
+class CheckableComboBox(QComboBox):
+    """A compact multi-select dropdown whose entries use checkboxes."""
+
+    checkedItemsChanged = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("请选择一个或多个模拟输入端口")
+        self.view().viewport().installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            watched is self.view().viewport()
+            and event.type() == QEvent.Type.MouseButtonRelease
+        ):
+            position = event.position().toPoint()  # type: ignore[attr-defined]
+            model_index = self.view().indexAt(position)
+            if model_index.isValid():
+                row = model_index.row()
+                checked = self.itemData(row, Qt.ItemDataRole.CheckStateRole)
+                new_state = (
+                    Qt.CheckState.Unchecked
+                    if checked == Qt.CheckState.Checked
+                    else Qt.CheckState.Checked
+                )
+                self.setItemData(row, new_state, Qt.ItemDataRole.CheckStateRole)
+                self._refresh_summary()
+                self.checkedItemsChanged.emit()
+                return True
+        return super().eventFilter(watched, event)
+
+    def add_checkable_item(self, text: str, data: Any, *, checked: bool = False) -> None:
+        self.addItem(text, data)
+        self.setItemData(
+            self.count() - 1,
+            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked,
+            Qt.ItemDataRole.CheckStateRole,
+        )
+        self._refresh_summary()
+
+    def checked_data(self) -> tuple[Any, ...]:
+        return tuple(
+            self.itemData(index)
+            for index in range(self.count())
+            if self.itemData(index, Qt.ItemDataRole.CheckStateRole)
+            == Qt.CheckState.Checked
+        )
+
+    def set_all_checked(self, checked: bool) -> None:
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self.blockSignals(True)
+        for index in range(self.count()):
+            self.setItemData(index, state, Qt.ItemDataRole.CheckStateRole)
+        self.blockSignals(False)
+        self._refresh_summary()
+        self.checkedItemsChanged.emit()
+
+    def _refresh_summary(self) -> None:
+        labels = [
+            self.itemText(index).split("/")[-1]
+            for index in range(self.count())
+            if self.itemData(index, Qt.ItemDataRole.CheckStateRole)
+            == Qt.CheckState.Checked
+        ]
+        if not labels:
+            text = "未选择采集端口"
+        elif len(labels) <= 3:
+            text = f"已选 {len(labels)} 路：" + ", ".join(labels)
+        else:
+            text = f"已选 {len(labels)} 路：" + ", ".join(labels[:3]) + "…"
+        self.lineEdit().setText(text)
 
 
 class UnitValueWidget(QWidget):
@@ -297,8 +377,10 @@ class DG4000Window(BaseDeviceWindow):
         record: DeviceRecord,
         ni_devices: list[DeviceRecord],
         connection_manager: DeviceConnectionManager | None = None,
+        device_provider: Callable[[], list[DeviceRecord]] | None = None,
     ) -> None:
         self.ni_devices = ni_devices
+        self.device_provider = device_provider
         self.connection_manager = connection_manager
         self.driver = (
             connection_manager.dg_driver_for(record)
@@ -310,7 +392,10 @@ class DG4000Window(BaseDeviceWindow):
         self.trigger_bridge = TriggerBridge()
         self.trigger_bridge.updated.connect(self._trigger_updated)
         self._last_trigger_error: str | None = None
+        self._ui_connected = False
+        self._ni_source_signature: tuple[tuple[str, str, str, bool], ...] = ()
         self.channel_controls: dict[int, dict[str, Any]] = {}
+        self.impedance_controls: dict[int, dict[str, Any]] = {}
         self.modulation_controls: dict[str, dict[str, Any]] = {}
         navigation = [
             ("总览", self._overview_page),
@@ -329,16 +414,29 @@ class DG4000Window(BaseDeviceWindow):
             )
             self._connected(identity)
 
+    def sync_connection_state(self) -> None:
+        """Reflect connection changes made from the device center."""
+
+        if self.connection_manager is None:
+            return
+        connected = self.connection_manager.is_connected(self.record)
+        if connected and not self._ui_connected:
+            self._connected(self.connection_manager.info(self.record))
+        elif not connected and self._ui_connected:
+            self._disconnected()
+
     def _overview_page(self) -> QWidget:
         page, layout = page_shell("DG4000 设备总览", "管理连接、输出状态与最近的联动任务。")
         metrics = QHBoxLayout()
-        for caption, value, color in (
-            ("连接状态", "未连接", "#f0b95d"),
-            ("通道 1", "关闭", "#8995aa"),
-            ("通道 2", "关闭", "#8995aa"),
-            ("触发积压", "0", "#55d9cc"),
+        self.overview_metrics: dict[str, QLabel] = {}
+        for key, caption, value, color in (
+            ("connection", "连接状态", "未连接", "#f0b95d"),
+            ("channel_1", "通道 1", "未知", "#8995aa"),
+            ("channel_2", "通道 2", "未知", "#8995aa"),
+            ("backlog", "触发积压", "0", "#55d9cc"),
         ):
-            card, _ = metric_card(caption, value, color)
+            card, number = metric_card(caption, value, color)
+            self.overview_metrics[key] = number
             metrics.addWidget(card)
         layout.addLayout(metrics)
 
@@ -434,7 +532,31 @@ class DG4000Window(BaseDeviceWindow):
         self.driver_status.setText("● 已连接")
         self.driver_status.style().unpolish(self.driver_status)
         self.driver_status.style().polish(self.driver_status)
+        self._ui_connected = True
+        self.overview_metrics["connection"].setText("已连接")
         self.statusBar().showMessage("DG4000 VISA 会话已连接", 5000)
+        self._refresh_output_states()
+
+    def _refresh_output_states(self) -> None:
+        if not self.driver.is_connected:
+            self._set_output_metrics(None)
+            return
+        self.submit(
+            self.driver.output_states,
+            on_success=lambda states: self._set_output_metrics(states),
+            on_error=self._output_state_query_failed,
+        )
+
+    def _set_output_metrics(self, states: tuple[bool, bool] | None) -> None:
+        for channel in (1, 2):
+            state = None if states is None else states[channel - 1]
+            self.overview_metrics[f"channel_{channel}"].setText(
+                "未知" if state is None else ("已打开" if state else "关闭")
+            )
+
+    def _output_state_query_failed(self, message: str) -> None:
+        self._set_output_metrics(None)
+        self.statusBar().showMessage(f"已连接，但读取 CH1/CH2 输出状态失败：{message}", 8000)
 
     def _connect_failed(self, message: str) -> None:
         self.connect_button.setText("连接设备")
@@ -463,6 +585,9 @@ class DG4000Window(BaseDeviceWindow):
         self.driver_status.setText("● 驱动尚未连接")
         self.driver_status.style().unpolish(self.driver_status)
         self.driver_status.style().polish(self.driver_status)
+        self._ui_connected = False
+        self.overview_metrics["connection"].setText("未连接")
+        self._set_output_metrics(None)
         self.statusBar().showMessage("DG4000 已断开", 5000)
 
     def _require_connection(self) -> bool:
@@ -474,7 +599,7 @@ class DG4000Window(BaseDeviceWindow):
     def _channel_page(self) -> QWidget:
         page, layout = page_shell(
             "通道与基本波形",
-            "配置两个输出通道的波形、频率、幅度、偏置、初相位和负载阻抗。",
+            "配置两个输出通道的波形、频率、幅度、偏置、初相位和输出状态。负载阻抗请在“存储与系统”中设置。",
         )
         tabs = QTabWidget()
         for channel in (1, 2):
@@ -488,37 +613,11 @@ class DG4000Window(BaseDeviceWindow):
             amplitude = unit_value_spin(1.0, 0.001, 20.0, "amplitude", "Vpp")
             offset = unit_value_spin(0, -10, 10, "voltage", "V")
             phase = unit_value_spin(0, 0, 360, "angle", "deg")
-            load = QComboBox()
-            load.addItem("高阻（INFINITY）", None)
-            load.addItem("50 Ω", 50)
-            load.addItem("75 Ω", 75)
-            load.addItem("600 Ω", 600)
-            load.addItem("自定义", "CUSTOM")
-            load.setToolTip(
-                "对应 :OUTP<n>:LOAD；用于匹配实际负载并校准仪器显示幅度，不改变输出级固有源阻抗。"
-            )
-            custom_load = QSpinBox()
-            custom_load.setRange(1, 10_000)
-            custom_load.setValue(50)
-            custom_load.setSuffix(" Ω")
-            custom_load.setEnabled(False)
-            load.currentIndexChanged.connect(
-                lambda _index, combo=load, control=custom_load: control.setEnabled(
-                    combo.currentData() == "CUSTOM"
-                )
-            )
-            load_row = QWidget()
-            load_layout = QHBoxLayout(load_row)
-            load_layout.setContentsMargins(0, 0, 0, 0)
-            load_layout.setSpacing(6)
-            load_layout.addWidget(load, 1)
-            load_layout.addWidget(custom_load)
             form.addRow("波形", waveform)
             form.addRow("频率", frequency)
             form.addRow("幅度", amplitude)
             form.addRow("直流偏置", offset)
             form.addRow("初相位", phase)
-            form.addRow("负载阻抗", load_row)
             output = QCheckBox("启用通道输出")
             form.addRow("输出", output)
             self.channel_controls[channel] = {
@@ -527,8 +626,6 @@ class DG4000Window(BaseDeviceWindow):
                 "amplitude": amplitude,
                 "offset": offset,
                 "phase": phase,
-                "load": load,
-                "custom_load": custom_load,
                 "output": output,
             }
             settings_layout.addLayout(form)
@@ -555,23 +652,20 @@ class DG4000Window(BaseDeviceWindow):
         )
         output = controls["output"].isChecked()
 
-        load_data = controls["load"].currentData()
-        load_ohms = controls["custom_load"].value() if load_data == "CUSTOM" else load_data
-
         def apply() -> None:
-            self.driver.configure_channel(
+            self.driver.configure_waveform_output(
                 channel,
                 waveform,
-                load_ohms=load_ohms,
                 enabled=output,
             )
 
-        self.submit(
-            apply,
-            on_success=lambda _=None: self.statusBar().showMessage(
-                f"CH{channel} 参数已下发", 4000
-            ),
-        )
+        def applied(_result: Any = None) -> None:
+            self.overview_metrics[f"channel_{channel}"].setText(
+                "已打开" if output else "关闭"
+            )
+            self.statusBar().showMessage(f"CH{channel} 参数已下发", 4000)
+
+        self.submit(apply, on_success=applied)
 
     def _modulation_page(self) -> QWidget:
         page, layout = page_shell("调制", "覆盖 DG4000 的模拟调制、数字键控和脉宽调制设置。")
@@ -775,12 +869,17 @@ class DG4000Window(BaseDeviceWindow):
         config, config_layout = panel("任务配置")
         form = QFormLayout()
         self.ni_source = QComboBox()
-        if self.ni_devices:
-            for device in self.ni_devices:
-                self.ni_source.addItem(f"{device.name} ({device.resource})", device.id)
-        else:
-            self.ni_source.addItem("请先在设备中心添加 NI 采集卡", None)
-            self.ni_source.setEnabled(False)
+        self.ni_source.currentTextChanged.connect(self.ni_source.setToolTip)
+        ni_source_row = QWidget()
+        ni_source_layout = QHBoxLayout(ni_source_row)
+        ni_source_layout.setContentsMargins(0, 0, 0, 0)
+        ni_source_layout.setSpacing(6)
+        ni_source_layout.addWidget(self.ni_source, 1)
+        refresh_ni = QPushButton("刷新")
+        refresh_ni.setToolTip("重新读取设备中心中的 NI 采集卡及连接状态")
+        refresh_ni.clicked.connect(self.refresh_ni_devices)
+        ni_source_layout.addWidget(refresh_ni)
+        self.refresh_ni_devices(force=True)
         self.step_counter = QComboBox()
         for index in range(4):
             self.step_counter.addItem(f"ctr{index}", f"ctr{index}")
@@ -797,7 +896,7 @@ class DG4000Window(BaseDeviceWindow):
             "组合扫描：生成所有轴的笛卡尔积，最后一个轴变化最快。"
         )
         self.scan_mode.currentIndexChanged.connect(self._scan_configuration_changed)
-        form.addRow("NI 计数设备", self.ni_source)
+        form.addRow("NI 计数设备", ni_source_row)
         form.addRow("NI 计数器", self.step_counter)
         form.addRow("PFI 触发端子", self.step_terminal)
         form.addRow("触发边沿", self.step_edge)
@@ -906,6 +1005,72 @@ class DG4000Window(BaseDeviceWindow):
         actions.addWidget(note)
         layout.addLayout(actions)
         return page
+
+    def update_ni_devices(self, all_devices: list[DeviceRecord]) -> None:
+        self.ni_devices = [item for item in all_devices if item.kind is DeviceKind.NI_DAQ]
+        self.refresh_ni_devices(from_provider=False)
+
+    def refresh_ni_devices(
+        self,
+        _checked: bool = False,
+        *,
+        force: bool = False,
+        from_provider: bool = True,
+    ) -> None:
+        if from_provider and self.device_provider is not None:
+            try:
+                self.ni_devices = [
+                    item for item in self.device_provider() if item.kind is DeviceKind.NI_DAQ
+                ]
+            except Exception as exc:
+                self.statusBar().showMessage(f"刷新 NI 设备列表失败：{exc}", 8000)
+        if not hasattr(self, "ni_source"):
+            return
+        signature = tuple(
+            (
+                item.id,
+                item.name,
+                item.resource,
+                bool(
+                    self.connection_manager is not None
+                    and self.connection_manager.is_connected(item)
+                ),
+            )
+            for item in self.ni_devices
+        )
+        if not force and signature == self._ni_source_signature:
+            return
+        selected_id = self.ni_source.currentData()
+        self.ni_source.blockSignals(True)
+        self.ni_source.clear()
+        if self.ni_devices:
+            for device in self.ni_devices:
+                connected = bool(
+                    self.connection_manager is not None
+                    and self.connection_manager.is_connected(device)
+                )
+                state = "已连接" if connected else "未连接"
+                self.ni_source.addItem(
+                    f"● {state} · {device.name} ({device.resource})", device.id
+                )
+            selected_index = self.ni_source.findData(selected_id)
+            if selected_index < 0 and self.connection_manager is not None:
+                selected_index = next(
+                    (
+                        index
+                        for index, device in enumerate(self.ni_devices)
+                        if self.connection_manager.is_connected(device)
+                    ),
+                    0,
+                )
+            self.ni_source.setCurrentIndex(max(0, selected_index))
+            self.ni_source.setEnabled(self.controller is None)
+        else:
+            self.ni_source.addItem("请先在设备中心添加 NI 采集卡", None)
+            self.ni_source.setEnabled(False)
+        self.ni_source.blockSignals(False)
+        self.ni_source.setToolTip(self.ni_source.currentText())
+        self._ni_source_signature = signature
 
     @staticmethod
     def _axis_defaults(parameter: StepParameter) -> tuple[str, float, float, int]:
@@ -1280,6 +1445,16 @@ class DG4000Window(BaseDeviceWindow):
         if ni_record is None:
             QMessageBox.warning(self, "缺少 NI 设备", "请先在设备中心添加并选择 NI 采集卡。")
             return
+        if (
+            self.connection_manager is not None
+            and not self.connection_manager.is_connected(ni_record)
+        ):
+            QMessageBox.warning(
+                self,
+                "NI 设备未连接",
+                "所选 NI 采集卡尚未连接。请先在设备中心或 NI 设置窗口连接，再刷新列表。",
+            )
+            return
         try:
             points = self._sequence_points()
         except ValueError as exc:
@@ -1363,6 +1538,7 @@ class DG4000Window(BaseDeviceWindow):
         self.trigger_metrics["received"].setText(str(snapshot.received_count))
         self.trigger_metrics["applied"].setText(str(snapshot.applied_count))
         self.trigger_metrics["backlog"].setText(str(snapshot.backlog))
+        self.overview_metrics["backlog"].setText(str(snapshot.backlog))
         if snapshot.current_index is None:
             self.trigger_metrics["current"].setText("—")
             self.trigger_metrics["current"].setToolTip("")
@@ -1402,10 +1578,12 @@ class DG4000Window(BaseDeviceWindow):
             return
         for key in ("received", "applied", "backlog"):
             self.trigger_metrics[key].setText("0")
+        self.overview_metrics["backlog"].setText("0")
         self.trigger_metrics["current"].setText("—")
         self.trigger_metrics["current"].setToolTip("")
 
     def _set_scan_editing_enabled(self, enabled: bool) -> None:
+        self.ni_source.setEnabled(enabled and bool(self.ni_devices))
         self.scan_mode.setEnabled(enabled)
         self.add_scan_axis_button.setEnabled(enabled)
         self.generate_scan_button.setEnabled(enabled)
@@ -1436,8 +1614,99 @@ class DG4000Window(BaseDeviceWindow):
             if row == 0 and not self.step_table.item(row, note_column).text():
                 self.step_table.item(row, note_column).setText("起始点（第一个触发）")
 
+    def _impedance_control_row(self, channel: int) -> QWidget:
+        load = QComboBox()
+        load.addItem("高阻（INFINITY）", None)
+        load.addItem("50 Ω（默认）", 50)
+        load.addItem("75 Ω", 75)
+        load.addItem("600 Ω", 600)
+        load.addItem("自定义", "CUSTOM")
+        load.setCurrentIndex(load.findData(50))
+        load.setToolTip(
+            f"对应 :OUTP{channel}:LOAD；用于匹配实际负载并校准仪器显示幅度。"
+        )
+        custom = QSpinBox()
+        custom.setRange(1, 10_000)
+        custom.setValue(50)
+        custom.setSuffix(" Ω")
+        custom.setEnabled(False)
+        load.currentIndexChanged.connect(
+            lambda _index, combo=load, control=custom: control.setEnabled(
+                combo.currentData() == "CUSTOM"
+            )
+        )
+        apply_button = QPushButton(f"应用到 CH{channel}")
+        apply_button.clicked.connect(
+            lambda _checked=False, selected=channel: self._apply_output_load(selected)
+        )
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(6)
+        row_layout.addWidget(load, 1)
+        row_layout.addWidget(custom)
+        row_layout.addWidget(apply_button)
+        self.impedance_controls[channel] = {
+            "load": load,
+            "custom_load": custom,
+            "apply": apply_button,
+        }
+        return row
+
+    def _selected_output_load(self, channel: int) -> int | None:
+        controls = self.impedance_controls[channel]
+        load_data = controls["load"].currentData()
+        return controls["custom_load"].value() if load_data == "CUSTOM" else load_data
+
+    def _apply_output_load(self, channel: int) -> None:
+        if not self._require_connection():
+            return
+        load_ohms = self._selected_output_load(channel)
+        self.submit(
+            lambda: self.driver.set_output_load(channel, load_ohms),
+            on_success=lambda _=None: self.statusBar().showMessage(
+                f"CH{channel} 负载阻抗已设置为 "
+                f"{'高阻' if load_ohms is None else f'{load_ohms} Ω'}",
+                5000,
+            ),
+        )
+
+    def _apply_all_output_loads(self) -> None:
+        if not self._require_connection():
+            return
+        commands = tuple(
+            f":OUTP{channel}:LOAD {output_load_value(self._selected_output_load(channel))}"
+            for channel in (1, 2)
+        )
+        self.submit(
+            lambda: self.driver.write_many(commands),
+            on_success=lambda _=None: self.statusBar().showMessage(
+                "CH1/CH2 负载阻抗已同时下发", 5000
+            ),
+        )
+
     def _system_page(self) -> QWidget:
-        page, layout = page_shell("存储与系统", "管理仪器状态文件、SCPI 控制台、显示和系统命令。")
+        page, layout = page_shell(
+            "存储与系统",
+            "管理输出负载阻抗、仪器状态文件、SCPI 控制台、显示和系统命令。",
+        )
+        impedance, impedance_layout = panel("输出负载阻抗")
+        impedance_note = QLabel(
+            "CH1/CH2 默认选择 50 Ω。设置通过 :OUTP<n>:LOAD 独立下发，不会在应用频率、"
+            "幅度或波形时被重复改写。高阻或自定义 1–10000 Ω 仍然可用。"
+        )
+        impedance_note.setObjectName("Muted")
+        impedance_note.setWordWrap(True)
+        impedance_layout.addWidget(impedance_note)
+        impedance_form = QFormLayout()
+        for channel in (1, 2):
+            impedance_form.addRow(f"CH{channel} 负载", self._impedance_control_row(channel))
+        impedance_layout.addLayout(impedance_form)
+        apply_all = QPushButton("同时应用 CH1/CH2")
+        apply_all.setObjectName("PrimaryButton")
+        apply_all.clicked.connect(self._apply_all_output_loads)
+        impedance_layout.addWidget(apply_all, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(impedance)
         storage, storage_layout = panel("仪器状态")
         buttons = QHBoxLayout()
         state_commands = {
@@ -1488,6 +1757,8 @@ class DG4000Window(BaseDeviceWindow):
                 self.scpi_log.appendPlainText(f"> {command}\n{result}")
             else:
                 self.statusBar().showMessage(f"{command} → {result}", 8000)
+            if not command.endswith("?"):
+                self._refresh_output_states()
 
         self.submit(operation, on_success=completed)
 
@@ -1522,6 +1793,7 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.analog_bridge = AnalogBridge()
         self.analog_bridge.updated.connect(self._analog_updated)
         self._last_analog_error: str | None = None
+        self._ui_connected = False
         navigation = [
             ("总览", self._overview_page),
             ("触发输入", self._trigger_page),
@@ -1534,19 +1806,30 @@ class NIDeviceWindow(BaseDeviceWindow):
         if self.connection_manager is not None and self.connection_manager.is_connected(record):
             self._ni_connected(self.connection_manager.info(record))
 
+    def sync_connection_state(self) -> None:
+        if self.connection_manager is None:
+            return
+        connected = self.connection_manager.is_connected(self.record)
+        if connected and not self._ui_connected:
+            self._ni_connected(self.connection_manager.info(self.record))
+        elif not connected and self._ui_connected:
+            self._ni_disconnected()
+
     def _overview_page(self) -> QWidget:
         page, layout = page_shell(
             "NI 采集卡总览",
             "支持外部触发计数和独立模拟电压采集；不通过 AO 电压控制 DG4000 参数。",
         )
         metrics = QHBoxLayout()
-        for caption, value, color in (
-            ("设备状态", "未连接", "#f0b95d"),
-            ("触发任务", "未运行", "#8995aa"),
-            ("累计触发", "0", "#8f7cff"),
-            ("缓冲积压", "0", "#55d9cc"),
+        self.ni_overview_metrics: dict[str, QLabel] = {}
+        for key, caption, value, color in (
+            ("connection", "设备状态", "未连接", "#f0b95d"),
+            ("trigger", "触发任务", "未运行", "#8995aa"),
+            ("received", "累计触发", "0", "#8f7cff"),
+            ("backlog", "缓冲积压", "0", "#55d9cc"),
         ):
-            card, _ = metric_card(caption, value, color)
+            card, number = metric_card(caption, value, color)
+            self.ni_overview_metrics[key] = number
             metrics.addWidget(card)
         layout.addLayout(metrics)
         info, info_layout = panel("设备信息")
@@ -1678,6 +1961,8 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.driver_status.setText("● 已连接")
         self.driver_status.style().unpolish(self.driver_status)
         self.driver_status.style().polish(self.driver_status)
+        self._ui_connected = True
+        self.ni_overview_metrics["connection"].setText("已连接")
         self.statusBar().showMessage("NI 设备已由 NI-DAQmx 识别", 5000)
         self._refresh_analog_channels()
 
@@ -1714,6 +1999,8 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.driver_status.setText("● 驱动尚未连接")
         self.driver_status.style().unpolish(self.driver_status)
         self.driver_status.style().polish(self.driver_status)
+        self._ui_connected = False
+        self.ni_overview_metrics["connection"].setText("未连接")
         self.statusBar().showMessage("NI 设备连接已释放", 4000)
 
     def _trigger_page(self) -> QWidget:
@@ -1749,7 +2036,7 @@ class NIDeviceWindow(BaseDeviceWindow):
     def _analog_input_page(self) -> QWidget:
         page, layout = page_shell(
             "模拟输入采集",
-            "使用 NI-DAQmx 硬件定时连续采集电压，实时绘图，并将当前保留数据保存为 CSV。",
+            "使用 NI-DAQmx 硬件定时连续采集电压；实时曲线用于监视，完整样本在采集过程中持续写入 CSV/TXT 文本。",
         )
 
         upper = QHBoxLayout()
@@ -1759,17 +2046,43 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.ai_config_tabs = QTabWidget()
         acquisition_tab = QWidget()
         form = QFormLayout(acquisition_tab)
-        self.ai_channel_list = QListWidget()
-        self.ai_channel_list.setSelectionMode(
-            QAbstractItemView.SelectionMode.MultiSelection
+        self.ai_channel_combo = CheckableComboBox()
+        self.ai_channel_combo.checkedItemsChanged.connect(
+            self._update_analog_channel_summary
         )
-        self.ai_channel_list.setMaximumHeight(105)
         default_channels = (
             tuple(f"{self.record.resource}/ai{index}" for index in range(4))
             if is_virtual_resource(self.record.resource)
             else tuple(f"{self.record.resource}/ai{index}" for index in range(8))
         )
         self._set_analog_channel_items(default_channels)
+        channel_actions_widget = QWidget()
+        channel_actions = QHBoxLayout(channel_actions_widget)
+        channel_actions.setContentsMargins(0, 0, 0, 0)
+        channel_actions.setSpacing(6)
+        self.ai_channel_summary = QLabel()
+        self.ai_channel_summary.setObjectName("Muted")
+        self.ai_channels_all = QPushButton("全选")
+        self.ai_channels_none = QPushButton("清空")
+        self.ai_channels_all.clicked.connect(
+            lambda: self._set_all_analog_channels(True)
+        )
+        self.ai_channels_none.clicked.connect(
+            lambda: self._set_all_analog_channels(False)
+        )
+        channel_actions.addWidget(self.ai_channel_summary)
+        channel_actions.addStretch()
+        channel_actions.addWidget(self.ai_channels_all)
+        channel_actions.addWidget(self.ai_channels_none)
+        channel_note = QLabel(
+            "下拉项可同时勾选多个 ai 端口；所有已选端口共享 NI 硬件采样时钟并行采集。"
+        )
+        channel_note.setObjectName("Muted")
+        channel_note.setWordWrap(True)
+        form.addRow("采集端口（可多选）", self.ai_channel_combo)
+        form.addRow(channel_actions_widget)
+        form.addRow(channel_note)
+        self._update_analog_channel_summary()
         self.ai_terminal_mode = QComboBox()
         for label, value in (
             ("设备默认", "DEFAULT"),
@@ -1794,23 +2107,68 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.ai_retained_samples.setValue(500_000)
         self.ai_retained_samples.setSingleStep(10_000)
         self.ai_retained_samples.setSuffix(" 点/通道")
-        form.addRow("模拟通道（可多选）", self.ai_channel_list)
         form.addRow("端接方式", self.ai_terminal_mode)
         form.addRow("采样率", self.ai_sample_rate)
         form.addRow("量程下限", self.ai_minimum)
         form.addRow("量程上限", self.ai_maximum)
         form.addRow("每次读取", self.ai_block_size)
         form.addRow("内存保留上限", self.ai_retained_samples)
-        self.ai_config_tabs.addTab(acquisition_tab, "采集任务")
+        acquisition_note = QLabel(
+            "采样率和每次读取点数均按每通道计算；全部勾选通道共享硬件采样时钟。"
+        )
+        acquisition_note.setObjectName("Muted")
+        acquisition_note.setWordWrap(True)
+        form.addRow(acquisition_note)
+        self.ai_config_tabs.addTab(acquisition_tab, "采集")
+
+        record_tab = QWidget()
+        record_form = QFormLayout(record_tab)
+        self.ai_stream_enabled = QCheckBox("采集时连续写入 CSV/TXT 文本")
+        self.ai_stream_enabled.setChecked(True)
+        self.ai_stream_path = QLineEdit(
+            str(
+                default_data_dir()
+                / "acquisitions"
+                / f"NI_AI_{datetime.now():%Y%m%d_%H%M%S}.csv"
+            )
+        )
+        self.ai_stream_browse = QPushButton("选择…")
+        self.ai_stream_browse.clicked.connect(self._browse_analog_stream_path)
+        stream_path_row = QWidget()
+        stream_path_layout = QHBoxLayout(stream_path_row)
+        stream_path_layout.setContentsMargins(0, 0, 0, 0)
+        stream_path_layout.setSpacing(6)
+        stream_path_layout.addWidget(self.ai_stream_path, 1)
+        stream_path_layout.addWidget(self.ai_stream_browse)
+        record_form.addRow(self.ai_stream_enabled)
+        record_form.addRow("连续文本文件", stream_path_row)
+        stream_note = QLabel(
+            "每个 NI 数据块立即追加并刷新到磁盘；内存上限只影响绘图窗口，不截断文本文件。"
+        )
+        stream_note.setObjectName("Muted")
+        stream_note.setWordWrap(True)
+        record_form.addRow(stream_note)
+        record_columns_note = QLabel(
+            "每个采样时刻占一行，每个已勾选通道占一个独立电压列。"
+        )
+        record_columns_note.setObjectName("Muted")
+        record_columns_note.setWordWrap(True)
+        record_form.addRow(record_columns_note)
+        self.ai_config_tabs.addTab(record_tab, "记录")
 
         self.analog_config_widgets = [
-            self.ai_channel_list,
+            self.ai_channel_combo,
+            self.ai_channels_all,
+            self.ai_channels_none,
             self.ai_terminal_mode,
             self.ai_sample_rate,
             self.ai_minimum,
             self.ai_maximum,
             self.ai_block_size,
             self.ai_retained_samples,
+            self.ai_stream_enabled,
+            self.ai_stream_path,
+            self.ai_stream_browse,
         ]
 
         if is_virtual_resource(self.record.resource):
@@ -1830,7 +2188,7 @@ class NIDeviceWindow(BaseDeviceWindow):
             virtual_note.setObjectName("Muted")
             virtual_note.setWordWrap(True)
             virtual_form.addRow(virtual_note)
-            self.ai_config_tabs.addTab(virtual_tab, "虚拟信号源")
+            self.ai_config_tabs.addTab(virtual_tab, "虚拟源")
             self.analog_config_widgets.extend(
                 [
                     self.ai_virtual_frequency,
@@ -1845,8 +2203,8 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.ai_start.setObjectName("PrimaryButton")
         self.ai_stop = QPushButton("停止")
         self.ai_stop.setEnabled(False)
-        self.ai_clear = QPushButton("清空数据")
-        self.ai_save_csv = QPushButton("保存 CSV")
+        self.ai_clear = QPushButton("清空显示")
+        self.ai_save_csv = QPushButton("导出缓存 CSV")
         self.ai_save_csv.setEnabled(False)
         self.ai_start.clicked.connect(self._start_analog_input)
         self.ai_stop.clicked.connect(self._stop_analog_input)
@@ -1865,11 +2223,12 @@ class NIDeviceWindow(BaseDeviceWindow):
         plot_actions = QHBoxLayout()
         self.ai_plot_status = QLabel("● 等待采集")
         self.ai_plot_status.setObjectName("StatusPending")
-        self.ai_save_png = QPushButton("保存波形图片")
-        self.ai_save_png.clicked.connect(self._save_analog_png)
+        self.ai_record_status = QLabel("连续文本记录：等待启动")
+        self.ai_record_status.setObjectName("Muted")
+        self.ai_record_status.setWordWrap(True)
         plot_actions.addWidget(self.ai_plot_status)
         plot_actions.addStretch()
-        plot_actions.addWidget(self.ai_save_png)
+        plot_actions.addWidget(self.ai_record_status)
         plot_layout.addLayout(plot_actions)
         upper.addWidget(settings, 1)
         upper.addWidget(plot_panel, 2)
@@ -1882,6 +2241,7 @@ class NIDeviceWindow(BaseDeviceWindow):
             ("samples", "每通道总点数", "0", "#55d9cc"),
             ("duration", "采集时长", "0 s", "#f0b95d"),
             ("retained", "保留 / 丢弃", "0 / 0", "#e7ebf4"),
+            ("saved", "已写入文本", "0", "#54d6a3"),
         ):
             card, number = metric_card(caption, value, color)
             self.ai_metrics[key] = number
@@ -1894,23 +2254,37 @@ class NIDeviceWindow(BaseDeviceWindow):
         return page
 
     def _set_analog_channel_items(self, channel_names: tuple[str, ...]) -> None:
-        if not hasattr(self, "ai_channel_list"):
+        if not hasattr(self, "ai_channel_combo"):
             return
-        selected = {
-            item.data(Qt.ItemDataRole.UserRole)
-            for item in self.ai_channel_list.selectedItems()
-        }
-        self.ai_channel_list.clear()
+        checked = set(self.ai_channel_combo.checked_data())
+        self.ai_channel_combo.blockSignals(True)
+        self.ai_channel_combo.clear()
         for index, channel in enumerate(channel_names):
-            item = QListWidgetItem(channel)
-            item.setData(Qt.ItemDataRole.UserRole, channel)
-            self.ai_channel_list.addItem(item)
-            item.setSelected(channel in selected or (not selected and index == 0))
-        if self.ai_channel_list.count() and not self.ai_channel_list.selectedItems():
-            self.ai_channel_list.item(0).setSelected(True)
+            self.ai_channel_combo.add_checkable_item(
+                channel,
+                channel,
+                checked=channel in checked or (not checked and index == 0),
+            )
+        self.ai_channel_combo.blockSignals(False)
+        self.ai_channel_combo._refresh_summary()
+        self._update_analog_channel_summary()
+
+    def _checked_analog_channels(self) -> tuple[str, ...]:
+        return tuple(str(channel) for channel in self.ai_channel_combo.checked_data())
+
+    def _set_all_analog_channels(self, checked: bool) -> None:
+        self.ai_channel_combo.set_all_checked(checked)
+
+    def _update_analog_channel_summary(self) -> None:
+        if not hasattr(self, "ai_channel_summary"):
+            return
+        self.ai_channel_summary.setText(
+            f"已勾选 {len(self._checked_analog_channels())} / "
+            f"{self.ai_channel_combo.count()} 路"
+        )
 
     def _refresh_analog_channels(self) -> None:
-        if not hasattr(self, "ai_channel_list"):
+        if not hasattr(self, "ai_channel_combo"):
             return
 
         def completed(channels: Any) -> None:
@@ -1934,12 +2308,8 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.statusBar().showMessage(f"模拟输入通道检测失败：{message}", 8000)
 
     def _analog_config(self) -> AnalogInputConfig:
-        channels = tuple(
-            item.data(Qt.ItemDataRole.UserRole) or item.text()
-            for item in self.ai_channel_list.selectedItems()
-        )
         config = AnalogInputConfig(
-            channels=channels,
+            channels=self._checked_analog_channels(),
             sample_rate_hz=self.ai_sample_rate.value(),
             samples_per_read=self.ai_block_size.value(),
             minimum_v=self.ai_minimum.value(),
@@ -1964,6 +2334,11 @@ class NIDeviceWindow(BaseDeviceWindow):
                     self._ni_lease_owner, (self.record.id,)
                 )
             config = self._analog_config()
+            stream_path = (
+                self._continuous_stream_destination()
+                if self.ai_stream_enabled.isChecked()
+                else None
+            )
             if self.connection_manager is not None:
                 reader = self.connection_manager.analog_input_for(
                     self.record,
@@ -1994,6 +2369,7 @@ class NIDeviceWindow(BaseDeviceWindow):
             controller = AnalogAcquisitionController(
                 reader,
                 maximum_retained_samples=self.ai_retained_samples.value(),
+                stream_path=stream_path,
             )
         except Exception as exc:
             self._release_ni_lease_if_idle()
@@ -2008,6 +2384,9 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.ai_start.setText("启动中…")
         self.ai_stop.setEnabled(False)
         self.ai_save_csv.setEnabled(False)
+        self.ai_record_status.setText(
+            f"连续文本记录：{stream_path}" if stream_path else "连续文本记录：已关闭"
+        )
         self._set_analog_config_enabled(False)
         self.submit(
             controller.start,
@@ -2041,7 +2420,14 @@ class NIDeviceWindow(BaseDeviceWindow):
         has_data = bool(controller and controller.snapshot().retained_samples)
         self.ai_save_csv.setEnabled(has_data)
         self._release_ni_lease_if_idle()
-        self.statusBar().showMessage("NI 模拟输入采集已停止，数据仍保留", 4000)
+        snapshot = controller.snapshot() if controller else None
+        if snapshot and snapshot.stream_path:
+            self.statusBar().showMessage(
+                f"连续采集已停止，{snapshot.saved_samples} 点/通道已写入 {snapshot.stream_path}",
+                8000,
+            )
+        else:
+            self.statusBar().showMessage("NI 模拟输入采集已停止，内存数据仍保留", 4000)
 
     def _analog_updated(self, update: AnalogAcquisitionUpdate) -> None:
         snapshot = update.snapshot
@@ -2053,6 +2439,17 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.ai_metrics["retained"].setText(
             f"{snapshot.retained_samples} / {snapshot.dropped_samples}"
         )
+        self.ai_metrics["saved"].setText(
+            str(snapshot.saved_samples) if snapshot.stream_path else "关闭"
+        )
+        if snapshot.stream_path:
+            record_state = "写入中" if snapshot.streaming else "已关闭"
+            self.ai_record_status.setText(
+                f"连续文本记录：{record_state} · {snapshot.saved_samples} 点/通道 · "
+                f"{snapshot.stream_path}"
+            )
+        else:
+            self.ai_record_status.setText("连续文本记录：已关闭")
         if snapshot.channel_names and snapshot.minimum_v:
             details = []
             for name, minimum, maximum, rms in zip(
@@ -2114,19 +2511,55 @@ class NIDeviceWindow(BaseDeviceWindow):
 
     def _clear_analog_data(self) -> None:
         controller = self.analog_controller
+        saved_samples = 0
+        has_stream = False
         if controller is not None:
             try:
                 controller.clear()
             except RuntimeError as exc:
                 QMessageBox.information(self, "采集正在运行", str(exc))
                 return
+            snapshot = controller.snapshot()
+            saved_samples = snapshot.saved_samples
+            has_stream = bool(snapshot.stream_path)
         self.ai_plot.clear()
         self.ai_metrics["channels"].setText("0")
         self.ai_metrics["samples"].setText("0")
         self.ai_metrics["duration"].setText("0 s")
         self.ai_metrics["retained"].setText("0 / 0")
+        self.ai_metrics["saved"].setText(str(saved_samples) if has_stream else "关闭")
         self.ai_statistics.setText("最近数据块统计：—")
         self.ai_save_csv.setEnabled(False)
+
+    def _browse_analog_stream_path(self) -> None:
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "选择连续采集文本文件",
+            self.ai_stream_path.text().strip(),
+            "CSV 文本 (*.csv);;TXT 文本 (*.txt)",
+        )
+        if path:
+            self.ai_stream_path.setText(path)
+
+    def _continuous_stream_destination(self) -> Path:
+        raw = self.ai_stream_path.text().strip()
+        if not raw:
+            raise ValueError("启用连续文本记录时必须选择保存文件")
+        destination = Path(raw)
+        if destination.suffix.lower() not in {".csv", ".txt"}:
+            destination = destination.with_suffix(destination.suffix + ".csv")
+        if destination.exists():
+            stem = destination.stem
+            suffix = destination.suffix
+            for index in range(2, 10_000):
+                candidate = destination.with_name(f"{stem}_{index}{suffix}")
+                if not candidate.exists():
+                    destination = candidate
+                    break
+            else:
+                raise ValueError("无法为连续采集创建不重复的文件名")
+        self.ai_stream_path.setText(str(destination))
+        return destination
 
     def _save_analog_csv(self) -> None:
         controller = self.analog_controller
@@ -2158,21 +2591,6 @@ class NIDeviceWindow(BaseDeviceWindow):
     def _analog_csv_saved(self, path: Any) -> None:
         self.ai_save_csv.setEnabled(True)
         self.statusBar().showMessage(f"模拟输入数据已保存：{path}", 8000)
-
-    def _save_analog_png(self) -> None:
-        default_name = f"NI_AI_Waveform_{datetime.now():%Y%m%d_%H%M%S}.png"
-        path, _filter = QFileDialog.getSaveFileName(
-            self,
-            "保存波形图片",
-            str(Path.cwd() / default_name),
-            "PNG 图片 (*.png)",
-        )
-        if path:
-            destination = Path(path)
-            if destination.suffix.lower() != ".png":
-                destination = destination.with_suffix(destination.suffix + ".png")
-            if self.ai_plot.save_png(destination):
-                self.statusBar().showMessage(f"波形图片已保存：{destination}", 8000)
 
     def _counter_page(self) -> QWidget:
         page, layout = page_shell("计数器", "为联动任务选择硬件边沿计数器并查看单调递增的触发总数。")
@@ -2246,11 +2664,13 @@ class NIDeviceWindow(BaseDeviceWindow):
         def started(_result: Any = None) -> None:
             self.ni_counter_stop.setEnabled(True)
             self.ni_counter_timer.start()
+            self.ni_overview_metrics["trigger"].setText("运行中")
             self.statusBar().showMessage("NI 累计边沿计数已启动", 4000)
 
         def failed(message: str) -> None:
             self.test_counter = None
             self.ni_counter_start.setEnabled(True)
+            self.ni_overview_metrics["trigger"].setText("错误")
             self._release_ni_lease_if_idle()
             self._show_hardware_error(message)
 
@@ -2264,6 +2684,7 @@ class NIDeviceWindow(BaseDeviceWindow):
         def received(value: Any) -> None:
             self.counter_read_pending = False
             self.ni_count_label.setText(str(value))
+            self.ni_overview_metrics["received"].setText(str(value))
 
         def failed(message: str) -> None:
             self.counter_read_pending = False
@@ -2280,6 +2701,8 @@ class NIDeviceWindow(BaseDeviceWindow):
 
         def stopped(_result: Any = None) -> None:
             self.ni_counter_start.setEnabled(True)
+            self.ni_overview_metrics["trigger"].setText("未运行")
+            self.ni_overview_metrics["backlog"].setText("0")
             self._release_ni_lease_if_idle()
             self.statusBar().showMessage("NI 计数已停止", 4000)
 
@@ -2487,10 +2910,16 @@ def create_device_window(
     record: DeviceRecord,
     all_devices: list[DeviceRecord],
     connection_manager: DeviceConnectionManager | None = None,
+    device_provider: Callable[[], list[DeviceRecord]] | None = None,
 ) -> BaseDeviceWindow:
     if record.kind is DeviceKind.DG4000:
         ni_devices = [item for item in all_devices if item.kind is DeviceKind.NI_DAQ]
-        return DG4000Window(record, ni_devices, connection_manager)
+        return DG4000Window(
+            record,
+            ni_devices,
+            connection_manager,
+            device_provider=device_provider,
+        )
     if record.kind is DeviceKind.NI_DAQ:
         return NIDeviceWindow(record, connection_manager)
     return GenericScpiWindow(record, connection_manager)

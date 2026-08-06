@@ -69,7 +69,7 @@ class VirtualGenerator:
             "modulation_type": "AM",
             "psk_phase_deg": 180.0,
             "fsk_frequency_hz": 2000.0,
-            "load_ohms": None,
+            "load_ohms": 50,
         }
 
     def reset(self) -> None:

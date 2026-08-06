@@ -184,6 +184,9 @@ class CrossDeviceScanTests(unittest.TestCase):
             repository.save(task)
             restored = repository.list()[0]
             self.assertEqual(restored, task)
+            self.assertEqual(repository.active_task_id(), task.id)
+            repository.set_active_task(restored.id)
+            self.assertEqual(repository.active_task_id(), restored.id)
 
 
 class DeviceLeaseTests(unittest.TestCase):

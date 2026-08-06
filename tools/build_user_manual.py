@@ -211,7 +211,7 @@ def cover_story(style_map):
     features = [
         [Paragraph("多设备", style_map["table_head"]), Paragraph("首页统一管理、共享连接、独立设置窗口", style_map["table_head"])],
         [Paragraph("跨设备扫描", style_map["table"]), Paragraph("一个 NI 驱动多台 DG、任务保存、完成屏障和 CSV 运行日志", style_map["table"])],
-        [Paragraph("负载与采集", style_map["table"]), Paragraph("DG4000 负载阻抗、NI 多通道模拟输入、实时绘图与 CSV", style_map["table"])],
+        [Paragraph("负载与采集", style_map["table"]), Paragraph("DG4000 负载阻抗、NI 多通道并行输入、实时绘图与连续文本记录", style_map["table"])],
         [Paragraph("虚拟实验室", style_map["table"]), Paragraph("无硬件体验触发联动、积压追平和模拟波形采集", style_map["table"])],
     ]
     feature_table = Table(features, colWidths=[37 * mm, 123 * mm])
@@ -241,7 +241,7 @@ def cover_story(style_map):
         feature_table,
         Spacer(1, 13 * mm),
         Table(
-            [[Paragraph("版本 0.5.0", small), Paragraph("2026-08-06", small)]],
+            [[Paragraph("版本 0.5.4", small), Paragraph("2026-08-06", small)]],
             colWidths=[80 * mm, 80 * mm],
             style=TableStyle([("ALIGN", (1, 0), (1, 0), "RIGHT")]),
         ),
@@ -454,7 +454,7 @@ def draw_header_footer(canvas, document) -> None:
         canvas.drawString(MARGIN_X, PAGE_HEIGHT - 9.3 * mm, "DG4000 + NI 多设备联动控制软件使用说明")
     canvas.setFont("CN", 7.5)
     canvas.setFillColor(MUTED)
-    canvas.drawString(MARGIN_X, 8 * mm, "版本 0.5.0")
+    canvas.drawString(MARGIN_X, 8 * mm, "版本 0.5.4")
     canvas.drawRightString(PAGE_WIDTH - MARGIN_X, 8 * mm, f"第 {page} 页")
     canvas.restoreState()
 

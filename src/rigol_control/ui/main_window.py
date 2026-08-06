@@ -106,7 +106,7 @@ class DeviceCenterWindow(QMainWindow):
         path.setToolTip(f"保存位置：{self.repository.path}")
         footer.addWidget(path)
         footer.addStretch()
-        version = QLabel("DG4000 + NI 联动控制 · v0.5.0")
+        version = QLabel("DG4000 + NI 联动控制 · v0.5.4")
         version.setObjectName("Muted")
         footer.addWidget(version)
         outer.addLayout(footer)
@@ -149,6 +149,7 @@ class DeviceCenterWindow(QMainWindow):
         self.count_label.setText(f"{len(records)} 台设备")
         self._last_columns = 0
         self._layout_cards()
+        self._sync_open_windows(records)
         if records:
             self.probe_all()
 
@@ -305,7 +306,12 @@ class DeviceCenterWindow(QMainWindow):
         except RuntimeError as exc:
             QMessageBox.warning(self, "打开失败", str(exc))
             return
-        window = create_device_window(record, all_devices, self.connection_manager)
+        window = create_device_window(
+            record,
+            all_devices,
+            self.connection_manager,
+            device_provider=self.repository.list,
+        )
         self.open_windows[device_id] = window
         window.destroyed.connect(lambda _=None, key=device_id: self.open_windows.pop(key, None))
         window.show()
@@ -376,6 +382,7 @@ class DeviceCenterWindow(QMainWindow):
         if card:
             card.set_connection_state(result.connected)
             card.status.setToolTip("\n".join(filter(None, (result.message, result.identity))))
+        self._sync_open_windows([item.record for item in self.cards.values()])
 
     def _connection_failed(self, device_id: str, message: str) -> None:
         card = self.cards.get(device_id)
@@ -397,6 +404,16 @@ class DeviceCenterWindow(QMainWindow):
                 card.set_connection_state(True)
             elif card.status.text() == "● 已连接":
                 card.set_connection_state(False)
+        self._sync_open_windows([item.record for item in self.cards.values()])
+
+    def _sync_open_windows(self, records: list[DeviceRecord]) -> None:
+        for window in tuple(self.open_windows.values()):
+            sync_connection = getattr(window, "sync_connection_state", None)
+            if callable(sync_connection):
+                sync_connection()
+            update_ni_devices = getattr(window, "update_ni_devices", None)
+            if callable(update_ni_devices):
+                update_ni_devices(records)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.connection_timer.stop()

@@ -8,6 +8,7 @@ from rigol_control.drivers.dg4000 import (
     StepParameter,
     StepValue,
     output_load_value,
+    parse_output_state,
 )
 from rigol_control.scan import ScanAxis, ScanMode, generate_scan_points
 from rigol_control.drivers.scpi import ScpiSession
@@ -142,6 +143,30 @@ class ScpiDriverTests(unittest.TestCase):
         )
         self.assertEqual(backend.writes[0], ":OUTP2:LOAD 75")
         self.assertEqual(backend.writes[-1], ":OUTP2 ON")
+
+        backend.writes.clear()
+        driver.configure_waveform_output(
+            1,
+            BasicWaveform("SQU", 5000, 2.0, 0.0, 10),
+            enabled=False,
+        )
+        self.assertFalse(any(":LOAD" in command for command in backend.writes))
+        self.assertEqual(backend.writes[-1], ":OUTP1 OFF")
+
+    def test_output_state_query_accepts_numeric_and_text_responses(self) -> None:
+        self.assertTrue(parse_output_state("1"))
+        self.assertTrue(parse_output_state('"ON"'))
+        self.assertFalse(parse_output_state("0"))
+        self.assertFalse(parse_output_state("off"))
+        with self.assertRaises(ValueError):
+            parse_output_state("RIGOL")
+
+        backend = FakeScpiBackend()
+        session = ScpiSession("USB0::TEST", backend_factory=lambda resource, timeout: backend)
+        driver = DG4000Driver(session)
+        driver.connect()
+        self.assertEqual(driver.output_states(), (False, False))
+        self.assertEqual(backend.queries[-2:], [":OUTP1?", ":OUTP2?"])
 
     def test_all_requested_step_targets_use_manual_commands(self) -> None:
         expected = {

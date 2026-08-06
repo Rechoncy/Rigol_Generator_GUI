@@ -107,6 +107,17 @@ def output_load_value(load_ohms: int | None) -> str:
     return str(load_ohms)
 
 
+def parse_output_state(value: str) -> bool:
+    """Parse the common numeric/text responses returned by ``:OUTP<n>?``."""
+
+    normalized = value.strip().strip('"').upper()
+    if normalized in {"1", "ON", "TRUE"}:
+        return True
+    if normalized in {"0", "OFF", "FALSE"}:
+        return False
+    raise ValueError(f"无法识别 DG4000 输出状态：{value!r}")
+
+
 class DG4000Driver:
     """DG4000 convenience API plus unrestricted raw SCPI access.
 
@@ -162,24 +173,48 @@ class DG4000Driver:
         validate_channel(channel)
         self.write(f":OUTP{channel} {'ON' if enabled else 'OFF'}")
 
+    def output_enabled(self, channel: int) -> bool:
+        validate_channel(channel)
+        return parse_output_state(self.query(f":OUTP{channel}?"))
+
+    def output_states(self) -> tuple[bool, bool]:
+        return (self.output_enabled(1), self.output_enabled(2))
+
     def set_output_load(self, channel: int, load_ohms: int | None) -> None:
         validate_channel(channel)
         self.write(f":OUTP{channel}:LOAD {output_load_value(load_ohms)}")
 
     def configure_basic(self, channel: int, waveform: BasicWaveform) -> None:
+        self.session.write_many(self._basic_commands(channel, waveform))
+
+    def configure_waveform_output(
+        self,
+        channel: int,
+        waveform: BasicWaveform,
+        *,
+        enabled: bool,
+    ) -> None:
+        """Apply waveform and output state without changing the configured load."""
+
+        self.session.write_many(
+            [
+                *self._basic_commands(channel, waveform),
+                f":OUTP{channel} {'ON' if enabled else 'OFF'}",
+            ]
+        )
+
+    def _basic_commands(self, channel: int, waveform: BasicWaveform) -> list[str]:
         validate_channel(channel)
         function = self.FUNCTIONS.get(waveform.function.upper(), self.FUNCTIONS.get(waveform.function))
         if function is None:
             raise ValueError(f"不支持的基本波形：{waveform.function}")
-        self.session.write_many(
-            [
-                f":SOUR{channel}:FUNC {function}",
-                f":SOUR{channel}:FREQ {finite_number(waveform.frequency_hz)}",
-                f":SOUR{channel}:VOLT {finite_number(waveform.amplitude_vpp)}",
-                f":SOUR{channel}:VOLT:OFFS {finite_number(waveform.offset_v)}",
-                f":SOUR{channel}:PHAS {finite_number(waveform.phase_deg)}",
-            ]
-        )
+        return [
+            f":SOUR{channel}:FUNC {function}",
+            f":SOUR{channel}:FREQ {finite_number(waveform.frequency_hz)}",
+            f":SOUR{channel}:VOLT {finite_number(waveform.amplitude_vpp)}",
+            f":SOUR{channel}:VOLT:OFFS {finite_number(waveform.offset_v)}",
+            f":SOUR{channel}:PHAS {finite_number(waveform.phase_deg)}",
+        ]
 
     def configure_channel(
         self,
@@ -191,20 +226,10 @@ class DG4000Driver:
     ) -> None:
         """Apply load, waveform and output state as one serialized SCPI batch."""
 
-        validate_channel(channel)
-        function = self.FUNCTIONS.get(
-            waveform.function.upper(), self.FUNCTIONS.get(waveform.function)
-        )
-        if function is None:
-            raise ValueError(f"不支持的基本波形：{waveform.function}")
         self.session.write_many(
             [
                 f":OUTP{channel}:LOAD {output_load_value(load_ohms)}",
-                f":SOUR{channel}:FUNC {function}",
-                f":SOUR{channel}:FREQ {finite_number(waveform.frequency_hz)}",
-                f":SOUR{channel}:VOLT {finite_number(waveform.amplitude_vpp)}",
-                f":SOUR{channel}:VOLT:OFFS {finite_number(waveform.offset_v)}",
-                f":SOUR{channel}:PHAS {finite_number(waveform.phase_deg)}",
+                *self._basic_commands(channel, waveform),
                 f":OUTP{channel} {'ON' if enabled else 'OFF'}",
             ]
         )

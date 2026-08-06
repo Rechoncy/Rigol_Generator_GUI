@@ -88,6 +88,8 @@ def main() -> int:
     capture(dg_window, "03-virtual-dg-overview.png", app)
     dg_window._select_page(1)
     capture(dg_window, "04-channel-waveform.png", app)
+    dg_window._select_page(5)
+    capture(dg_window, "10-system-impedance.png", app)
     ni_window._select_page(0)
     capture(ni_window, "05-virtual-ni-trigger-console.png", app)
 
@@ -147,9 +149,10 @@ def main() -> int:
     linkage._stop()
 
     ni_window._select_page(2)
-    ni_window.ai_channel_list.item(1).setSelected(True)
+    ni_window._set_all_analog_channels(True)
     ni_window.ai_sample_rate.setValue(10_000)
     ni_window.ai_block_size.setValue(500)
+    ni_window.ai_stream_path.setText(str(DATA / "continuous-ni-input.csv"))
     ni_window._start_analog_input()
     wait(
         app,

@@ -1,3 +1,4 @@
+import csv
 import os
 import tempfile
 import time
@@ -6,7 +7,9 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication, QPushButton
 
 from rigol_control.app import create_application
 from rigol_control.connections import DeviceConnectionManager
@@ -18,6 +21,7 @@ from rigol_control.trigger import ControllerState
 from rigol_control.services import DiscoveredResource
 from rigol_control.ui.device_windows import DG4000Window, NIDeviceWindow
 from rigol_control.ui.dialogs import DeviceDialog
+from rigol_control.ui.linkage_window import LinkageTaskWindow
 from rigol_control.ui.main_window import DeviceCenterWindow
 from rigol_control.virtual_lab import VIRTUAL_DG2_RESOURCE, VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
 
@@ -109,7 +113,13 @@ class UiSmokeTests(unittest.TestCase):
                 self.is_connected = False
 
             def query(self, command):
-                return "RIGOL,DG4162,TEST,1.0"
+                if command == "*IDN?":
+                    return "RIGOL,DG4162,TEST,1.0"
+                if command == ":OUTP1?":
+                    return "ON"
+                if command == ":OUTP2?":
+                    return "0"
+                return "0"
 
             def write(self, command):
                 pass
@@ -131,18 +141,69 @@ class UiSmokeTests(unittest.TestCase):
         home.open_device(self.dg.id)
         window = home.open_windows[self.dg.id]
         self.assertTrue(window.driver.is_connected)
-        window.close()
-        self.app.processEvents()
-        self.assertTrue(manager.is_connected(self.dg))
-
+        self.assertTrue(
+            self._wait_for(
+                lambda: window.overview_metrics["connection"].text() == "已连接"
+                and window.overview_metrics["channel_1"].text() == "已打开"
+                and window.overview_metrics["channel_2"].text() == "关闭"
+            )
+        )
         home.disconnect_device(self.dg.id)
         self.assertTrue(
             self._wait_for(
                 lambda: not manager.is_connected(self.dg)
                 and home.cards[self.dg.id].connect_button.isEnabled()
+                and window.overview_metrics["connection"].text() == "未连接"
+                and window.overview_metrics["channel_1"].text() == "未知"
             )
         )
         self.assertTrue(home.cards[self.dg.id].connect_button.isEnabled())
+        window.close()
+        self.app.processEvents()
+        home.close()
+        self.app.processEvents()
+
+    def test_open_dg_window_discovers_ni_added_and_connected_later(self) -> None:
+        repository = DeviceRepository(Path(self.temporary.name) / "dynamic-ni")
+        dg = repository.save(
+            DeviceRecord.create(
+                kind=DeviceKind.DG4000,
+                name="虚拟 DG",
+                resource=VIRTUAL_DG_RESOURCE,
+                connection="内置模拟器",
+            )
+        )
+        manager = DeviceConnectionManager()
+        home = DeviceCenterWindow(repository, manager)
+        home.open_device(dg.id)
+        dg_window = home.open_windows[dg.id]
+        self.assertIsNone(dg_window.ni_source.currentData())
+        self.assertFalse(dg_window.ni_source.isEnabled())
+
+        ni = repository.save(
+            DeviceRecord.create(
+                kind=DeviceKind.NI_DAQ,
+                name="后添加的虚拟 NI",
+                resource=VIRTUAL_NI_RESOURCE,
+                connection="内置模拟器",
+            )
+        )
+        home.reload_devices()
+        self.assertGreaterEqual(dg_window.ni_source.findData(ni.id), 0)
+        self.assertIn("未连接", dg_window.ni_source.currentText())
+
+        home.open_device(ni.id)
+        ni_window = home.open_windows[ni.id]
+        self.assertEqual(ni_window.ni_overview_metrics["connection"].text(), "未连接")
+        home.connect_device(ni.id)
+        self.assertTrue(
+            self._wait_for(
+                lambda: manager.is_connected(ni)
+                and ni_window.ni_overview_metrics["connection"].text() == "已连接"
+                and dg_window.ni_source.findData(ni.id) >= 0
+                and "已连接" in dg_window.ni_source.currentText()
+            )
+        )
         home.close()
         self.app.processEvents()
 
@@ -166,22 +227,62 @@ class UiSmokeTests(unittest.TestCase):
         dg_window = home.open_windows[dg.id]
         ni_window = home.open_windows[ni.id]
         frequency_control = dg_window.channel_controls[1]["frequency"]
+        self.assertTrue(
+            self._wait_for(
+                lambda: dg_window.overview_metrics["connection"].text() == "已连接"
+                and dg_window.overview_metrics["channel_1"].text() == "关闭"
+            )
+        )
         self.assertEqual(frequency_control.current_unit(), "kHz")
         self.assertEqual(frequency_control.value(), 1000)
         frequency_control.set_unit("MHz")
         self.assertEqual(frequency_control.display_value(), 0.001)
         self.assertEqual(frequency_control.value(), 1000)
         channel_controls = dg_window.channel_controls[1]
-        channel_controls["load"].setCurrentIndex(
-            channel_controls["load"].findData(50)
+        self.assertNotIn("load", channel_controls)
+        impedance_controls = dg_window.impedance_controls[1]
+        self.assertEqual(dg_window.impedance_controls[2]["load"].currentData(), 50)
+        self.assertEqual(impedance_controls["load"].currentData(), 50)
+        impedance_controls["load"].setCurrentIndex(
+            impedance_controls["load"].findData(75)
         )
+        dg_window.impedance_controls[2]["load"].setCurrentIndex(
+            dg_window.impedance_controls[2]["load"].findData(600)
+        )
+        dg_window._apply_all_output_loads()
+        self.assertTrue(
+            self._wait_for(
+                lambda: (
+                    manager.virtual_lab.generator_snapshot(dg.resource)
+                    .channels[0]
+                    .load_ohms
+                    == 75
+                    and manager.virtual_lab.generator_snapshot(dg.resource)
+                    .channels[1]
+                    .load_ohms
+                    == 600
+                )
+            )
+        )
+        frequency_control.setValue(1234)
+        channel_controls["output"].setChecked(True)
         dg_window._apply_channel(1)
         self.assertTrue(
             self._wait_for(
-                lambda: manager.virtual_lab.generator_snapshot(dg.resource)
-                .channels[0]
-                .load_ohms
-                == 50
+                lambda: (
+                    manager.virtual_lab.generator_snapshot(dg.resource)
+                    .channels[0]
+                    .frequency_hz
+                    == 1234
+                    and manager.virtual_lab.generator_snapshot(dg.resource)
+                    .channels[0]
+                    .load_ohms
+                    == 75
+                    and manager.virtual_lab.generator_snapshot(dg.resource)
+                    .channels[0]
+                    .output
+                    and dg_window.overview_metrics["channel_1"].text() == "已打开"
+                )
             )
         )
         dg_window._select_page(4)
@@ -227,7 +328,7 @@ class UiSmokeTests(unittest.TestCase):
         home.close()
         self.app.processEvents()
 
-    def test_virtual_analog_input_plots_and_exports_multichannel_data(self) -> None:
+    def test_virtual_analog_input_acquires_and_streams_four_channels_in_parallel(self) -> None:
         manager = DeviceConnectionManager()
         record = DeviceRecord.create(
             kind=DeviceKind.NI_DAQ,
@@ -239,9 +340,36 @@ class UiSmokeTests(unittest.TestCase):
         window = NIDeviceWindow(record, manager)
         window.show()
         window._select_page(2)
-        window.ai_channel_list.item(1).setSelected(True)
+        self.assertEqual(window.ai_channel_combo.count(), 4)
+        self.assertTrue(window.ai_channel_combo.isEditable())
+        self.assertTrue(window.ai_channel_combo.lineEdit().isReadOnly())
+        window.ai_channel_combo.showPopup()
+        self.app.processEvents()
+        second_channel = window.ai_channel_combo.model().index(1, 0)
+        QTest.mouseClick(
+            window.ai_channel_combo.view().viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=window.ai_channel_combo.view().visualRect(second_channel).center(),
+        )
+        self.app.processEvents()
+        self.assertEqual(
+            window.ai_channel_combo.itemData(1, Qt.ItemDataRole.CheckStateRole),
+            Qt.CheckState.Checked,
+        )
+        self.assertTrue(window.ai_channel_combo.view().isVisible())
+        window.ai_channel_combo.hidePopup()
+        window._set_all_analog_channels(True)
+        self.assertEqual(window.ai_channel_summary.text(), "已勾选 4 / 4 路")
+        self.assertIn("已选 4 路", window.ai_channel_combo.currentText())
+        self.assertTrue(all(
+            window.ai_channel_combo.itemData(index, Qt.ItemDataRole.CheckStateRole)
+            == Qt.CheckState.Checked
+            for index in range(window.ai_channel_combo.count())
+        ))
         window.ai_sample_rate.setValue(20_000)
         window.ai_block_size.setValue(200)
+        stream_path = Path(self.temporary.name) / "continuous-ui.csv"
+        window.ai_stream_path.setText(str(stream_path))
         window._start_analog_input()
         self.assertTrue(
             self._wait_for(
@@ -254,7 +382,8 @@ class UiSmokeTests(unittest.TestCase):
             self._wait_for(lambda: window.ai_plot.displayed_samples >= 400)
         )
         self.assertGreaterEqual(window.ai_plot.displayed_samples, 400)
-        self.assertEqual(window.ai_metrics["channels"].text(), "2")
+        self.assertEqual(window.ai_metrics["channels"].text(), "4")
+        self.assertGreater(int(window.ai_metrics["saved"].text()), 0)
         window._stop_analog_input()
         self.assertTrue(
             self._wait_for(
@@ -266,6 +395,20 @@ class UiSmokeTests(unittest.TestCase):
         window.analog_controller.save_csv(path)
         self.assertTrue(path.exists())
         self.assertGreater(path.stat().st_size, 1000)
+        self.assertTrue(stream_path.exists())
+        self.assertGreater(stream_path.stat().st_size, 1000)
+        with stream_path.open("r", encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.reader(stream))
+        self.assertEqual(rows[5][2:], [
+            f"{VIRTUAL_NI_RESOURCE}/ai{index}" for index in range(4)
+        ])
+        self.assertTrue(all(len(row) == 6 for row in rows[6:]))
+        self.assertFalse(
+            any(
+                button.text() == "保存波形图片"
+                for button in window.findChildren(QPushButton)
+            )
+        )
         window.close()
         self.app.processEvents()
 
@@ -292,16 +435,23 @@ class UiSmokeTests(unittest.TestCase):
         first.start.setValue(1)
         first.step.setValue(1)
         first.count.setValue(2)
-        window._add_axis()
+        window.add_axis_button.click()
+        self.app.processEvents()
+        self.assertEqual(len(window.axis_editors), 2)
         second = window.axis_editors[1]
         second.device.setCurrentIndex(second.device.findData(generators[1].id))
         second.parameter.setCurrentIndex(second.parameter.findData(StepParameter.AMPLITUDE))
         second.start.setValue(0.5)
         second.step.setValue(0.25)
         second.count.setValue(2)
+        window.counter.setCurrentIndex(window.counter.findData("ctr2"))
+        window.terminal.setCurrentText("PFI7")
+        window.edge.setCurrentIndex(1)
         window._generate_table(show_message=False)
         self.assertEqual(window.point_table.rowCount(), 2)
-        window._save_task()
+        window.point_table.item(1, 2).setText("0.875")
+        window.save_task_button.click()
+        self.app.processEvents()
         self.assertTrue(window.task_repository.path.exists())
         window._start()
         self.assertTrue(
@@ -330,6 +480,21 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(log_path.exists())
         window._stop()
         self.assertIsNone(manager.lease_owner(generators[0].id))
+        saved_task_id = window._current_task_id
+        window.close()
+        self.app.processEvents()
+
+        restored = LinkageTaskWindow(repository, manager)
+        self.assertEqual(restored._current_task_id, saved_task_id)
+        self.assertEqual(restored.ni_source.currentData(), window.ni_source.currentData())
+        self.assertEqual(restored.counter.currentData(), "ctr2")
+        self.assertEqual(restored.terminal.currentText(), "PFI7")
+        self.assertEqual(restored.edge.currentIndex(), 1)
+        self.assertEqual(len(restored.axis_editors), 2)
+        self.assertEqual(restored.axis_editors[0].device.currentData(), generators[0].id)
+        self.assertEqual(restored.axis_editors[1].device.currentData(), generators[1].id)
+        self.assertEqual(restored.point_table.item(1, 2).text(), "0.875")
+        restored.close()
         home.close()
         self.app.processEvents()
 

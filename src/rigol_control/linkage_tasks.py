@@ -193,15 +193,30 @@ class LinkageTaskRepository:
         self.path = self.data_dir / "linkage_tasks.json"
 
     def list(self) -> list[LinkageTaskRecord]:
+        payload = self._read_payload()
+        return [LinkageTaskRecord.from_dict(item) for item in payload.get("tasks", [])]
+
+    def active_task_id(self) -> str | None:
+        payload = self._read_payload()
+        active = payload.get("active_task_id")
+        return str(active) if active else None
+
+    def set_active_task(self, task_id: str | None) -> None:
+        tasks = self.list()
+        if task_id is not None and not any(item.id == task_id for item in tasks):
+            raise ValueError("要设为当前实验的跨设备任务不存在")
+        self._write(tasks, active_task_id=task_id)
+
+    def _read_payload(self) -> dict[str, Any]:
         if not self.path.exists():
-            return []
+            return {"schema_version": self.SCHEMA_VERSION, "tasks": []}
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"无法读取跨设备联动任务：{exc}") from exc
         if payload.get("schema_version") != self.SCHEMA_VERSION:
             raise RuntimeError("跨设备联动任务配置版本不受支持")
-        return [LinkageTaskRecord.from_dict(item) for item in payload.get("tasks", [])]
+        return payload
 
     def save(self, task: LinkageTaskRecord) -> LinkageTaskRecord:
         task.validate()
@@ -212,7 +227,7 @@ class LinkageTaskRepository:
                 break
         else:
             tasks.append(task)
-        self._write(tasks)
+        self._write(tasks, active_task_id=task.id)
         return task
 
     def delete(self, task_id: str) -> bool:
@@ -220,14 +235,23 @@ class LinkageTaskRepository:
         retained = [item for item in tasks if item.id != task_id]
         if len(retained) == len(tasks):
             return False
-        self._write(retained)
+        active_task_id = self.active_task_id()
+        if active_task_id == task_id:
+            active_task_id = retained[0].id if retained else None
+        self._write(retained, active_task_id=active_task_id)
         return True
 
-    def _write(self, tasks: list[LinkageTaskRecord]) -> None:
+    def _write(
+        self,
+        tasks: list[LinkageTaskRecord],
+        *,
+        active_task_id: str | None = None,
+    ) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".json.tmp")
         payload = {
             "schema_version": self.SCHEMA_VERSION,
+            "active_task_id": active_task_id,
             "tasks": [task.to_dict() for task in tasks],
         }
         try:

@@ -47,6 +47,7 @@ class VirtualLabTests(unittest.TestCase):
         driver.set_output(1, True)
         snapshot = self.lab.generator_snapshot(VIRTUAL_DG_RESOURCE)
         channel = snapshot.channels[0]
+        self.assertEqual(channel.load_ohms, 50)
         self.assertEqual(channel.frequency_hz, 12345)
         self.assertEqual(channel.amplitude_vpp, 2.5)
         self.assertEqual(channel.phase_deg, 30)
