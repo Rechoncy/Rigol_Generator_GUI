@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rigol-generator-gui"
+version = "0.5.0"
+description = "DG4000 and NI DAQ multi-device control center"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.7",
+]
+
+[project.optional-dependencies]
+instrument = [
+    "PyVISA>=1.14",
+    "nidaqmx>=1.0",
+]
+
+[project.scripts]
+rigol-generator-gui = "rigol_control.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
