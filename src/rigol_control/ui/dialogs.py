@@ -122,6 +122,16 @@ class DeviceDialog(QDialog):
             self.hint.setText("自动读取 NI-DAQmx 中已注册的设备；也可手动输入 NI MAX 中的设备名。")
             if not current_name:
                 self.name.setPlaceholderText("例如 NI USB-6363")
+        elif selected is DeviceKind.VAUNIX_LMS:
+            self.connection.addItems(["Vaunix USB DLL", "内置模拟器"])
+            self.resource.lineEdit().setPlaceholderText(
+                "自动搜索，或手动输入 VAUNIX::LMS::<序列号>"
+            )
+            self.hint.setText(
+                "通过 Windows vnx_fmsynth.dll 枚举 LMS/BLX；使用序列号稳定识别设备。"
+            )
+            if not current_name:
+                self.name.setPlaceholderText("例如 Vaunix BLX-403")
         else:
             self.connection.addItems(["USB VISA", "TCP/IP VISA", "GPIB VISA", "串口 VISA"])
             self.resource.lineEdit().setPlaceholderText("自动搜索，或手动输入 USB0::...::INSTR")
@@ -136,7 +146,15 @@ class DeviceDialog(QDialog):
         self.search_button.setEnabled(False)
         self.search_button.setText("搜索中…")
         self.scan_status.setText(
-            "正在搜索 NI-DAQmx 设备…" if kind is DeviceKind.NI_DAQ else "正在搜索 VISA 资源…"
+            (
+                "正在搜索 NI-DAQmx 设备…"
+                if kind is DeviceKind.NI_DAQ
+                else (
+                    "正在搜索 Vaunix LMS/BLX…"
+                    if kind is DeviceKind.VAUNIX_LMS
+                    else "正在搜索 VISA 资源…"
+                )
+            )
         )
         task = CallTask(lambda: self.discovery_service.discover(kind))
         self._scan_tasks.add(task)

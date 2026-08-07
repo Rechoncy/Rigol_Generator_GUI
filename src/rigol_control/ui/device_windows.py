@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +52,7 @@ from ..drivers.ni_analog import AnalogInputConfig, NIDaqAnalogInput
 from ..drivers.ni_counter import NIDaqEdgeCounter
 from ..drivers.scpi import ScpiSession
 from ..models import DeviceKind, DeviceRecord
-from ..repository import default_data_dir
+from ..repository import DeviceParameterRepository, default_data_dir
 from ..scan import (
     MAX_SCAN_AXES,
     ScanAxis,
@@ -291,9 +292,20 @@ class AnalogBridge(QObject):
 
 
 class BaseDeviceWindow(QMainWindow):
-    def __init__(self, record: DeviceRecord, navigation: list[tuple[str, Callable[[], QWidget]]]) -> None:
+    PARAMETER_BINDING_VERSION = 2
+    PARAMETER_KEY_PROPERTY = "deviceParameterKey"
+
+    def __init__(
+        self,
+        record: DeviceRecord,
+        navigation: list[tuple[str, Callable[[], QWidget]]],
+        parameter_repository: DeviceParameterRepository | None = None,
+    ) -> None:
         super().__init__()
         self.record = record
+        self.parameter_repository = parameter_repository
+        self._restoring_device_parameters = False
+        self._last_parameter_snapshot: dict[str, Any] | None = None
         self.thread_pool = QThreadPool.globalInstance()
         self._call_tasks: set[CallTask] = set()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -347,6 +359,13 @@ class BaseDeviceWindow(QMainWindow):
         body.addWidget(sidebar)
         body.addWidget(self.pages, 1)
         self.setCentralWidget(root)
+        self._parameter_save_timer = QTimer(self)
+        self._parameter_save_timer.setInterval(500)
+        self._parameter_save_timer.timeout.connect(self._save_device_parameters)
+        self._restore_device_parameters()
+        if self.parameter_repository is not None:
+            self._save_device_parameters(force=True)
+            self._parameter_save_timer.start()
 
     def submit(
         self,
@@ -371,6 +390,227 @@ class BaseDeviceWindow(QMainWindow):
         for position, button in enumerate(self.nav_buttons):
             button.setChecked(position == index)
 
+    @staticmethod
+    def _parameter_data(value: Any) -> Any:
+        if isinstance(value, Enum):
+            return value.value
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        return str(value)
+
+    @classmethod
+    def _set_parameter_key(cls, control: QWidget, key: str) -> None:
+        """Give a persisted control a stable key independent of Qt child order."""
+        control.setProperty(cls.PARAMETER_KEY_PROPERTY, key)
+
+    def _persistent_controls(
+        self,
+        *,
+        use_explicit_keys: bool = True,
+    ) -> dict[str, QWidget]:
+        bindings: dict[str, QWidget] = {}
+
+        def visit(parent: QWidget, page_index: int, counters: dict[str, int]) -> None:
+            for child in parent.children():
+                if not isinstance(child, QWidget):
+                    continue
+                if bool(child.property("skipDeviceParameterPersistence")):
+                    continue
+                if isinstance(child, UnitValueWidget):
+                    kind = "unit"
+                elif isinstance(child, CheckableComboBox):
+                    kind = "multi_combo"
+                elif isinstance(child, QComboBox):
+                    kind = "combo"
+                elif isinstance(child, QDoubleSpinBox):
+                    kind = "double"
+                elif isinstance(child, QSpinBox):
+                    kind = "spin"
+                elif isinstance(child, QCheckBox):
+                    kind = "check"
+                elif isinstance(child, QLineEdit):
+                    kind = "line"
+                else:
+                    visit(child, page_index, counters)
+                    continue
+                explicit_key = child.property(self.PARAMETER_KEY_PROPERTY)
+                if use_explicit_keys and explicit_key:
+                    key = f"named/{explicit_key}"
+                    existing = bindings.get(key)
+                    if existing is not None and existing is not child:
+                        raise RuntimeError(f"设备参数保存键重复：{explicit_key}")
+                    bindings[key] = child
+                    continue
+                ordinal = counters.get(kind, 0)
+                counters[kind] = ordinal + 1
+                bindings[f"page_{page_index}/{kind}_{ordinal}"] = child
+
+        for page_index in range(self.pages.count()):
+            visit(self.pages.widget(page_index), page_index, {})
+        return bindings
+
+    def _legacy_persistent_controls(self) -> dict[str, QWidget]:
+        """Bindings used by snapshots written before stable semantic keys."""
+        return self._persistent_controls(use_explicit_keys=False)
+
+    def _serialize_parameter_control(self, control: QWidget) -> dict[str, Any]:
+        if isinstance(control, UnitValueWidget):
+            return {
+                "type": "unit",
+                "value": control.value(),
+                "unit": control.current_unit(),
+            }
+        if isinstance(control, CheckableComboBox):
+            return {
+                "type": "multi_combo",
+                "checked": [
+                    self._parameter_data(value) for value in control.checked_data()
+                ],
+            }
+        if isinstance(control, QComboBox):
+            return {
+                "type": "combo",
+                "data": self._parameter_data(control.currentData()),
+                "text": control.currentText(),
+            }
+        if isinstance(control, QDoubleSpinBox):
+            return {"type": "double", "value": control.value()}
+        if isinstance(control, QSpinBox):
+            return {"type": "spin", "value": control.value()}
+        if isinstance(control, QCheckBox):
+            return {"type": "check", "checked": control.isChecked()}
+        if isinstance(control, QLineEdit):
+            return {"type": "line", "text": control.text()}
+        raise TypeError(f"不支持保存控件 {type(control).__name__}")
+
+    def _restore_parameter_control(
+        self,
+        control: QWidget,
+        state: dict[str, Any],
+    ) -> None:
+        if isinstance(control, UnitValueWidget) and state.get("type") == "unit":
+            unit_key = str(state.get("unit", control.current_unit()))
+            if control.unit_combo.findData(unit_key) >= 0:
+                control.set_unit(unit_key)
+            control.setValue(float(state.get("value", control.value())))
+            return
+        if (
+            isinstance(control, CheckableComboBox)
+            and state.get("type") == "multi_combo"
+        ):
+            checked = set(state.get("checked", []))
+            control.blockSignals(True)
+            for index in range(control.count()):
+                value = self._parameter_data(control.itemData(index))
+                control.setItemData(
+                    index,
+                    Qt.CheckState.Checked if value in checked else Qt.CheckState.Unchecked,
+                    Qt.ItemDataRole.CheckStateRole,
+                )
+            control.blockSignals(False)
+            control._refresh_summary()
+            control.checkedItemsChanged.emit()
+            return
+        if isinstance(control, QComboBox) and state.get("type") == "combo":
+            saved_data = state.get("data")
+            index = -1
+            if saved_data is not None:
+                index = next(
+                    (
+                        item_index
+                        for item_index in range(control.count())
+                        if self._parameter_data(control.itemData(item_index)) == saved_data
+                    ),
+                    -1,
+                )
+            if index < 0:
+                index = control.findText(str(state.get("text", "")))
+            if index >= 0:
+                control.setCurrentIndex(index)
+            elif control.isEditable():
+                control.setCurrentText(str(state.get("text", "")))
+            return
+        if isinstance(control, QDoubleSpinBox) and state.get("type") == "double":
+            control.setValue(float(state.get("value", control.value())))
+            return
+        if isinstance(control, QSpinBox) and state.get("type") == "spin":
+            control.setValue(int(state.get("value", control.value())))
+            return
+        if isinstance(control, QCheckBox) and state.get("type") == "check":
+            control.setChecked(bool(state.get("checked", control.isChecked())))
+            return
+        if isinstance(control, QLineEdit) and state.get("type") == "line":
+            control.setText(str(state.get("text", "")))
+
+    def _custom_device_parameters(self) -> dict[str, Any]:
+        return {}
+
+    def _restore_custom_device_parameters(self, state: dict[str, Any]) -> None:
+        del state
+
+    def _device_parameter_snapshot(self) -> dict[str, Any]:
+        return {
+            "binding_version": self.PARAMETER_BINDING_VERSION,
+            "controls": {
+                key: self._serialize_parameter_control(control)
+                for key, control in self._persistent_controls().items()
+            },
+            "custom": self._custom_device_parameters(),
+        }
+
+    def _restore_device_parameters(self) -> None:
+        if self.parameter_repository is None:
+            return
+        try:
+            snapshot = self.parameter_repository.load(
+                self.record.id,
+                kind=self.record.kind.value,
+            )
+            if not snapshot:
+                return
+            self._restoring_device_parameters = True
+            controls = self._persistent_controls()
+            legacy_controls = (
+                self._legacy_persistent_controls()
+                if snapshot.get("binding_version") != self.PARAMETER_BINDING_VERSION
+                else {}
+            )
+            saved_controls = snapshot.get("controls", {})
+            if isinstance(saved_controls, dict):
+                for key, state in saved_controls.items():
+                    control = controls.get(key) or legacy_controls.get(key)
+                    if control is not None and isinstance(state, dict):
+                        self._restore_parameter_control(control, state)
+            custom = snapshot.get("custom", {})
+            if isinstance(custom, dict):
+                self._restore_custom_device_parameters(custom)
+            self.statusBar().showMessage("已恢复该设备上次保存的参数", 4000)
+        except Exception as exc:
+            self.statusBar().showMessage(f"设备参数恢复失败：{exc}", 10000)
+        finally:
+            self._restoring_device_parameters = False
+
+    def _save_device_parameters(self, force: bool = False) -> None:
+        if self.parameter_repository is None or self._restoring_device_parameters:
+            return
+        try:
+            snapshot = self._device_parameter_snapshot()
+            if not force and snapshot == self._last_parameter_snapshot:
+                return
+            self.parameter_repository.save(
+                self.record.id,
+                kind=self.record.kind.value,
+                parameters=snapshot,
+            )
+            self._last_parameter_snapshot = snapshot
+        except Exception as exc:
+            self.statusBar().showMessage(f"设备参数自动保存失败：{exc}", 10000)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._parameter_save_timer.stop()
+        self._save_device_parameters(force=True)
+        super().closeEvent(event)
+
 class DG4000Window(BaseDeviceWindow):
     def __init__(
         self,
@@ -378,6 +618,7 @@ class DG4000Window(BaseDeviceWindow):
         ni_devices: list[DeviceRecord],
         connection_manager: DeviceConnectionManager | None = None,
         device_provider: Callable[[], list[DeviceRecord]] | None = None,
+        parameter_repository: DeviceParameterRepository | None = None,
     ) -> None:
         self.ni_devices = ni_devices
         self.device_provider = device_provider
@@ -405,7 +646,7 @@ class DG4000Window(BaseDeviceWindow):
             ("触发步进", self._trigger_step_page),
             ("存储与系统", self._system_page),
         ]
-        super().__init__(record, navigation)
+        super().__init__(record, navigation, parameter_repository)
         if self.driver.is_connected:
             identity = (
                 self.connection_manager.info(record).identity
@@ -620,6 +861,15 @@ class DG4000Window(BaseDeviceWindow):
             form.addRow("初相位", phase)
             output = QCheckBox("启用通道输出")
             form.addRow("输出", output)
+            for name, control in {
+                "waveform": waveform,
+                "frequency": frequency,
+                "amplitude": amplitude,
+                "offset": offset,
+                "phase": phase,
+                "output": output,
+            }.items():
+                self._set_parameter_key(control, f"dg4000.channel.{channel}.{name}")
             self.channel_controls[channel] = {
                 "waveform": waveform,
                 "frequency": frequency,
@@ -638,6 +888,29 @@ class DG4000Window(BaseDeviceWindow):
             tabs.addTab(tab, f"CH{channel}")
         layout.addWidget(tabs)
         return page
+
+    def _legacy_persistent_controls(self) -> dict[str, QWidget]:
+        bindings = super()._legacy_persistent_controls()
+
+        # Older releases numbered controls in QObject.children() order. A
+        # QTabWidget changes that order whenever CH1/CH2 is selected, which is
+        # the source of the channel-swap bug. Interpret legacy channel entries
+        # in their intended visual order (CH1, then CH2) during migration.
+        unit_names = ("frequency", "amplitude", "offset", "phase")
+        for channel in (1, 2):
+            channel_index = channel - 1
+            controls = self.channel_controls[channel]
+            bindings[f"page_1/combo_{channel_index}"] = controls["waveform"]
+            bindings[f"page_1/check_{channel_index}"] = controls["output"]
+            for value_index, name in enumerate(unit_names):
+                bindings[f"page_1/unit_{channel_index * 4 + value_index}"] = (
+                    controls[name]
+                )
+
+            impedance = self.impedance_controls[channel]
+            bindings[f"page_5/combo_{channel_index}"] = impedance["load"]
+            bindings[f"page_5/spin_{channel_index}"] = impedance["custom_load"]
+        return bindings
 
     def _apply_channel(self, channel: int) -> None:
         if not self._require_connection():
@@ -940,6 +1213,7 @@ class DG4000Window(BaseDeviceWindow):
 
         self.scan_axes: list[ScanAxisControls] = []
         self.scan_axis_tabs = QTabWidget()
+        self.scan_axis_tabs.setProperty("skipDeviceParameterPersistence", True)
         self.scan_axis_tabs.setFixedHeight(165)
         sequence_layout.addWidget(self.scan_axis_tabs)
 
@@ -957,6 +1231,7 @@ class DG4000Window(BaseDeviceWindow):
         sequence_layout.addLayout(point_toolbar)
 
         self.step_table = QTableWidget(0, 3)
+        self.step_table.setProperty("skipDeviceParameterPersistence", True)
         self.step_table.setMinimumHeight(125)
         self.step_table.setAlternatingRowColors(True)
         self.step_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1614,6 +1889,115 @@ class DG4000Window(BaseDeviceWindow):
             if row == 0 and not self.step_table.item(row, note_column).text():
                 self.step_table.item(row, note_column).setText("起始点（第一个触发）")
 
+    def _custom_device_parameters(self) -> dict[str, Any]:
+        if not hasattr(self, "scan_axes") or not hasattr(self, "step_table"):
+            return {}
+        axes = [
+            {
+                "parameter": axis.parameter.currentData().value,
+                "channel": axis.channel.currentData(),
+                "unit": axis.unit.currentData(),
+                "start": axis.start.value(),
+                "step": axis.step.value(),
+                "count": axis.count.value(),
+            }
+            for axis in self.scan_axes
+        ]
+        rows: list[dict[str, Any]] = []
+        value_columns = len(self.scan_axes)
+        for row in range(self.step_table.rowCount()):
+            values = []
+            for column in range(1, value_columns + 1):
+                item = self.step_table.item(row, column)
+                values.append(item.text() if item is not None else "")
+            note_item = self.step_table.item(row, value_columns + 1)
+            rows.append(
+                {
+                    "values": values,
+                    "note": note_item.text() if note_item is not None else "",
+                }
+            )
+        mode = self.scan_mode.currentData()
+        return {
+            "trigger_scan": {
+                "mode": mode.value if isinstance(mode, ScanMode) else str(mode),
+                "axes": axes,
+                "rows": rows,
+            }
+        }
+
+    def _restore_custom_device_parameters(self, state: dict[str, Any]) -> None:
+        trigger_scan = state.get("trigger_scan")
+        if not isinstance(trigger_scan, dict):
+            return
+        parsed_axes: list[tuple[StepParameter, int, str, float, float, int]] = []
+        saved_axes = trigger_scan.get("axes", [])
+        if not isinstance(saved_axes, list):
+            return
+        for item in saved_axes[:MAX_SCAN_AXES]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                parameter = StepParameter(str(item["parameter"]))
+                channel = int(item["channel"])
+                unit_key = str(item["unit"])
+                start = float(item["start"])
+                step = float(item["step"])
+                count = int(item["count"])
+                if channel not in (1, 2):
+                    continue
+                unit_spec(parameter.unit_family, unit_key)
+            except (KeyError, TypeError, ValueError):
+                continue
+            parsed_axes.append(
+                (parameter, channel, unit_key, start, step, count)
+            )
+        if not parsed_axes:
+            return
+
+        try:
+            mode = ScanMode(str(trigger_scan.get("mode", "")))
+        except ValueError:
+            mode = self.scan_mode.currentData()
+        mode_index = self.scan_mode.findData(mode)
+        if mode_index >= 0:
+            self.scan_mode.setCurrentIndex(mode_index)
+
+        for axis in self.scan_axes:
+            axis.frame.setParent(None)
+            axis.frame.deleteLater()
+        self.scan_axes.clear()
+        for parameter, channel, unit_key, start, step, count in parsed_axes:
+            self._add_scan_axis(parameter, channel, refresh=False)
+            axis = self.scan_axes[-1]
+            unit_index = axis.unit.findData(unit_key)
+            if unit_index >= 0:
+                axis.unit.setCurrentIndex(unit_index)
+            axis.start.setValue(start)
+            axis.step.setValue(step)
+            axis.count.setValue(count)
+        self._rebuild_scan_axes_layout()
+        self._generate_scan_table(show_message=False)
+
+        rows = trigger_scan.get("rows")
+        if isinstance(rows, list) and rows:
+            self.step_table.setRowCount(0)
+            for row_index, row_state in enumerate(rows[:MAX_SCAN_POINTS]):
+                if not isinstance(row_state, dict):
+                    continue
+                values = row_state.get("values", [])
+                if not isinstance(values, list) or len(values) != len(self.scan_axes):
+                    continue
+                self._append_scan_point_row(
+                    [0.0] * len(self.scan_axes),
+                    str(row_state.get("note", "")),
+                )
+                table_row = self.step_table.rowCount() - 1
+                for column, value in enumerate(values, start=1):
+                    self.step_table.item(table_row, column).setText(str(value))
+                self.step_table.item(table_row, 0).setText(str(row_index + 1))
+        self._scan_configuration_changed()
+
     def _impedance_control_row(self, channel: int) -> QWidget:
         load = QComboBox()
         load.addItem("高阻（INFINITY）", None)
@@ -1651,6 +2035,8 @@ class DG4000Window(BaseDeviceWindow):
             "custom_load": custom,
             "apply": apply_button,
         }
+        self._set_parameter_key(load, f"dg4000.channel.{channel}.load")
+        self._set_parameter_key(custom, f"dg4000.channel.{channel}.custom_load")
         return row
 
     def _selected_output_load(self, channel: int) -> int | None:
@@ -1783,6 +2169,7 @@ class NIDeviceWindow(BaseDeviceWindow):
         self,
         record: DeviceRecord,
         connection_manager: DeviceConnectionManager | None = None,
+        parameter_repository: DeviceParameterRepository | None = None,
     ) -> None:
         self.probe_service = DeviceProbeService()
         self.connection_manager = connection_manager
@@ -1802,7 +2189,7 @@ class NIDeviceWindow(BaseDeviceWindow):
             ("路由", self._routing_page),
             ("诊断", self._diagnostics_page),
         ]
-        super().__init__(record, navigation)
+        super().__init__(record, navigation, parameter_repository)
         if self.connection_manager is not None and self.connection_manager.is_connected(record):
             self._ni_connected(self.connection_manager.info(record))
 
@@ -2218,7 +2605,42 @@ class NIDeviceWindow(BaseDeviceWindow):
         settings_layout.addLayout(action_row)
 
         plot_panel, plot_layout = panel("实时波形")
+        plot_scale_layout = QGridLayout()
+        plot_scale_layout.setHorizontalSpacing(8)
+        plot_scale_layout.setVerticalSpacing(6)
+        self.ai_x_scale = unit_value_spin(
+            0.02, 1e-6, 3600, "time", "ms"
+        )
+        self.ai_y_auto = QCheckBox("Y 轴自动")
+        self.ai_y_auto.setChecked(True)
+        self.ai_y_scale = unit_value_spin(
+            0.5, 1e-9, 1000, "voltage", "V"
+        )
+        self.ai_y_center = unit_value_spin(
+            0.0, -1000, 1000, "voltage", "V"
+        )
+        self.ai_plot_span = QLabel()
+        self.ai_plot_span.setObjectName("Muted")
+        plot_scale_layout.addWidget(QLabel("X 轴时基"), 0, 0)
+        plot_scale_layout.addWidget(self.ai_x_scale, 0, 1, 1, 2)
+        plot_scale_layout.addWidget(QLabel("/ 格"), 0, 3)
+        plot_scale_layout.addWidget(self.ai_plot_span, 0, 4, 1, 3)
+        plot_scale_layout.addWidget(self.ai_y_auto, 1, 0)
+        plot_scale_layout.addWidget(QLabel("Y 轴标度"), 1, 1)
+        plot_scale_layout.addWidget(self.ai_y_scale, 1, 2)
+        plot_scale_layout.addWidget(QLabel("/ 格"), 1, 3)
+        plot_scale_layout.addWidget(QLabel("中心"), 1, 4)
+        plot_scale_layout.addWidget(self.ai_y_center, 1, 5, 1, 2)
+        plot_scale_layout.setColumnStretch(6, 1)
+        plot_layout.addLayout(plot_scale_layout)
         self.ai_plot = WaveformPlot()
+        for control in (self.ai_x_scale, self.ai_y_scale, self.ai_y_center):
+            control.spin.valueChanged.connect(self._update_analog_plot_scales)
+            control.unit_combo.currentIndexChanged.connect(
+                self._update_analog_plot_scales
+            )
+        self.ai_y_auto.toggled.connect(self._update_analog_plot_scales)
+        self._update_analog_plot_scales()
         plot_layout.addWidget(self.ai_plot, 1)
         plot_actions = QHBoxLayout()
         self.ai_plot_status = QLabel("● 等待采集")
@@ -2281,6 +2703,29 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.ai_channel_summary.setText(
             f"已勾选 {len(self._checked_analog_channels())} / "
             f"{self.ai_channel_combo.count()} 路"
+        )
+
+    def _update_analog_plot_scales(self, _value: Any = None) -> None:
+        if not hasattr(self, "ai_plot"):
+            return
+        seconds_per_division = self.ai_x_scale.value()
+        automatic_y = self.ai_y_auto.isChecked()
+        self.ai_y_scale.setEnabled(not automatic_y)
+        self.ai_y_center.setEnabled(not automatic_y)
+        self.ai_plot.set_time_scale(seconds_per_division)
+        self.ai_plot.set_voltage_scale(
+            None if automatic_y else self.ai_y_scale.value(),
+            center_v=self.ai_y_center.value(),
+        )
+        total_seconds = seconds_per_division * self.ai_plot.HORIZONTAL_DIVISIONS
+        if total_seconds < 0.001:
+            span_text = f"{total_seconds * 1_000_000:.6g} µs"
+        elif total_seconds < 1:
+            span_text = f"{total_seconds * 1000:.6g} ms"
+        else:
+            span_text = f"{total_seconds:.6g} s"
+        self.ai_plot_span.setText(
+            f"显示最近 {span_text}（{self.ai_plot.HORIZONTAL_DIVISIONS} 格）"
         )
 
     def _refresh_analog_channels(self) -> None:
@@ -2772,6 +3217,7 @@ class GenericScpiWindow(BaseDeviceWindow):
         self,
         record: DeviceRecord,
         connection_manager: DeviceConnectionManager | None = None,
+        parameter_repository: DeviceParameterRepository | None = None,
     ) -> None:
         self.connection_manager = connection_manager
         self.session = (
@@ -2779,7 +3225,11 @@ class GenericScpiWindow(BaseDeviceWindow):
             if connection_manager is not None
             else ScpiSession(record.resource)
         )
-        super().__init__(record, [("SCPI 控制台", self._console_page)])
+        super().__init__(
+            record,
+            [("SCPI 控制台", self._console_page)],
+            parameter_repository,
+        )
         if self.session.is_connected:
             identity = (
                 self.connection_manager.info(record).identity
@@ -2911,6 +3361,7 @@ def create_device_window(
     all_devices: list[DeviceRecord],
     connection_manager: DeviceConnectionManager | None = None,
     device_provider: Callable[[], list[DeviceRecord]] | None = None,
+    parameter_repository: DeviceParameterRepository | None = None,
 ) -> BaseDeviceWindow:
     if record.kind is DeviceKind.DG4000:
         ni_devices = [item for item in all_devices if item.kind is DeviceKind.NI_DAQ]
@@ -2919,7 +3370,19 @@ def create_device_window(
             ni_devices,
             connection_manager,
             device_provider=device_provider,
+            parameter_repository=parameter_repository,
         )
     if record.kind is DeviceKind.NI_DAQ:
-        return NIDeviceWindow(record, connection_manager)
-    return GenericScpiWindow(record, connection_manager)
+        return NIDeviceWindow(record, connection_manager, parameter_repository)
+    if record.kind is DeviceKind.VAUNIX_LMS:
+        from .vaunix_window import VaunixLmsWindow
+
+        ni_devices = [item for item in all_devices if item.kind is DeviceKind.NI_DAQ]
+        return VaunixLmsWindow(
+            record,
+            ni_devices,
+            connection_manager,
+            device_provider=device_provider,
+            parameter_repository=parameter_repository,
+        )
+    return GenericScpiWindow(record, connection_manager, parameter_repository)

@@ -16,6 +16,7 @@ UNIT_FAMILIES: dict[str, tuple[UnitSpec, ...]] = {
         UnitSpec("Hz", "Hz", 1.0),
         UnitSpec("kHz", "kHz", 1_000.0),
         UnitSpec("MHz", "MHz", 1_000_000.0),
+        UnitSpec("GHz", "GHz", 1_000_000_000.0),
     ),
     "amplitude": (
         UnitSpec("Vpp", "Vpp", 1.0),

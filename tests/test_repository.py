@@ -4,7 +4,11 @@ import unittest
 from pathlib import Path
 
 from rigol_control.models import DeviceKind, DeviceRecord
-from rigol_control.repository import DeviceRepository, DuplicateDeviceError
+from rigol_control.repository import (
+    DeviceParameterRepository,
+    DeviceRepository,
+    DuplicateDeviceError,
+)
 
 
 class DeviceRepositoryTests(unittest.TestCase):
@@ -59,7 +63,31 @@ class DeviceRepositoryTests(unittest.TestCase):
         with self.assertRaises(DuplicateDeviceError):
             self.repository.save(duplicate)
 
+    def test_device_parameters_are_isolated_by_stable_device_id(self) -> None:
+        parameters = DeviceParameterRepository(Path(self.temporary.name))
+        parameters.save(
+            "dg-a",
+            kind=DeviceKind.DG4000.value,
+            parameters={"controls": {"frequency": 1250.5}},
+        )
+        parameters.save(
+            "ni-a",
+            kind=DeviceKind.NI_DAQ.value,
+            parameters={"controls": {"sample_rate": 20_000}},
+        )
+
+        self.assertEqual(
+            parameters.load("dg-a", kind=DeviceKind.DG4000.value),
+            {"controls": {"frequency": 1250.5}},
+        )
+        self.assertEqual(
+            parameters.load("ni-a", kind=DeviceKind.NI_DAQ.value),
+            {"controls": {"sample_rate": 20_000}},
+        )
+        self.assertEqual(parameters.load("dg-a", kind=DeviceKind.NI_DAQ.value), {})
+        self.assertTrue(parameters.delete("dg-a"))
+        self.assertFalse(parameters.delete("dg-a"))
+
 
 if __name__ == "__main__":
     unittest.main()
-

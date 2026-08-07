@@ -9,13 +9,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QPushButton
+from PyQt6.QtWidgets import QApplication, QPushButton, QTabWidget
 
 from rigol_control.app import create_application
 from rigol_control.connections import DeviceConnectionManager
 from rigol_control.drivers.dg4000 import StepParameter
+from rigol_control.drivers.vaunix_lms import VIRTUAL_VAUNIX_RESOURCE
 from rigol_control.models import DeviceKind, DeviceRecord
-from rigol_control.repository import DeviceRepository
+from rigol_control.repository import DeviceParameterRepository, DeviceRepository
 from rigol_control.scan import ScanMode
 from rigol_control.trigger import ControllerState
 from rigol_control.services import DiscoveredResource
@@ -23,6 +24,7 @@ from rigol_control.ui.device_windows import DG4000Window, NIDeviceWindow
 from rigol_control.ui.dialogs import DeviceDialog
 from rigol_control.ui.linkage_window import LinkageTaskWindow
 from rigol_control.ui.main_window import DeviceCenterWindow
+from rigol_control.ui.vaunix_window import VaunixLmsWindow
 from rigol_control.virtual_lab import VIRTUAL_DG2_RESOURCE, VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
 
 
@@ -59,6 +61,255 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIsInstance(home.open_windows[self.ni.id], NIDeviceWindow)
         self.assertEqual(len(home.open_windows), 2)
         home.close()
+        self.app.processEvents()
+
+    def test_device_parameters_restore_automatically_after_reopening(self) -> None:
+        parameter_repository = DeviceParameterRepository(Path(self.temporary.name))
+        dg_window = DG4000Window(
+            self.dg,
+            [self.ni],
+            parameter_repository=parameter_repository,
+        )
+        dg_window.channel_controls[1]["frequency"].set_unit("MHz")
+        dg_window.channel_controls[1]["frequency"].setValue(2_500_000)
+        dg_window.channel_controls[1]["amplitude"].setValue(0.875)
+        dg_window.channel_controls[1]["output"].setChecked(True)
+        dg_window.modulation_controls["PSK"]["channel"].setCurrentIndex(1)
+        dg_window.modulation_controls["PSK"]["parameter"].setValue(123.5)
+        dg_window.modulation_controls["PSK"]["enabled"].setChecked(True)
+        load = dg_window.impedance_controls[1]["load"]
+        load.setCurrentIndex(load.findData(75))
+        dg_window.step_terminal.setCurrentText("PFI7")
+        first_axis = dg_window.scan_axes[0]
+        first_axis.start.setValue(1.25)
+        first_axis.step.setValue(0.25)
+        first_axis.count.setValue(3)
+        dg_window._add_scan_axis(StepParameter.AMPLITUDE, 2)
+        second_axis = dg_window.scan_axes[1]
+        second_axis.start.setValue(0.5)
+        second_axis.step.setValue(0.125)
+        second_axis.count.setValue(3)
+        dg_window._generate_scan_table(show_message=False)
+        dg_window.step_table.item(1, 2).setText("0.9375")
+        expected_snapshot = dg_window._device_parameter_snapshot()
+        self.assertTrue(
+            self._wait_for(
+                lambda: parameter_repository.load(
+                    self.dg.id,
+                    kind=DeviceKind.DG4000.value,
+                )
+                == expected_snapshot,
+                timeout=2.0,
+            )
+        )
+        dg_window.close()
+        self.app.processEvents()
+
+        restored_dg = DG4000Window(
+            self.dg,
+            [self.ni],
+            parameter_repository=parameter_repository,
+        )
+        self.assertEqual(
+            restored_dg.channel_controls[1]["frequency"].current_unit(),
+            "MHz",
+        )
+        self.assertAlmostEqual(
+            restored_dg.channel_controls[1]["frequency"].value(),
+            2_500_000,
+        )
+        self.assertAlmostEqual(
+            restored_dg.channel_controls[1]["amplitude"].value(),
+            0.875,
+        )
+        self.assertTrue(restored_dg.channel_controls[1]["output"].isChecked())
+        self.assertEqual(
+            restored_dg.modulation_controls["PSK"]["channel"].currentData(),
+            2,
+        )
+        self.assertAlmostEqual(
+            restored_dg.modulation_controls["PSK"]["parameter"].value(),
+            123.5,
+        )
+        self.assertTrue(
+            restored_dg.modulation_controls["PSK"]["enabled"].isChecked()
+        )
+        self.assertEqual(
+            restored_dg.impedance_controls[1]["load"].currentData(),
+            75,
+        )
+        self.assertEqual(restored_dg.step_terminal.currentText(), "PFI7")
+        self.assertEqual(len(restored_dg.scan_axes), 2)
+        self.assertEqual(restored_dg.scan_axes[1].parameter.currentData(), StepParameter.AMPLITUDE)
+        self.assertEqual(restored_dg.scan_axes[1].channel.currentData(), 2)
+        self.assertEqual(restored_dg.step_table.item(1, 2).text(), "0.9375")
+        restored_dg.close()
+        self.app.processEvents()
+
+        ni_window = NIDeviceWindow(
+            self.ni,
+            parameter_repository=parameter_repository,
+        )
+        ni_window._set_all_analog_channels(True)
+        ni_window.ai_terminal_mode.setCurrentIndex(
+            ni_window.ai_terminal_mode.findData("DIFF")
+        )
+        ni_window.ai_sample_rate.setValue(12_500)
+        ni_window.ai_retained_samples.setValue(750_000)
+        ni_window.ai_stream_enabled.setChecked(False)
+        ni_window.ai_stream_path.setText(str(Path(self.temporary.name) / "saved.csv"))
+        ni_window.ai_x_scale.setValue(0.005)
+        ni_window.ai_y_auto.setChecked(False)
+        ni_window.ai_y_scale.setValue(0.25)
+        ni_window.ai_y_center.setValue(0.125)
+        ni_window.close()
+        self.app.processEvents()
+
+        restored_ni = NIDeviceWindow(
+            self.ni,
+            parameter_repository=parameter_repository,
+        )
+        self.assertEqual(len(restored_ni._checked_analog_channels()), 8)
+        self.assertEqual(restored_ni.ai_terminal_mode.currentData(), "DIFF")
+        self.assertAlmostEqual(restored_ni.ai_sample_rate.value(), 12_500)
+        self.assertEqual(restored_ni.ai_retained_samples.value(), 750_000)
+        self.assertFalse(restored_ni.ai_stream_enabled.isChecked())
+        self.assertTrue(restored_ni.ai_stream_path.text().endswith("saved.csv"))
+        self.assertAlmostEqual(restored_ni.ai_plot.seconds_per_division, 0.005)
+        self.assertAlmostEqual(restored_ni.ai_plot.volts_per_division, 0.25)
+        self.assertAlmostEqual(restored_ni.ai_plot.voltage_center_v, 0.125)
+        restored_ni.close()
+        self.app.processEvents()
+
+    def test_dg_channels_keep_identity_when_ch2_tab_was_active_at_save(self) -> None:
+        parameter_repository = DeviceParameterRepository(Path(self.temporary.name))
+        window = DG4000Window(
+            self.dg,
+            [self.ni],
+            parameter_repository=parameter_repository,
+        )
+        channel_1 = window.channel_controls[1]
+        channel_2 = window.channel_controls[2]
+        channel_1["waveform"].setCurrentIndex(1)
+        channel_1["frequency"].setValue(1_250_000)
+        channel_1["amplitude"].setValue(1.25)
+        channel_1["offset"].setValue(-0.25)
+        channel_1["phase"].setValue(45)
+        channel_1["output"].setChecked(True)
+        channel_2["waveform"].setCurrentIndex(2)
+        channel_2["frequency"].setValue(7_500_000)
+        channel_2["amplitude"].setValue(2.5)
+        channel_2["offset"].setValue(0.75)
+        channel_2["phase"].setValue(270)
+        channel_2["output"].setChecked(False)
+        load_1 = window.impedance_controls[1]
+        load_1["load"].setCurrentIndex(load_1["load"].findData(75))
+        load_2 = window.impedance_controls[2]
+        load_2["load"].setCurrentIndex(load_2["load"].findData("CUSTOM"))
+        load_2["custom_load"].setValue(1234)
+
+        channel_tabs = next(
+            tabs
+            for tabs in window.findChildren(QTabWidget)
+            if tabs.count() == 2 and tabs.tabText(0) == "CH1"
+        )
+        channel_tabs.setCurrentIndex(1)
+        self.app.processEvents()
+        window._save_device_parameters(force=True)
+        saved = parameter_repository.load(
+            self.dg.id,
+            kind=DeviceKind.DG4000.value,
+        )
+        self.assertEqual(saved["binding_version"], 2)
+        self.assertIn("named/dg4000.channel.1.frequency", saved["controls"])
+        self.assertIn("named/dg4000.channel.2.frequency", saved["controls"])
+        window.close()
+        self.app.processEvents()
+
+        restored = DG4000Window(
+            self.dg,
+            [self.ni],
+            parameter_repository=parameter_repository,
+        )
+        restored_1 = restored.channel_controls[1]
+        restored_2 = restored.channel_controls[2]
+        self.assertEqual(restored_1["waveform"].currentIndex(), 1)
+        self.assertAlmostEqual(restored_1["frequency"].value(), 1_250_000)
+        self.assertAlmostEqual(restored_1["amplitude"].value(), 1.25)
+        self.assertAlmostEqual(restored_1["offset"].value(), -0.25)
+        self.assertAlmostEqual(restored_1["phase"].value(), 45)
+        self.assertTrue(restored_1["output"].isChecked())
+        self.assertEqual(restored_2["waveform"].currentIndex(), 2)
+        self.assertAlmostEqual(restored_2["frequency"].value(), 7_500_000)
+        self.assertAlmostEqual(restored_2["amplitude"].value(), 2.5)
+        self.assertAlmostEqual(restored_2["offset"].value(), 0.75)
+        self.assertAlmostEqual(restored_2["phase"].value(), 270)
+        self.assertFalse(restored_2["output"].isChecked())
+        self.assertEqual(restored.impedance_controls[1]["load"].currentData(), 75)
+        self.assertEqual(
+            restored.impedance_controls[2]["load"].currentData(),
+            "CUSTOM",
+        )
+        self.assertEqual(restored.impedance_controls[2]["custom_load"].value(), 1234)
+        restored.close()
+        self.app.processEvents()
+
+    def test_dg_legacy_channel_positions_migrate_in_ch1_ch2_order(self) -> None:
+        parameter_repository = DeviceParameterRepository(Path(self.temporary.name))
+        parameter_repository.save(
+            self.dg.id,
+            kind=DeviceKind.DG4000.value,
+            parameters={
+                "controls": {
+                    "page_1/unit_0": {
+                        "type": "unit",
+                        "value": 1_500_000,
+                        "unit": "MHz",
+                    },
+                    "page_1/unit_1": {
+                        "type": "unit",
+                        "value": 1.5,
+                        "unit": "Vpp",
+                    },
+                    "page_1/check_0": {"type": "check", "checked": True},
+                    "page_1/unit_4": {
+                        "type": "unit",
+                        "value": 8_500_000,
+                        "unit": "MHz",
+                    },
+                    "page_1/unit_5": {
+                        "type": "unit",
+                        "value": 2.5,
+                        "unit": "Vpp",
+                    },
+                    "page_1/check_1": {"type": "check", "checked": False},
+                },
+                "custom": {},
+            },
+        )
+        restored = DG4000Window(
+            self.dg,
+            [self.ni],
+            parameter_repository=parameter_repository,
+        )
+        self.assertAlmostEqual(
+            restored.channel_controls[1]["frequency"].value(),
+            1_500_000,
+        )
+        self.assertAlmostEqual(restored.channel_controls[1]["amplitude"].value(), 1.5)
+        self.assertTrue(restored.channel_controls[1]["output"].isChecked())
+        self.assertAlmostEqual(
+            restored.channel_controls[2]["frequency"].value(),
+            8_500_000,
+        )
+        self.assertAlmostEqual(restored.channel_controls[2]["amplitude"].value(), 2.5)
+        self.assertFalse(restored.channel_controls[2]["output"].isChecked())
+        migrated = parameter_repository.load(
+            self.dg.id,
+            kind=DeviceKind.DG4000.value,
+        )
+        self.assertEqual(migrated["binding_version"], 2)
+        restored.close()
         self.app.processEvents()
 
     def test_device_dialog_auto_discovers_resources_into_editable_combo(self) -> None:
@@ -214,7 +465,7 @@ class UiSmokeTests(unittest.TestCase):
         home.create_virtual_lab()
         self.assertTrue(
             self._wait_for(
-                lambda: len(repository.list()) == 3
+                lambda: len(repository.list()) == 4
                 and all(manager.is_connected(item) for item in repository.list())
             )
         )
@@ -328,6 +579,146 @@ class UiSmokeTests(unittest.TestCase):
         home.close()
         self.app.processEvents()
 
+    def test_virtual_vaunix_full_window_and_ni_frequency_power_linkage(self) -> None:
+        repository = DeviceRepository(Path(self.temporary.name) / "vaunix-ui")
+        manager = DeviceConnectionManager()
+        home = DeviceCenterWindow(repository, manager)
+        home.create_virtual_lab()
+        self.assertTrue(
+            self._wait_for(
+                lambda: len(repository.list()) == 4
+                and all(manager.is_connected(item) for item in repository.list())
+            )
+        )
+        vaunix = next(
+            item
+            for item in repository.list()
+            if item.resource == VIRTUAL_VAUNIX_RESOURCE
+        )
+        ni = next(
+            item for item in repository.list() if item.resource == VIRTUAL_NI_RESOURCE
+        )
+        home.open_device(vaunix.id)
+        window = home.open_windows[vaunix.id]
+        self.assertIsInstance(window, VaunixLmsWindow)
+        self.assertTrue(
+            self._wait_for(
+                lambda: window.overview_metrics["connection"].text() == "已连接"
+            )
+        )
+        window.output_frequency.setValue(8.5e9)
+        window.output_power.setValue(-12.5)
+        window.output_rf.setChecked(True)
+        window._apply_output()
+        device = manager.vaunix_device_for(vaunix)
+        self.assertTrue(
+            self._wait_for(
+                lambda: abs(device.snapshot().frequency_hz - 8.5e9) < 1
+                and abs(device.snapshot().power_dbm + 12.5) < 1e-9
+                and device.snapshot().rf_on
+            )
+        )
+
+        window.trigger_frequency_start.setValue(5e9)
+        window.trigger_frequency_step.setValue(1e9)
+        window.trigger_frequency_count.setValue(2)
+        window.trigger_power_enabled.setChecked(True)
+        window.trigger_power_start.setValue(-10.0)
+        window.trigger_power_step.setValue(5.0)
+        window.trigger_power_count.setValue(2)
+        window._generate_trigger_table(show_message=False)
+        self.assertEqual(window.trigger_table.rowCount(), 2)
+        self.assertEqual(window.trigger_ni.currentData(), ni.id)
+        window._start_trigger()
+        self.assertTrue(
+            self._wait_for(
+                lambda: window.controller is not None
+                and window.controller.snapshot().state is ControllerState.RUNNING
+            )
+        )
+        manager.virtual_lab.emit_trigger(ni.resource, 3)
+        self.assertTrue(
+            self._wait_for(
+                lambda: window.controller.snapshot().applied_count == 3
+                and window.trigger_metrics["applied"].text() == "3"
+            )
+        )
+        self.assertAlmostEqual(device.snapshot().frequency_hz, 5e9)
+        self.assertAlmostEqual(device.snapshot().power_dbm, -10.0)
+        window._stop_trigger()
+        self.assertTrue(self._wait_for(lambda: window.controller is None))
+        home.close()
+        self.app.processEvents()
+
+    def test_vaunix_parameters_sequence_and_trigger_table_restore_per_device(self) -> None:
+        parameter_repository = DeviceParameterRepository(
+            Path(self.temporary.name) / "vaunix-parameters"
+        )
+        manager = DeviceConnectionManager()
+        vaunix = DeviceRecord.create(
+            kind=DeviceKind.VAUNIX_LMS,
+            name="虚拟 Vaunix",
+            resource=VIRTUAL_VAUNIX_RESOURCE,
+            connection="内置模拟器",
+        )
+        ni = DeviceRecord.create(
+            kind=DeviceKind.NI_DAQ,
+            name="虚拟 NI",
+            resource=VIRTUAL_NI_RESOURCE,
+            connection="内置模拟器",
+        )
+        manager.connect(vaunix)
+        manager.connect(ni)
+        window = VaunixLmsWindow(
+            vaunix,
+            [ni],
+            manager,
+            parameter_repository=parameter_repository,
+        )
+        self.assertAlmostEqual(window.output_power.singleStep(), 0.5)
+        self.assertAlmostEqual(window.trigger_power_start.singleStep(), 0.5)
+        self.assertAlmostEqual(window.trigger_power_step.singleStep(), 0.5)
+        window.trigger_power_enabled.setChecked(True)
+        window.trigger_power_start.setValue(-10.25)
+        with self.assertRaisesRegex(ValueError, "0.5 dB"):
+            window._trigger_axes_values()
+        window.trigger_power_start.setValue(-10.0)
+        window.sequence_table.item(0, 2).setText("-9.25")
+        with self.assertRaisesRegex(ValueError, "0.5 dB"):
+            window._sequence_elements()
+        window.output_frequency.set_unit("MHz")
+        window.output_frequency.setValue(7.25e9)
+        window.output_power.setValue(-11.5)
+        window.sequence_table.item(0, 1).setText("7123.5")
+        window.sequence_table.item(0, 2).setText("-9.5")
+        window.trigger_frequency_count.setValue(2)
+        window.trigger_power_count.setValue(2)
+        window._generate_trigger_table(show_message=False)
+        window.trigger_table.item(1, 2).setText("-3.75")
+        with self.assertRaisesRegex(ValueError, "0.5 dB"):
+            window._trigger_points()
+        window.trigger_table.item(1, 2).setText("-3.5")
+        window.close()
+        self.app.processEvents()
+
+        restored = VaunixLmsWindow(
+            vaunix,
+            [ni],
+            manager,
+            parameter_repository=parameter_repository,
+        )
+        self.assertEqual(restored.output_frequency.current_unit(), "MHz")
+        self.assertAlmostEqual(restored.output_frequency.value(), 7.25e9)
+        self.assertAlmostEqual(restored.output_power.value(), -11.5)
+        self.assertEqual(restored.sequence_table.item(0, 1).text(), "7123.5")
+        self.assertEqual(restored.sequence_table.item(0, 2).text(), "-9.5")
+        self.assertTrue(restored.trigger_power_enabled.isChecked())
+        self.assertEqual(restored.trigger_table.rowCount(), 2)
+        self.assertEqual(restored.trigger_table.item(1, 2).text(), "-3.5")
+        restored.close()
+        manager.close_all()
+        self.app.processEvents()
+
     def test_virtual_analog_input_acquires_and_streams_four_channels_in_parallel(self) -> None:
         manager = DeviceConnectionManager()
         record = DeviceRecord.create(
@@ -366,6 +757,16 @@ class UiSmokeTests(unittest.TestCase):
             == Qt.CheckState.Checked
             for index in range(window.ai_channel_combo.count())
         ))
+        self.assertAlmostEqual(window.ai_plot.seconds_per_division, 0.02)
+        self.assertIsNone(window.ai_plot.volts_per_division)
+        window.ai_x_scale.setValue(0.005)
+        window.ai_y_auto.setChecked(False)
+        window.ai_y_scale.setValue(0.25)
+        window.ai_y_center.setValue(0.1)
+        self.assertAlmostEqual(window.ai_plot.seconds_per_division, 0.005)
+        self.assertAlmostEqual(window.ai_plot.volts_per_division, 0.25)
+        self.assertAlmostEqual(window.ai_plot.voltage_center_v, 0.1)
+        self.assertIn("25 ms", window.ai_plot_span.text())
         window.ai_sample_rate.setValue(20_000)
         window.ai_block_size.setValue(200)
         stream_path = Path(self.temporary.name) / "continuous-ui.csv"
@@ -374,14 +775,19 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(
             self._wait_for(
                 lambda: window.analog_controller is not None
-                and window.analog_controller.snapshot().total_samples >= 400,
+                and window.analog_controller.snapshot().total_samples >= 1200,
                 timeout=2.0,
             )
         )
         self.assertTrue(
-            self._wait_for(lambda: window.ai_plot.displayed_samples >= 400)
+            self._wait_for(lambda: window.ai_plot.displayed_samples >= 1200)
         )
-        self.assertGreaterEqual(window.ai_plot.displayed_samples, 400)
+        self.assertGreaterEqual(window.ai_plot.displayed_samples, 1200)
+        self.assertEqual(window.ai_plot.visible_samples, 500)
+        self.assertGreater(
+            window.ai_plot.displayed_samples,
+            window.ai_plot.visible_samples,
+        )
         self.assertEqual(window.ai_metrics["channels"].text(), "4")
         self.assertGreater(int(window.ai_metrics["saved"].text()), 0)
         window._stop_analog_input()
@@ -419,7 +825,7 @@ class UiSmokeTests(unittest.TestCase):
         home.create_virtual_lab()
         self.assertTrue(
             self._wait_for(
-                lambda: len(repository.list()) == 3
+                lambda: len(repository.list()) == 4
                 and all(manager.is_connected(item) for item in repository.list())
             )
         )

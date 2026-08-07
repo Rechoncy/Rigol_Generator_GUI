@@ -96,7 +96,11 @@ class DeviceCard(QFrame):
 
     @staticmethod
     def _default_connection(kind: DeviceKind) -> str:
-        return "NI-DAQmx 本机设备" if kind is DeviceKind.NI_DAQ else "VISA / SCPI"
+        if kind is DeviceKind.NI_DAQ:
+            return "NI-DAQmx 本机设备"
+        if kind is DeviceKind.VAUNIX_LMS:
+            return "Vaunix USB DLL"
+        return "VISA / SCPI"
 
     def set_probe_result(self, result: ProbeResult) -> None:
         if result.state is ProbeState.ONLINE:
@@ -152,7 +156,7 @@ class AddDeviceCard(QFrame):
         title = QLabel("添加设备")
         title.setObjectName("CardTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        note = QLabel("保存 DG4000、NI 采集卡或通用 SCPI 设备")
+        note = QLabel("保存 DG4000、Vaunix、NI 采集卡或通用 SCPI 设备")
         note.setObjectName("Muted")
         note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(plus)

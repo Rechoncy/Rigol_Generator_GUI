@@ -1,3 +1,3 @@
-"""DG4000/NI DAQ multi-device control application."""
+"""DG4000, Vaunix LMS/BLX, and NI DAQ multi-device control application."""
 
-__version__ = "0.5.4"
+__version__ = "0.6.0"

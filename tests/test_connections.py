@@ -1,6 +1,7 @@
 import unittest
 
 from rigol_control.connections import DeviceConnectionManager
+from rigol_control.drivers.vaunix_lms import VIRTUAL_VAUNIX_RESOURCE
 from rigol_control.models import DeviceKind, DeviceRecord
 from rigol_control.services import ProbeResult, ProbeState
 
@@ -100,6 +101,27 @@ class DeviceConnectionManagerTests(unittest.TestCase):
         self.assertIn("NI USB-6363", result.identity)
         self.assertTrue(self.manager.is_connected(record))
         self.manager.disconnect(record)
+        self.assertFalse(self.manager.is_connected(record))
+
+    def test_virtual_vaunix_driver_is_shared_connected_and_disconnected(self) -> None:
+        record = DeviceRecord.create(
+            kind=DeviceKind.VAUNIX_LMS,
+            name="Vaunix BLX",
+            resource=VIRTUAL_VAUNIX_RESOURCE,
+            connection="内置模拟器",
+        )
+        driver = self.manager.vaunix_device_for(record)
+        self.assertIs(driver, self.manager.vaunix_device_for(record))
+        self.assertFalse(self.manager.is_connected(record))
+
+        result = self.manager.connect(record)
+        self.assertTrue(result.connected)
+        self.assertIn("BLX-403", result.identity)
+        self.assertTrue(driver.is_connected)
+        self.assertTrue(self.manager.is_connected(record))
+
+        self.manager.disconnect(record)
+        self.assertFalse(driver.is_connected)
         self.assertFalse(self.manager.is_connected(record))
 
 

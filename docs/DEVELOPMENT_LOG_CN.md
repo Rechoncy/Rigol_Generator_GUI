@@ -1,8 +1,8 @@
-# DG4000 + NI 多设备联动控制：开发日志与维护指南
+# DG4000 + Vaunix + NI 多设备联动控制：开发日志与维护指南
 
 文档版本：1.0
 
-对应软件版本：0.5.4
+对应软件版本：0.6.0
 
 最后更新：2026-08-06
 适用仓库：`Rigol_Generator_GUI`
@@ -17,12 +17,13 @@
 
 ### 2.1 当前目标
 
-- 在一个首页中保存、连接和管理多台 DG4000、NI DAQ 与通用 SCPI 设备。
+- 在一个首页中保存、连接和管理多台 DG4000、Vaunix LMS/BLX、NI DAQ 与通用 SCPI 设备。
 - 为每台设备打开独立设置窗口，共享已建立的 VISA 会话。
 - 覆盖 DG4000 常用功能，并保留原始 SCPI 控制台作为完整手册命令入口。
 - 使用 NI 硬件累计边沿计数触发 DG4000 参数步进，不使用 NI AO 电压控制信号发生器。
 - 支持频率、幅度、相位、PSK 相位和 FSK 频率的单机或跨设备多轴循环扫描。
 - 支持 NI 多通道硬件定时模拟输入、实时绘图和连续 CSV/TXT 文本记录。
+- 通过 Vaunix Windows SDK 1.15 完整控制 LMS/BLX，并用 NI 累计边沿驱动频率和绝对功率联合扫描。
 - 在无硬件、无 PyVISA、无 NI-DAQmx 的环境中提供可重复的虚拟联调路径。
 
 ### 2.2 非目标和边界
@@ -40,11 +41,12 @@ PyQt6 UI
   ├─ 设备中心 / 单设备窗口 / 跨设备任务窗口
   ├─ DeviceConnectionManager（共享连接与设备租约）
   ├─ 任务控制器（触发、跨设备、模拟采集）
-  ├─ 类型化驱动（DG4000、NI counter、NI analog）
-  └─ PyVISA / NI-DAQmx / VirtualLab
+  ├─ 类型化驱动（DG4000、Vaunix LMS/BLX、NI counter、NI analog）
+  └─ PyVISA / vnx_fmsynth.dll / NI-DAQmx / VirtualLab
 
 本地数据目录
   ├─ devices.json
+  ├─ device_parameters.json
   ├─ step_tasks.json
   ├─ linkage_tasks.json
   ├─ run_logs/*.csv
@@ -59,11 +61,12 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 |---|---|---|
 | `src/rigol_control/app.py` | CLI、Qt 应用创建、字体和主题启动 | 新增命令行参数时补 smoke test |
 | `src/rigol_control/models.py` | 设备类型和不可变设备记录 | 字段变化需考虑旧 JSON 兼容 |
-| `src/rigol_control/repository.py` | `devices.json` 读写、唯一性和原子替换 | 格式不兼容时提升 schema version 并提供迁移 |
+| `src/rigol_control/repository.py` | `devices.json` 与 `device_parameters.json` 读写、唯一性和原子替换 | 格式不兼容时提升 schema version 并提供迁移 |
 | `src/rigol_control/connections.py` | VISA 会话共享、NI 逻辑连接、设备租约、虚拟/实机工厂 | 新任务必须先获取租约并在所有退出路径释放 |
 | `src/rigol_control/services.py` | VISA/NI 资源发现与设备探测 | 未安装厂商驱动时必须返回可解释状态 |
 | `src/rigol_control/drivers/scpi.py` | 单 VISA 会话串行化、查询和批量写入 | 不允许多个线程绕过会话锁直接访问同一资源 |
 | `src/rigol_control/drivers/dg4000.py` | DG4000 类型化命令、负载、步进参数命令映射 | 新命令需同时覆盖格式校验和 fake backend 测试 |
+| `src/rigol_control/drivers/vaunix_lms.py` | Vaunix SDK 1.15 ctypes 绑定、稳定序列号连接、完整 LMS/BLX 控制和虚拟设备 | DLL 句柄不是稳定身份；频率为 10 Hz 单位；功率编码为 0.25 dB、实际分辨率为 0.5 dB |
 | `src/rigol_control/drivers/ni_counter.py` | NI-DAQmx 累计边沿计数 | PFI、计数器和边沿必须来自真实设备能力 |
 | `src/rigol_control/drivers/ni_analog.py` | NI 多通道连续采样和数据块模型 | 保持一个任务内通道同步和样本形状一致 |
 | `src/rigol_control/units.py` | UI 显示单位与 SCPI 基准单位换算 | 内部值始终使用 Hz、V、度、秒等基准单位 |
@@ -78,6 +81,7 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 | `src/rigol_control/ui/main_window.py` | 多设备首页、连接/断开、窗口管理 | 不在卡片组件内创建第二份连接会话 |
 | `src/rigol_control/ui/dialogs.py` | 添加/编辑设备和资源下拉发现 | 保留手工输入作为驱动缺失时的后备路径 |
 | `src/rigol_control/ui/device_windows.py` | DG/NI 单设备页面和任务入口 | 文件较大，新增逻辑优先抽到模型/控制器后再接 UI |
+| `src/rigol_control/ui/vaunix_window.py` | Vaunix 全功能页面、BLX 序列和 NI 频率/功率联动 | 依据连接型号能力禁用不支持操作；页面参数必须自动持久化 |
 | `src/rigol_control/ui/linkage_window.py` | 跨设备轴编辑、任务保存、运行指标 | 修改轴后必须把旧点表标为过期 |
 | `src/rigol_control/ui/waveform.py` | 多通道实时曲线 | 只显示有限窗口，不承担完整数据归档 |
 | `tools/capture_manual_screenshots.py` | 无硬件生成说明书截图 | 新增关键页面后更新截图脚本和 Markdown 标记 |
@@ -88,7 +92,7 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 ### 5.1 设备连接与共享
 
 1. 首页从 `DeviceRepository` 读取设备记录。
-2. `DeviceConnectionManager.connect()` 按设备类型选择 PyVISA、NI 探测或虚拟实验室。
+2. `DeviceConnectionManager.connect()` 按设备类型选择 PyVISA、Vaunix DLL、NI 探测或虚拟实验室。
 3. SCPI 会话以 device ID 缓存，首页和设置窗口通过同一 manager 获取同一会话。
 4. 关闭设置窗口不自动断开设备；显式断开或应用退出才释放会话。
 5. 设备被任务租约占用时禁止断开或被另一个任务复用。
@@ -121,6 +125,15 @@ writer thread 在 applied_count < received_count 时逐个补发
 4. 启用连续记录时，数据块立即追加到 CSV/TXT 并在每块后刷新。
 5. 绘图和统计只保留用户指定的有限样本窗口；旧显示点可丢弃，磁盘文件不截断。
 6. 停止、错误和窗口关闭路径必须关闭 reader 与文件句柄。
+
+### 5.5 Vaunix LMS/BLX 与 NI 联动
+
+1. `locate_vaunix_dll()` 依次检查 `VAUNIX_LMS_DLL`、项目目录、驱动目录和本地 `lms-sdk-*` x64 路径。
+2. `VaunixLmsApi.enumerate_devices()` 返回临时 SDK 句柄、型号、序列号和状态；持久化资源只使用 `VAUNIX::LMS::<serial>`。
+3. 连接时重新枚举并按序列号匹配，初始化后读取频率/功率范围、快速脉冲、Chirp、BLX 能力和 SDK 版本。
+4. 普通控制经类型化方法下发；频率从 Hz 编码为 10 Hz 无符号单位。绝对功率先校验为 0.5 dB 网格，再按 DLL 的 0.25 dB 编码转换为有符号整数。
+5. NI 联动复用 `TriggerStepController` 的累计计数、首触发 P0 和有序积压契约；在 Vaunix 驱动内把频率轴映射为 `SetFrequencyEx`，功率轴映射为绝对 `SetPowerLevel`。
+6. 启动时原子租用 Vaunix 与 NI；停止、错误和关闭窗口释放。设备端 BLX 序列与软件 NI 逐点联动不得同时运行。
 
 ## 6. 设计决策记录
 
@@ -164,7 +177,21 @@ writer thread 在 applied_count < received_count 时逐个补发
 
 状态：已采纳。设备总览保存所有指标标签引用，并由共享 `DeviceConnectionManager` 的状态转换更新。DG4000 连接后异步查询 `:OUTP1?` 和 `:OUTP2?`；界面下发输出命令成功后立即更新对应通道。连接、断开、设备增删和 NI 列表变化会同步到已经打开的设置窗口。读取失败时通道显示“未知”，不得继续显示可能过期的“关闭”。
 
+### ADR-011：设备参数按稳定设备 ID 自动保存，恢复时不自动下发
+
+状态：已采纳。每个设备窗口以 500 ms 周期比较当前参数快照，仅在变化时原子写入 `device_parameters.json`，关闭窗口前再次强制保存。通用控件保存基准数值、显示单位、下拉选择、多选通道、开关和文本；DG 单设备触发扫描额外保存动态扫描轴、顺序及手工点表。重新打开窗口时先恢复界面，再允许用户主动应用或启动任务；恢复过程绝不自动发送 SCPI、启动 NI 任务或改变实体输出。设备删除时同时删除对应参数快照，避免孤立配置误用。
+
+### ADR-012：Vaunix 使用序列号作为资源身份，SDK 句柄只在连接期使用
+
+状态：已采纳，自 0.6.0 起生效。Vaunix `DEVID` 由 DLL 枚举产生，其顺序可能随 USB 插拔变化，不能写入 `devices.json`。资源统一编码为 `VAUNIX::LMS::<serial>`；每次连接重新枚举并按序列号匹配。这样设备参数、窗口和任务租约始终绑定同一台物理设备。
+
+### ADR-013：Vaunix 型号能力来自运行时查询，不以型号字符串硬编码
+
+状态：已采纳。连接后读取频率/功率范围、快速脉冲和 Chirp 能力；BLX 序列能力只由 BLX 系列身份启用。UI 首次显示宽范围编辑器，连接后收紧量程并禁用不支持按钮，驱动层继续做最终校验。虚拟设备选择全功能 BLX-403，用于覆盖所有页面，而非冒充任意实机型号。
+
 ## 7. DG4000 命令约定
+
+### 7.1 DG4000 SCPI
 
 | 功能 | 命令模板 | 备注 |
 |---|---|---|
@@ -180,6 +207,21 @@ writer thread 在 applied_count < received_count 时逐个补发
 
 所有数值先由 `units.py` 转为基准单位。类型化 API 只覆盖高频操作；原始 `write()` 和 `query()` 必须保持可用，以覆盖编程手册中型号/固件特有的全部命令。
 
+### 7.2 Vaunix Windows SDK 约定
+
+| 功能 | SDK 调用 | 内部/界面单位 |
+|---|---|---|
+| 当前频率 | `fnLMS_SetFrequencyEx` / `GetFrequencyEx` | DLL 为 10 Hz；内部 Hz，界面 Hz/kHz/MHz/GHz |
+| 绝对功率 | `fnLMS_SetPowerLevel` / `GetAbsPowerLevel` | DLL 编码为 0.25 dB；仪器分辨率和界面步长为 0.5 dB |
+| RF 与参考 | `SetRFOn` / `SetUseInternalRef` | 布尔状态 |
+| 扫频 | Start/End/Step、SweepTime 或 Dwell/Idle、Direction/Mode/Type/Trigger/Start | LMS 使用总时间，BLX 使用驻留/空闲 |
+| 脉冲 | `SetFastPulsedOutput` / `SetUseExternalPulseMod` | 秒；内部选件按能力启用，外部输入独立尝试并保留 DLL 错误 |
+| Chirp | Mode/Length/Repeat/ExternalTrigger | 秒；受型号能力限制 |
+| BLX 序列 | Element/Start/Count/Dwell/Idle/StartSequence | 最多 50 项，可独立控制频率/功率 |
+| 状态与保存 | `GetDeviceStatus` / `SaveSettings` | 保存写设备非易失存储，需用户确认 |
+
+SDK 返回状态必须统一经过 `_check_set_status()`；读取型函数不能把合法的负功率值误判为错误。功率换算保留 `dBm / 0.25 dB` 的 API 编码，但 `_power_units()` 必须先拒绝非 0.5 dB 网格，不能把可编码值误认为硬件可实现值。版本号按 `0xMMmm` 打包，SDK 1.15 表示为 `0x010F`，显示时必须解码为 `1.15`。
+
 ## 8. 持久化和输出文件
 
 默认数据目录为 `%APPDATA%\RigolGeneratorControl`，也可用 `--data-dir` 或 `RIGOL_GUI_DATA_DIR` 覆盖。
@@ -187,6 +229,7 @@ writer thread 在 applied_count < received_count 时逐个补发
 | 文件 | 版本/格式 | 用途 |
 |---|---|---|
 | `devices.json` | schema 1 | 设备 ID、类型、名称、资源、连接方式和时间戳 |
+| `device_parameters.json` | schema 1 | 按设备 ID 保存全部可编辑控件、单位、通道选择、动态扫描轴和手工点表 |
 | `step_tasks.json` | schema 1 | 单设备触发配置、扫描轴和显式点表 |
 | `linkage_tasks.json` | schema 1 | NI 触发源、跨设备扫描轴、模式、设备顺序和点表 |
 | `run_logs/*.csv` | CSV | 每个跨设备触发的点级和设备级执行证据 |
@@ -228,11 +271,11 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 | 层级 | 重点 | 主要文件 |
 |---|---|---|
 | 纯模型 | 单位换算、扫描点、首触发循环、任务序列化 | `test_scan.py`、`test_sequence.py`、`test_step_tasks.py` |
-| 驱动 | SCPI 命令、负载范围、NI 配置映射 | `test_hardware_core.py` |
+| 驱动 | SCPI 命令、负载范围、NI 配置映射、Vaunix 全功能状态与单位编码 | `test_hardware_core.py`、`test_vaunix.py` |
 | 控制器 | 无丢失积压、停止/异常、连续文本和缓存丢弃 | `test_analog.py`、`test_linkage.py` |
 | 基础设施 | 资源发现、连接共享、设备租约、原子仓库 | `test_discovery.py`、`test_connections.py`、`test_repository.py` |
-| 虚拟实验室 | 虚拟状态、触发、四通道采集、默认 50 Ω | `test_virtual_lab.py` |
-| UI 端到端 | 多设备首页、下拉多选、负载独立应用、跨设备联动 | `test_ui_smoke.py` |
+| 虚拟实验室 | DG/Vaunix 状态、触发、四通道采集、默认 50 Ω | `test_virtual_lab.py`、`test_vaunix.py` |
+| UI 端到端 | 四设备首页、下拉多选、负载独立应用、DG 跨设备联动、Vaunix 频率/功率联动 | `test_ui_smoke.py` |
 
 关键回归契约：
 
@@ -246,6 +289,10 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 - CH1/CH2 负载控件默认 50 Ω；应用波形不得改变已经单独设置的负载。
 - DG 与 NI 连接后总览必须显示“已连接”；DG 输出查询和下发后 CH1/CH2 指标必须与真实状态一致。
 - DG 窗口先打开、随后添加或连接 NI 时，触发步进下拉框必须动态出现该设备并显示连接状态。
+- Vaunix 自动发现必须始终保留虚拟资源；实机资源必须使用序列号而不是 SDK `DEVID`。
+- Vaunix 首个 NI 触发应用频率/功率 P0，计数跳变必须完整补发且末点循环。
+- Vaunix `-7.5 dBm` 必须编码为 `-30`；`-7.25 dBm` 虽能形成整数编码，但必须在驱动、BLX 序列和 NI 点表预检中被拒绝。
+- 不支持快速脉冲、Chirp 或 BLX 序列的型号不得强行下发相关命令。
 
 ## 11. 实机验收清单
 
@@ -259,10 +306,32 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 8. 跨两台 DG 验证设备顺序、点级屏障、运行 CSV 和断线错误。
 9. NI AI 先以低采样率验证四通道，再提高到目标速率并检查文件增长和 CPU/磁盘占用。
 10. 长时间采集后检查文件末尾样本序号、列数、停止时关闭状态和可读性。
+11. 用本地 x64 SDK 搜索 Vaunix，核对型号、序列号、SDK 1.15、频率/功率范围与能力位。
+12. 保持 RF 关闭，验证频率、绝对功率、参考、扫频、脉冲/Chirp/BLX 序列的设置和回读；不支持功能应禁用。
+13. 用 NI 单步及批量触发验证 Vaunix 频率/功率同步和组合扫描、首触发 P0、循环、积压与停止释放。
 
 实体输出测试必须由实验负责人确认幅度、偏置、负载、端接方式、PFI 电平、接地和被测电路耐压。自动测试不能替代这些电气检查。
 
 ## 12. 版本开发日志
+
+### 0.6.0 通道持久化修复 — 2026-08-07
+
+- 修复 DG4000 保存后重新打开时 CH1/CH2 参数可能整体互换的问题。根因是旧实现用 `QObject.children()` 的动态遍历序号作为保存键；切换 `QTabWidget` 标签会改变页面层叠顺序，使同一个 `page_1/unit_n` 在保存和恢复时绑定到不同通道。
+- DG4000 波形、频率、幅度、偏置、相位、输出状态及负载阻抗改用包含设备类型、通道和参数名的稳定语义键，例如 `named/dg4000.channel.1.frequency`，不再依赖控件创建顺序、当前标签或层叠顺序。
+- 参数快照增加 `binding_version = 2`。读取旧版位置键时按界面语义顺序 CH1、CH2 迁移，首次打开后自动写回稳定键；配置文件总结构和设备稳定 ID 不变，不需要删除或重置 `device_parameters.json`。
+- 新增双通道差异化回归：分别保存两套波形、频率、幅度、偏置、相位和输出状态，在 CH2 为活动标签时关闭并重开，逐项确认通道身份不变；另增加旧版位置键迁移测试。
+
+### 0.6.0 — 2026-08-06
+
+- 新增 `DeviceKind.VAUNIX_LMS`、自动资源搜索、序列号稳定资源地址、连接缓存和首页连接/断开状态。
+- 完成 SDK 1.15 `vnx_fmsynth.dll` 的 ctypes 原型映射，覆盖设备枚举、能力/状态、频率、绝对功率、RF、参考、LMS/BLX 扫频、快速/外部脉冲、Chirp、BLX 50 项序列和非易失设置保存。
+- 新增七页 Vaunix 设置窗口；连接后按设备实测范围收紧控件，并禁用不支持的快速脉冲、Chirp 和 BLX 操作。
+- 新增 NI 触发频率/功率单轴、同步或笛卡尔组合扫描；保持首触发 P0、永久循环、累计计数和无最小间隔语义。
+- 新增全功能虚拟 BLX-403，虚拟实验室从三台扩展为四台设备；Vaunix 与 NI 联动使用同一设备租约机制。
+- Vaunix 全部界面参数、BLX 序列表和触发点表按设备自动保存；恢复不自动写硬件或开启 RF。
+- 增加驱动、发现、连接、UI 与联动专项测试，重拍 Vaunix 截图并更新 README、中文使用说明 PDF 和本维护日志。
+- 本机已成功加载 SDK x64 DLL 并读取版本 1.15；当前无 Vaunix USB 实机，实体型号和电气输出仍待实验室验收。
+- 修正功率粒度解释：0.25 dB 是 DLL 编码单位，0.5 dB 才是仪器实际分辨率；输出、虚拟设备、BLX 序列和 NI 扫描统一执行 0.5 dB 网格校验。
 
 ### 0.5.4 — 2026-08-06
 
@@ -275,6 +344,10 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 - 修复已打开 DG 窗口只持有 NI 设备静态快照的问题；设备增删和连接变化现在自动刷新触发步进下拉框，并提供手动“刷新”按钮。
 - 修复跨设备“增加扫描轴”按钮把 Qt `clicked(bool)` 参数误当成 `LinkageAxis`、继而访问 `bool.device_id` 的问题；按钮连接显式丢弃 checked 参数，方法入口同时保留类型防御，并将端到端测试改为真实按钮点击。
 - 跨设备实验保存增加 `active_task_id`：保存或加载任务后记录为当前实验，再次打开窗口会自动恢复 NI 触发配置、每个扫描轴的 DG/通道/参数/单位、扫描范围和手工编辑点表。加载前严格校验稳定设备 ID 与设备类型，绑定设备已删除时停止恢复且绝不自动改绑。
+- 新增 `device_parameters.json` 自动持久化；DG4000、NI DAQ 和通用 SCPI 窗口的全部可编辑参数在变化后自动保存，重开窗口和重启软件不再恢复默认值。
+- 数值同时保存基准值与显示单位；DG 动态扫描轴和手工点表使用专用结构恢复。恢复只改变界面，不自动下发硬件命令，删除设备时同步清理参数记录。
+- NI 实时波形增加 X 轴时基（s/ms/µs 每格）、Y 轴自动/手动标度（V/mV 每格）和 Y 轴中心设置；默认显示最近 100 ms，用户可在采集中实时调整。
+- 绘图仅截取当前时间窗口，并在点数超过像素宽度时绘制峰谷包络，解决高采样率长缓存挤成色块的问题；连续文本仍逐块保存全部原始样本，不受坐标范围和显示抽稀影响。
 - 新增本文档，完善使用说明和系统页截图。
 
 ### 0.5.3 — 2026-08-06
@@ -377,6 +450,9 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 | 长时间文本文件很大 | 逐块写入、有限内存 | 文件轮转、分段索引和容量预警 |
 | 磁盘满或写入失败 | 采集进入错误并关闭资源 | 预分配/剩余空间监视 |
 | NI 设备资源冲突 | 显式租约 | 更细粒度的 counter/AI 子资源租约 |
+| Vaunix DLL 缺失或位数不匹配 | 自动搜索、环境变量、明确错误、虚拟设备后备 | 发布包携带经过授权和版本锁定的厂商运行库 |
+| Vaunix 型号能力不同 | 连接后动态范围/能力读取和双层校验 | 建立实机型号验收矩阵 |
+| 软件 NI 触发快于 Vaunix USB 下发 | 累计计数、有序积压、实时指标 | 优先使用 BLX 设备端序列或公共硬件触发 |
 | UI 主文件增长 | 业务逻辑已下沉控制器 | 继续拆分 DG 和 NI 页面组件 |
 
 ## 16. 故障定位顺序
@@ -408,6 +484,14 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 2. 在 NI MAX 验证通道、端接方式、量程和采样率。
 3. 检查保存目录写权限和磁盘空间。
 4. 查看错误状态是否报告样本序号不连续、通道变化或采样率变化。
+
+### Vaunix 搜不到或功能不匹配
+
+1. 确认使用 64 位 Python 与 SDK `x64\Release\vnx_fmsynth.dll`，或设置 `VAUNIX_LMS_DLL` 为明确绝对路径。
+2. 运行发现测试确认至少返回 `SIM::VAUNIX_LMS::1`；实机未出现时关闭厂商示例程序并重新插拔 USB。
+3. 核对资源中的序列号，而不是记录 SDK 临时 `DEVID`。
+4. 连接后查看总览范围和能力；快速脉冲、Chirp、BLX 序列只能按驱动真实报告使用。
+5. 功率使用绝对 dBm，不能把 `GetPowerLevel` 的相对衰减语义混入 UI；当前回读使用 `GetAbsPowerLevel`。
 
 ## 17. 新变更记录模板
 

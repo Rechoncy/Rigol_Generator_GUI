@@ -154,7 +154,7 @@ class TriggerStepController:
             )
             self._writer_thread = Thread(
                 target=self._writer_loop,
-                name="dg4000-scpi-writer",
+                name="instrument-step-writer",
                 daemon=True,
             )
             monitor = self._monitor_thread
@@ -232,7 +232,7 @@ class TriggerStepController:
                     self._current_values = values
                 self._publish()
         except Exception as exc:
-            self._fail(f"向 DG4000 下发步进参数失败：{exc}")
+            self._fail(f"向目标设备下发步进参数失败：{exc}")
 
     def _fail(self, message: str) -> None:
         with self._condition:

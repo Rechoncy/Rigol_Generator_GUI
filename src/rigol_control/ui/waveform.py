@@ -12,6 +12,9 @@ from ..drivers.ni_analog import AnalogInputBlock
 class WaveformPlot(QWidget):
     """Dependency-free real-time waveform plot with bounded display history."""
 
+    HORIZONTAL_DIVISIONS = 5
+    VERTICAL_DIVISIONS = 4
+
     COLORS = (
         QColor("#55d9cc"),
         QColor("#8f7cff"),
@@ -30,13 +33,60 @@ class WaveformPlot(QWidget):
         self.sample_rate_hz = 0.0
         self.first_sample_index = 0
         self._buffers: tuple[deque[float], ...] = ()
-        self.setMinimumHeight(330)
+        self.seconds_per_division = 0.02
+        self.volts_per_division: float | None = None
+        self.voltage_center_v = 0.0
+        self.setMinimumHeight(240)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
-        self.setToolTip("实时显示所有已勾选通道的最近数据；连续文本由采集器逐块写入磁盘。")
+        self.setToolTip(
+            "实时显示最近时间窗口；X/Y 标度只影响绘图，连续文本仍逐块保存全部原始数据。"
+        )
 
     @property
     def displayed_samples(self) -> int:
         return len(self._buffers[0]) if self._buffers else 0
+
+    @property
+    def visible_samples(self) -> int:
+        if self.sample_rate_hz <= 0:
+            return self.displayed_samples
+        requested = max(
+            2,
+            int(
+                math.ceil(
+                    self.seconds_per_division
+                    * self.HORIZONTAL_DIVISIONS
+                    * self.sample_rate_hz
+                )
+            ),
+        )
+        return min(self.displayed_samples, requested)
+
+    def set_time_scale(self, seconds_per_division: float) -> None:
+        value = float(seconds_per_division)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("X 轴时基必须是大于 0 的有限值")
+        self.seconds_per_division = value
+        self.update()
+
+    def set_voltage_scale(
+        self,
+        volts_per_division: float | None,
+        *,
+        center_v: float = 0.0,
+    ) -> None:
+        center = float(center_v)
+        if not math.isfinite(center):
+            raise ValueError("Y 轴中心必须是有限值")
+        if volts_per_division is None:
+            self.volts_per_division = None
+        else:
+            scale = float(volts_per_division)
+            if not math.isfinite(scale) or scale <= 0:
+                raise ValueError("Y 轴标度必须是大于 0 的有限值")
+            self.volts_per_division = scale
+        self.voltage_center_v = center
+        self.update()
 
     def clear(self) -> None:
         self.channel_names = ()
@@ -64,7 +114,7 @@ class WaveformPlot(QWidget):
         painter = QPainter(self)
         painter.fillRect(event.rect(), QColor("#0b1320"))
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        plot = QRectF(72, 22, max(10, self.width() - 92), max(10, self.height() - 64))
+        plot = QRectF(90, 22, max(10, self.width() - 110), max(10, self.height() - 64))
         painter.fillRect(plot, QColor("#0f1927"))
         self._draw_grid(painter, plot)
         if not self._buffers or self.displayed_samples < 2:
@@ -72,24 +122,37 @@ class WaveformPlot(QWidget):
             painter.drawText(plot, Qt.AlignmentFlag.AlignCenter, "等待模拟输入数据…")
             return
 
-        all_values = [value for buffer in self._buffers for value in buffer]
-        minimum = min(all_values)
-        maximum = max(all_values)
-        if math.isclose(minimum, maximum):
-            padding = max(abs(minimum) * 0.1, 0.5)
+        visible_count = self.visible_samples
+        visible_buffers = tuple(list(buffer)[-visible_count:] for buffer in self._buffers)
+        if self.volts_per_division is None:
+            all_values = [value for values in visible_buffers for value in values]
+            minimum = min(all_values)
+            maximum = max(all_values)
+            if math.isclose(minimum, maximum):
+                padding = max(abs(minimum) * 0.1, 0.5)
+            else:
+                padding = (maximum - minimum) * 0.08
+            minimum -= padding
+            maximum += padding
         else:
-            padding = (maximum - minimum) * 0.08
-        minimum -= padding
-        maximum += padding
-        self._draw_axis_labels(painter, plot, minimum, maximum)
+            half_span = self.volts_per_division * self.VERTICAL_DIVISIONS / 2
+            minimum = self.voltage_center_v - half_span
+            maximum = self.voltage_center_v + half_span
+        self._draw_axis_labels(
+            painter,
+            plot,
+            minimum,
+            maximum,
+            visible_count,
+        )
 
         painter.save()
         painter.setClipRect(plot)
-        for index, buffer in enumerate(self._buffers):
+        for index, values in enumerate(visible_buffers):
             self._draw_trace(
                 painter,
                 plot,
-                list(buffer),
+                values,
                 minimum,
                 maximum,
                 self.COLORS[index % len(self.COLORS)],
@@ -114,6 +177,7 @@ class WaveformPlot(QWidget):
         plot: QRectF,
         minimum: float,
         maximum: float,
+        visible_count: int,
     ) -> None:
         painter.setPen(QColor("#9aa8bc"))
         for index in range(5):
@@ -121,11 +185,14 @@ class WaveformPlot(QWidget):
             value = maximum - (maximum - minimum) * fraction
             y = plot.top() + plot.height() * fraction
             painter.drawText(
-                QRectF(20, y - 9, 47, 18),
+                QRectF(22, y - 9, 62, 18),
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                 f"{value:.4g}",
             )
-        start_seconds = self.first_sample_index / self.sample_rate_hz
+        first_visible_index = (
+            self.first_sample_index + self.displayed_samples - visible_count
+        )
+        start_seconds = first_visible_index / self.sample_rate_hz
         end_seconds = (self.first_sample_index + self.displayed_samples - 1) / self.sample_rate_hz
         painter.drawText(
             QRectF(plot.left(), plot.bottom() + 7, plot.width() / 2, 20),

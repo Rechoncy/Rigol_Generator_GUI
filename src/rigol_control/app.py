@@ -14,7 +14,9 @@ from .ui.theme import APP_STYLE
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DG4000 与 NI DAQ 多设备控制中心")
+    parser = argparse.ArgumentParser(
+        description="DG4000、Vaunix LMS/BLX 与 NI DAQ 多设备控制中心"
+    )
     parser.add_argument("--data-dir", type=Path, help="覆盖设备配置保存目录")
     parser.add_argument(
         "--smoke-test",
@@ -26,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def create_application(argv: list[str] | None = None) -> QApplication:
     app = QApplication(argv if argv is not None else sys.argv)
-    app.setApplicationName("DG4000 NI Control Center")
+    app.setApplicationName("DG4000 Vaunix NI Control Center")
     app.setOrganizationName("RigolGeneratorControl")
     app.setStyle("Fusion")
     font_family = load_ui_font()

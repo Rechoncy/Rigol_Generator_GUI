@@ -3,6 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from .drivers.vaunix_lms import (
+    VIRTUAL_VAUNIX_RESOURCE,
+    VaunixLmsApi,
+    VaunixLmsDevice,
+)
 from .models import DeviceKind, DeviceRecord
 from .virtual_lab import VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
 
@@ -37,7 +42,7 @@ class DiscoveredResource:
 
 
 class DeviceDiscoveryService:
-    """Enumerate selectable VISA resources or NI-DAQmx devices."""
+    """Enumerate selectable VISA, NI-DAQmx, and Vaunix LMS/BLX resources."""
 
     def discover(self, kind: DeviceKind) -> list[DiscoveredResource]:
         if kind is DeviceKind.NI_DAQ:
@@ -60,6 +65,25 @@ class DeviceDiscoveryService:
                 return [virtual, *self._discover_visa()]
             except DiscoveryError:
                 return [virtual]
+        if kind is DeviceKind.VAUNIX_LMS:
+            virtual = DiscoveredResource(
+                VIRTUAL_VAUNIX_RESOURCE,
+                "内置模拟器",
+                "虚拟 Vaunix BLX-403 - 无需硬件",
+            )
+            try:
+                api = VaunixLmsApi()
+                hardware = [
+                    DiscoveredResource(
+                        descriptor.resource,
+                        "Vaunix USB DLL",
+                        f"{descriptor.model} · SN {descriptor.serial_number}",
+                    )
+                    for descriptor in api.enumerate_devices()
+                ]
+            except Exception:
+                hardware = []
+            return [virtual, *hardware]
         return self._discover_visa()
 
     @staticmethod
@@ -133,7 +157,35 @@ class DeviceProbeService:
     def probe(self, record: DeviceRecord) -> ProbeResult:
         if record.kind is DeviceKind.NI_DAQ:
             return self._probe_ni(record)
+        if record.kind is DeviceKind.VAUNIX_LMS:
+            return self._probe_vaunix(record)
         return self._probe_scpi(record)
+
+    @staticmethod
+    def _probe_vaunix(record: DeviceRecord) -> ProbeResult:
+        if record.resource.strip().upper().startswith("SIM::"):
+            return ProbeResult(
+                ProbeState.ONLINE,
+                "虚拟设备可用",
+                "Vaunix BLX-403-VIRTUAL · SN 4030001",
+            )
+        device = VaunixLmsDevice(record.resource)
+        try:
+            identity = device.connect()
+            return ProbeResult(ProbeState.ONLINE, "已连接", identity)
+        except Exception as exc:
+            message = str(exc)
+            state = (
+                ProbeState.DRIVER_MISSING
+                if "vnx_fmsynth.dll" in message or "加载 Vaunix DLL" in message
+                else ProbeState.OFFLINE
+            )
+            return ProbeResult(state, f"检测失败：{message}")
+        finally:
+            try:
+                device.disconnect()
+            except Exception:
+                pass
 
     @staticmethod
     def _probe_scpi(record: DeviceRecord) -> ProbeResult:

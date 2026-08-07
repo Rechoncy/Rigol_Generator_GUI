@@ -14,6 +14,7 @@ def utc_now() -> str:
 class DeviceKind(str, Enum):
     DG4000 = "dg4000"
     NI_DAQ = "ni_daq"
+    VAUNIX_LMS = "vaunix_lms"
     GENERIC_SCPI = "generic_scpi"
 
     @property
@@ -21,6 +22,7 @@ class DeviceKind(str, Enum):
         return {
             DeviceKind.DG4000: "RIGOL DG4000",
             DeviceKind.NI_DAQ: "NI 数据采集卡",
+            DeviceKind.VAUNIX_LMS: "Vaunix LMS/BLX",
             DeviceKind.GENERIC_SCPI: "通用 SCPI 设备",
         }[self]
 
@@ -29,6 +31,7 @@ class DeviceKind(str, Enum):
         return {
             DeviceKind.DG4000: "#18c9b8",
             DeviceKind.NI_DAQ: "#8f7cff",
+            DeviceKind.VAUNIX_LMS: "#f08ab8",
             DeviceKind.GENERIC_SCPI: "#f3a84f",
         }[self]
 
@@ -108,4 +111,3 @@ class DeviceRecord:
         )
         record.validate()
         return record
-

@@ -8,6 +8,14 @@ from .ni_analog import (
 )
 from .ni_counter import NIDaqEdgeCounter
 from .scpi import ScpiConnectionError, ScpiSession
+from .vaunix_lms import (
+    VIRTUAL_VAUNIX_RESOURCE,
+    VaunixCapabilities,
+    VaunixLmsApi,
+    VaunixLmsDevice,
+    VaunixSequenceElement,
+    VirtualVaunixLmsDevice,
+)
 
 __all__ = [
     "DG4000Driver",
@@ -19,5 +27,11 @@ __all__ = [
     "ScpiConnectionError",
     "ScpiSession",
     "StepParameter",
+    "VIRTUAL_VAUNIX_RESOURCE",
+    "VaunixCapabilities",
+    "VaunixLmsApi",
+    "VaunixLmsDevice",
+    "VaunixSequenceElement",
+    "VirtualVaunixLmsDevice",
     "save_analog_csv",
 ]

@@ -8,6 +8,7 @@ from .drivers.dg4000 import DG4000Driver
 from .drivers.ni_analog import AnalogInputConfig, NIDaqAnalogInput
 from .drivers.ni_counter import NIDaqEdgeCounter
 from .drivers.scpi import ScpiSession
+from .drivers.vaunix_lms import VaunixLmsDevice, VirtualVaunixLmsDevice
 from .models import DeviceKind, DeviceRecord
 from .services import DeviceProbeService, ProbeState
 from .virtual_lab import (
@@ -54,6 +55,9 @@ class DeviceConnectionManager:
         self._resources: dict[str, str] = {}
         self._scpi_connected: set[str] = set()
         self._ni_connected: set[str] = set()
+        self._vaunix_connected: set[str] = set()
+        self._vaunix_devices: dict[str, VaunixLmsDevice | VirtualVaunixLmsDevice] = {}
+        self._vaunix_resources: dict[str, str] = {}
         self._identities: dict[str, str] = {}
         self._leases: dict[str, str] = {}
         self._lock = RLock()
@@ -76,6 +80,20 @@ class DeviceConnectionManager:
                 self._ni_connected.add(record.id)
                 self._identities[record.id] = result.identity
             return ConnectionInfo(record.id, True, result.identity, "NI-DAQmx 已识别设备")
+
+        if record.kind is DeviceKind.VAUNIX_LMS:
+            device = self.vaunix_device_for(record)
+            with self._lock:
+                if record.id in self._vaunix_connected:
+                    return self.info(record)
+            try:
+                identity = device.connect()
+            except Exception as exc:
+                raise DeviceConnectionError(str(exc)) from exc
+            with self._lock:
+                self._vaunix_connected.add(record.id)
+                self._identities[record.id] = identity
+            return ConnectionInfo(record.id, True, identity, "Vaunix USB DLL 已连接")
 
         session = self.session_for(record)
         with self._lock:
@@ -100,6 +118,19 @@ class DeviceConnectionManager:
                 self._ni_connected.discard(record.id)
                 self._identities.pop(record.id, None)
             return ConnectionInfo(record.id, False, message="NI 逻辑连接已释放")
+        if record.kind is DeviceKind.VAUNIX_LMS:
+            with self._lock:
+                device = self._vaunix_devices.get(record.id)
+                connected = record.id in self._vaunix_connected
+            if device is not None and connected:
+                try:
+                    device.disconnect()
+                except Exception as exc:
+                    raise DeviceConnectionError(str(exc)) from exc
+            with self._lock:
+                self._vaunix_connected.discard(record.id)
+                self._identities.pop(record.id, None)
+            return ConnectionInfo(record.id, False, message="Vaunix USB 设备已关闭")
         with self._lock:
             session = self._sessions.get(record.id)
             connected = record.id in self._scpi_connected
@@ -117,6 +148,8 @@ class DeviceConnectionManager:
         with self._lock:
             if record.kind is DeviceKind.NI_DAQ:
                 connected = record.id in self._ni_connected
+            elif record.kind is DeviceKind.VAUNIX_LMS:
+                connected = record.id in self._vaunix_connected
             else:
                 connected = record.id in self._scpi_connected
             return ConnectionInfo(
@@ -162,8 +195,8 @@ class DeviceConnectionManager:
             return self._leases.get(device_id)
 
     def session_for(self, record: DeviceRecord) -> ScpiSession:
-        if record.kind is DeviceKind.NI_DAQ:
-            raise ValueError("NI DAQ 不使用 SCPI 会话")
+        if record.kind in {DeviceKind.NI_DAQ, DeviceKind.VAUNIX_LMS}:
+            raise ValueError("NI DAQ 和 Vaunix LMS/BLX 不使用 SCPI 会话")
         with self._lock:
             resource_changed = (
                 record.id in self._sessions
@@ -182,6 +215,33 @@ class DeviceConnectionManager:
         if record.kind is not DeviceKind.DG4000:
             raise ValueError("只有 DG4000 设备可创建 DG4000Driver")
         return DG4000Driver(self.session_for(record))
+
+    def vaunix_device_for(
+        self,
+        record: DeviceRecord,
+    ) -> VaunixLmsDevice | VirtualVaunixLmsDevice:
+        if record.kind is not DeviceKind.VAUNIX_LMS:
+            raise ValueError("只有 Vaunix LMS/BLX 可创建设备驱动")
+        with self._lock:
+            resource_changed = (
+                record.id in self._vaunix_devices
+                and self._vaunix_resources.get(record.id) != record.resource
+            )
+            if resource_changed and record.id in self._vaunix_connected:
+                raise DeviceBusyError("请先断开旧的 Vaunix 资源，再修改设备地址")
+            if resource_changed:
+                self._vaunix_devices.pop(record.id, None)
+                self._vaunix_resources.pop(record.id, None)
+            device = self._vaunix_devices.get(record.id)
+            if device is None:
+                device = (
+                    VirtualVaunixLmsDevice(record.resource)
+                    if is_virtual_resource(record.resource)
+                    else VaunixLmsDevice(record.resource)
+                )
+                self._vaunix_devices[record.id] = device
+                self._vaunix_resources[record.id] = record.resource
+            return device
 
     def counter_for(
         self,
@@ -237,6 +297,8 @@ class DeviceConnectionManager:
         with self._lock:
             self._sessions.pop(record.id, None)
             self._resources.pop(record.id, None)
+            self._vaunix_devices.pop(record.id, None)
+            self._vaunix_resources.pop(record.id, None)
 
     def close_all(self) -> None:
         with self._lock:
@@ -247,11 +309,22 @@ class DeviceConnectionManager:
             ]
             self._scpi_connected.clear()
             self._ni_connected.clear()
+            vaunix_devices = [
+                device
+                for device_id, device in self._vaunix_devices.items()
+                if device_id in self._vaunix_connected
+            ]
+            self._vaunix_connected.clear()
             self._identities.clear()
             self._leases.clear()
         for session in sessions:
             try:
                 session.disconnect()
+            except Exception:
+                pass
+        for device in vaunix_devices:
+            try:
+                device.disconnect()
             except Exception:
                 pass
 

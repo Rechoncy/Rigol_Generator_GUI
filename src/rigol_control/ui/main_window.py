@@ -16,8 +16,13 @@ from PyQt6.QtWidgets import (
 )
 
 from ..connections import ConnectionInfo, DeviceConnectionManager
+from ..drivers.vaunix_lms import VIRTUAL_VAUNIX_RESOURCE
 from ..models import DeviceKind, DeviceRecord
-from ..repository import DeviceRepository, DuplicateDeviceError
+from ..repository import (
+    DeviceParameterRepository,
+    DeviceRepository,
+    DuplicateDeviceError,
+)
 from ..services import DeviceProbeService, ProbeResult
 from ..virtual_lab import VIRTUAL_DG2_RESOURCE, VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
 from .device_windows import BaseDeviceWindow, create_device_window
@@ -34,6 +39,7 @@ class DeviceCenterWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.repository = repository
+        self.parameter_repository = DeviceParameterRepository(repository.data_dir)
         self.connection_manager = connection_manager or DeviceConnectionManager()
         self.probe_service = DeviceProbeService()
         self.thread_pool = QThreadPool.globalInstance()
@@ -62,7 +68,7 @@ class DeviceCenterWindow(QMainWindow):
         titles = QVBoxLayout()
         title = QLabel("设备中心")
         title.setObjectName("Title")
-        subtitle = QLabel("统一保存和打开 DG4000、NI 采集卡及其他仪器")
+        subtitle = QLabel("统一保存和打开 DG4000、Vaunix、NI 采集卡及其他仪器")
         subtitle.setObjectName("Muted")
         titles.addWidget(title)
         titles.addWidget(subtitle)
@@ -73,7 +79,7 @@ class DeviceCenterWindow(QMainWindow):
         refresh = QPushButton("刷新状态")
         refresh.clicked.connect(self.probe_all)
         virtual = QPushButton("虚拟实验室")
-        virtual.setToolTip("创建并连接两台虚拟 DG4000 和一台虚拟 NI")
+        virtual.setToolTip("创建并连接两台虚拟 DG4000、一台虚拟 NI 和一台虚拟 Vaunix")
         virtual.clicked.connect(self.create_virtual_lab)
         linkage = QPushButton("跨设备联动")
         linkage.setToolTip("使用一个 NI 触发源统一驱动多台 DG4000 的联合扫描")
@@ -101,12 +107,15 @@ class DeviceCenterWindow(QMainWindow):
         outer.addWidget(scroll, 1)
 
         footer = QHBoxLayout()
-        path = QLabel("设备列表已自动保存在本机")
+        path = QLabel("设备列表及参数已自动保存在本机")
         path.setObjectName("Muted")
-        path.setToolTip(f"保存位置：{self.repository.path}")
+        path.setToolTip(
+            f"设备列表：{self.repository.path}\n"
+            f"设备参数：{self.parameter_repository.path}"
+        )
         footer.addWidget(path)
         footer.addStretch()
-        version = QLabel("DG4000 + NI 联动控制 · v0.5.4")
+        version = QLabel("DG4000 + Vaunix + NI 联动控制 · v0.6.0")
         version.setObjectName("Muted")
         footer.addWidget(version)
         outer.addLayout(footer)
@@ -193,6 +202,11 @@ class DeviceCenterWindow(QMainWindow):
                 DeviceKind.NI_DAQ,
                 "虚拟 NI USB-6363",
                 VIRTUAL_NI_RESOURCE,
+            ),
+            (
+                DeviceKind.VAUNIX_LMS,
+                "虚拟 Vaunix BLX-403",
+                VIRTUAL_VAUNIX_RESOURCE,
             ),
         )
         virtual_ids: list[str] = []
@@ -285,6 +299,7 @@ class DeviceCenterWindow(QMainWindow):
         try:
             self.connection_manager.forget(record)
             self.repository.delete(device_id)
+            self.parameter_repository.delete(device_id)
         except Exception as exc:
             QMessageBox.warning(self, "删除失败", str(exc))
             return
@@ -311,6 +326,7 @@ class DeviceCenterWindow(QMainWindow):
             all_devices,
             self.connection_manager,
             device_provider=self.repository.list,
+            parameter_repository=self.parameter_repository,
         )
         self.open_windows[device_id] = window
         window.destroyed.connect(lambda _=None, key=device_id: self.open_windows.pop(key, None))

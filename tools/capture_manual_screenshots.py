@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from rigol_control.app import create_application
 from rigol_control.connections import DeviceConnectionManager
 from rigol_control.drivers.dg4000 import StepParameter
+from rigol_control.drivers.vaunix_lms import VIRTUAL_VAUNIX_RESOURCE
 from rigol_control.models import DeviceKind
 from rigol_control.repository import DeviceRepository
 from rigol_control.ui.dialogs import DeviceDialog
@@ -61,7 +62,7 @@ def main() -> int:
     home.create_virtual_lab()
     wait(
         app,
-        lambda: len(repository.list()) == 3
+        lambda: len(repository.list()) == 4
         and all(manager.is_connected(record) for record in repository.list()),
     )
     capture(home, "01-device-center.png", app)
@@ -76,13 +77,24 @@ def main() -> int:
     dg = next(record for record in records if record.resource == VIRTUAL_DG_RESOURCE)
     ni = next(record for record in records if record.resource == VIRTUAL_NI_RESOURCE)
     dg2 = next(record for record in records if record.resource == VIRTUAL_DG2_RESOURCE)
+    vaunix = next(
+        record for record in records if record.resource == VIRTUAL_VAUNIX_RESOURCE
+    )
     home.open_device(dg.id)
     home.open_device(ni.id)
-    wait(app, lambda: dg.id in home.open_windows and ni.id in home.open_windows)
+    home.open_device(vaunix.id)
+    wait(
+        app,
+        lambda: dg.id in home.open_windows
+        and ni.id in home.open_windows
+        and vaunix.id in home.open_windows,
+    )
     dg_window = home.open_windows[dg.id]
     ni_window = home.open_windows[ni.id]
+    vaunix_window = home.open_windows[vaunix.id]
     dg_window.resize(1180, 760)
     ni_window.resize(1180, 760)
+    vaunix_window.resize(1180, 760)
 
     dg_window._select_page(0)
     capture(dg_window, "03-virtual-dg-overview.png", app)
@@ -92,6 +104,10 @@ def main() -> int:
     capture(dg_window, "10-system-impedance.png", app)
     ni_window._select_page(0)
     capture(ni_window, "05-virtual-ni-trigger-console.png", app)
+    vaunix_window._select_page(2)
+    capture(vaunix_window, "11-vaunix-sweep-chirp.png", app)
+    vaunix_window._select_page(5)
+    capture(vaunix_window, "12-vaunix-ni-frequency-power-step.png", app)
 
     dg_window._select_page(4)
     dg_window._add_scan_axis()
