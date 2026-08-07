@@ -1108,7 +1108,7 @@ class DG4000Window(BaseDeviceWindow):
             ":SOUR1:SWE:STAT ON",
         ]
         self.submit(
-            lambda: self.driver.write_many(commands),
+            lambda: self.driver.write_settings(commands),
             on_success=lambda _=None: self.statusBar().showMessage("CH1 扫频已启用", 4000),
         )
 
@@ -1130,7 +1130,7 @@ class DG4000Window(BaseDeviceWindow):
             ":SOUR1:BURS ON",
         ]
         self.submit(
-            lambda: self.driver.write_many(commands),
+            lambda: self.driver.write_settings(commands),
             on_success=lambda _=None: self.statusBar().showMessage("CH1 脉冲串已启用", 4000),
         )
 
@@ -2065,7 +2065,7 @@ class DG4000Window(BaseDeviceWindow):
             for channel in (1, 2)
         )
         self.submit(
-            lambda: self.driver.write_many(commands),
+            lambda: self.driver.write_settings(commands),
             on_success=lambda _=None: self.statusBar().showMessage(
                 "CH1/CH2 负载阻抗已同时下发", 5000
             ),

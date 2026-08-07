@@ -11,7 +11,7 @@ from rigol_control.drivers.dg4000 import (
     parse_output_state,
 )
 from rigol_control.scan import ScanAxis, ScanMode, generate_scan_points
-from rigol_control.drivers.scpi import ScpiSession
+from rigol_control.drivers.scpi import ScpiError, ScpiSession
 from rigol_control.trigger import ControllerState, TriggerStepController
 
 
@@ -92,6 +92,41 @@ def wait_until(predicate, timeout: float = 1.0) -> bool:
 
 
 class ScpiDriverTests(unittest.TestCase):
+    def test_idempotent_settings_reconnect_once_after_transient_io_failure(self) -> None:
+        class FailingWriteBackend(FakeScpiBackend):
+            def write(self, command: str) -> None:
+                raise OSError("simulated USB transport loss")
+
+        backends = []
+
+        def factory(_resource, _timeout):
+            backend = FailingWriteBackend() if not backends else FakeScpiBackend()
+            backends.append(backend)
+            return backend
+
+        driver = DG4000Driver(ScpiSession("USB0::TEST", backend_factory=factory))
+        driver.connect()
+        driver.configure_basic(1, BasicWaveform("SIN", 1000, 1.0))
+        self.assertEqual(len(backends), 2)
+        self.assertTrue(backends[0].closed)
+        self.assertEqual(backends[1].queries, ["*IDN?"])
+        self.assertEqual(backends[1].writes[0], ":SOUR1:FUNC SIN")
+
+        raw_backends = []
+
+        def raw_factory(_resource, _timeout):
+            backend = FailingWriteBackend()
+            raw_backends.append(backend)
+            return backend
+
+        raw_driver = DG4000Driver(
+            ScpiSession("USB0::RAW", backend_factory=raw_factory)
+        )
+        raw_driver.connect()
+        with self.assertRaisesRegex(ScpiError, "simulated USB transport loss"):
+            raw_driver.write("*TRG")
+        self.assertEqual(len(raw_backends), 1)
+
     def test_session_serializes_typed_and_raw_commands(self) -> None:
         backend = FakeScpiBackend()
         session = ScpiSession("USB0::TEST", backend_factory=lambda resource, timeout: backend)

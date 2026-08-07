@@ -363,7 +363,8 @@ class UiSmokeTests(unittest.TestCase):
             def disconnect(self):
                 self.is_connected = False
 
-            def query(self, command):
+            def query(self, command, *, recover=False):
+                del recover
                 if command == "*IDN?":
                     return "RIGOL,DG4162,TEST,1.0"
                 if command == ":OUTP1?":
@@ -372,11 +373,11 @@ class UiSmokeTests(unittest.TestCase):
                     return "0"
                 return "0"
 
-            def write(self, command):
-                pass
+            def write(self, command, *, recover=False):
+                del command, recover
 
-            def write_many(self, commands):
-                pass
+            def write_many(self, commands, *, recover=False):
+                del commands, recover
 
         manager = DeviceConnectionManager(session_factory=FakeSession)
         home = DeviceCenterWindow(self.repository, manager)

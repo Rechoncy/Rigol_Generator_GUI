@@ -6,7 +6,7 @@ from enum import Enum
 from .drivers.vaunix_lms import (
     VIRTUAL_VAUNIX_RESOURCE,
     VaunixLmsApi,
-    VaunixLmsDevice,
+    format_dll_version,
 )
 from .models import DeviceKind, DeviceRecord
 from .virtual_lab import VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
@@ -169,10 +169,30 @@ class DeviceProbeService:
                 "虚拟设备可用",
                 "Vaunix BLX-403-VIRTUAL · SN 4030001",
             )
-        device = VaunixLmsDevice(record.resource)
         try:
-            identity = device.connect()
-            return ProbeResult(ProbeState.ONLINE, "已连接", identity)
+            api = VaunixLmsApi()
+            descriptor = next(
+                (
+                    item
+                    for item in api.enumerate_devices()
+                    if item.resource.casefold() == record.resource.strip().casefold()
+                ),
+                None,
+            )
+            if descriptor is None:
+                return ProbeResult(
+                    ProbeState.OFFLINE,
+                    "检测失败：当前枚举结果中没有该序列号",
+                )
+            identity = (
+                f"Vaunix {descriptor.model} · SN {descriptor.serial_number} · "
+                f"DLL {format_dll_version(api.dll_version)}"
+            )
+            return ProbeResult(
+                ProbeState.ONLINE,
+                "已枚举设备（探测不会打开或关闭设备句柄）",
+                identity,
+            )
         except Exception as exc:
             message = str(exc)
             state = (
@@ -181,11 +201,6 @@ class DeviceProbeService:
                 else ProbeState.OFFLINE
             )
             return ProbeResult(state, f"检测失败：{message}")
-        finally:
-            try:
-                device.disconnect()
-            except Exception:
-                pass
 
     @staticmethod
     def _probe_scpi(record: DeviceRecord) -> ProbeResult:

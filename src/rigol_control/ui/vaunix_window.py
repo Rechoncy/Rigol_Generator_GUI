@@ -745,10 +745,12 @@ class VaunixLmsWindow(BaseDeviceWindow):
         internal_ref = bool(self.output_reference.currentData())
 
         def apply() -> None:
-            self.device.set_internal_reference(internal_ref)
-            self.device.set_frequency_hz(frequency)
-            self.device.set_power_dbm(power)
-            self.device.set_rf_on(rf_on)
+            self.device.configure_output(
+                frequency_hz=frequency,
+                power_dbm=power,
+                rf_on=rf_on,
+                internal_reference=internal_ref,
+            )
 
         self.submit(
             apply,

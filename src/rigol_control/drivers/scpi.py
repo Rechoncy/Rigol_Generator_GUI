@@ -66,11 +66,13 @@ class ScpiSession:
         self,
         resource: str,
         *,
-        timeout_ms: int = 2000,
+        timeout_ms: int = 5000,
+        recovery_attempts: int = 1,
         backend_factory: BackendFactory = VisaBackend,
     ) -> None:
         self.resource = resource
         self.timeout_ms = timeout_ms
+        self.recovery_attempts = 1 if int(recovery_attempts) > 0 else 0
         self._backend_factory = backend_factory
         self._backend: ScpiBackend | None = None
         self._lock = RLock()
@@ -95,29 +97,77 @@ class ScpiSession:
         with self._lock:
             self._close_locked()
 
-    def write(self, command: str) -> None:
+    def write(self, command: str, *, recover: bool = False) -> None:
         normalized = self._normalize(command)
         with self._lock:
-            backend = self._require_backend()
-            try:
-                backend.write(normalized)
-            except Exception as exc:
-                raise ScpiError(f"SCPI 写入失败 [{normalized}]：{exc}") from exc
+            self._write_locked(normalized, recover=recover)
 
-    def write_many(self, commands: Iterable[str]) -> None:
+    def write_many(self, commands: Iterable[str], *, recover: bool = False) -> None:
         normalized = [self._normalize(command) for command in commands]
         with self._lock:
-            backend = self._require_backend()
             for command in normalized:
-                try:
-                    backend.write(command)
-                except Exception as exc:
-                    raise ScpiError(f"SCPI 批量写入失败 [{command}]：{exc}") from exc
+                self._write_locked(command, recover=recover, batch=True)
 
-    def query(self, command: str) -> str:
+    def query(self, command: str, *, recover: bool = False) -> str:
         normalized = self._normalize(command)
         with self._lock:
-            return self._query_locked(normalized)
+            try:
+                return self._query_locked(normalized)
+            except ScpiError as first_error:
+                if not recover or self.recovery_attempts < 1:
+                    raise
+                self._recover_locked(normalized, first_error)
+                try:
+                    return self._query_locked(normalized)
+                except ScpiError as retry_error:
+                    raise ScpiError(
+                        f"SCPI 查询在自动重连后仍失败 [{normalized}]：{retry_error}"
+                    ) from retry_error
+
+    def _write_locked(
+        self,
+        command: str,
+        *,
+        recover: bool,
+        batch: bool = False,
+    ) -> None:
+        backend = self._require_backend()
+        try:
+            backend.write(command)
+            return
+        except Exception as exc:
+            label = "批量写入" if batch else "写入"
+            first_exception = exc
+            first_error = ScpiError(f"SCPI {label}失败 [{command}]：{exc}")
+        if not recover or self.recovery_attempts < 1:
+            raise first_error from first_exception
+        self._recover_locked(command, first_error)
+        try:
+            self._require_backend().write(command)
+        except Exception as retry_exc:
+            raise ScpiError(
+                f"SCPI 写入在自动重连后仍失败 [{command}]：{retry_exc}"
+            ) from retry_exc
+
+    def _recover_locked(self, command: str, first_error: Exception) -> None:
+        old_backend, self._backend = self._backend, None
+        if old_backend is not None:
+            try:
+                old_backend.close()
+            except Exception:
+                pass
+        try:
+            backend = self._backend_factory(self.resource, self.timeout_ms)
+            self._backend = backend
+            identity = str(backend.query("*IDN?")).strip()
+            if not identity:
+                raise ScpiConnectionError("自动重连后 *IDN? 返回为空")
+        except Exception as recovery_exc:
+            self._close_locked_safely()
+            raise ScpiConnectionError(
+                f"SCPI 通信失败 [{command}]，自动重连也失败：{recovery_exc}；"
+                f"原始错误：{first_error}"
+            ) from recovery_exc
 
     def _query_locked(self, command: str) -> str:
         backend = self._require_backend()
@@ -139,6 +189,14 @@ class ScpiSession:
             except Exception as exc:
                 raise ScpiError(f"关闭 VISA 会话失败：{exc}") from exc
 
+    def _close_locked_safely(self) -> None:
+        backend, self._backend = self._backend, None
+        if backend is not None:
+            try:
+                backend.close()
+            except Exception:
+                pass
+
     @staticmethod
     def _normalize(command: str) -> str:
         normalized = command.strip()
@@ -147,4 +205,3 @@ class ScpiSession:
         if "\n" in normalized or "\r" in normalized:
             raise ValueError("单条 SCPI 命令不能包含换行")
         return normalized
-

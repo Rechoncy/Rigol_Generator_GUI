@@ -18,6 +18,11 @@ MAX_SEQUENCE_ENTRIES = 50
 POWER_ENCODING_DB = 0.25
 POWER_RESOLUTION_DB = 0.5
 VIRTUAL_VAUNIX_RESOURCE = "SIM::VAUNIX_LMS::1"
+_VAUNIX_DLL_LOCK = RLock()
+_TRANSIENT_STATUS_CODES = {0x80020000, 0xFFFF0002}
+_NOT_READY_STATUS_CODES = {0x80030000, 0xFFFF0003}
+_HID_RETRY_ATTEMPTS = 2
+_HID_RETRY_DELAY_SECONDS = 0.02
 
 DEV_CONNECTED = 0x00000001
 DEV_OPENED = 0x00000002
@@ -157,9 +162,13 @@ class VaunixLmsApi:
             self.dll = ctypes.CDLL(str(self.dll_path))
         except OSError as exc:
             raise VaunixLmsError(f"无法加载 Vaunix DLL：{exc}") from exc
-        self._lock = RLock()
-        self._configure_prototypes()
-        self.dll.fnLMS_SetTestMode(False)
+        # vnx_fmsynth.dll owns process-global USB state. Discovery, probing and
+        # connected devices must therefore share one lock even when represented
+        # by different Python API objects.
+        self._lock = _VAUNIX_DLL_LOCK
+        with self._lock:
+            self._configure_prototypes()
+            self.dll.fnLMS_SetTestMode(False)
 
     def _configure_prototypes(self) -> None:
         d = self.dll
@@ -249,7 +258,8 @@ class VaunixLmsApi:
 
     @property
     def dll_version(self) -> int:
-        return int(self.dll.fnLMS_GetDLLVersion())
+        with self._lock:
+            return int(self.dll.fnLMS_GetDLLVersion())
 
     def enumerate_devices(self) -> tuple[VaunixDeviceDescriptor, ...]:
         with self._lock:
@@ -326,10 +336,11 @@ class VaunixLmsDevice:
             )
             if descriptor is None:
                 raise VaunixLmsError(f"未发现序列号为 {serial} 的 Vaunix LMS/BLX")
-            _check_set_status(
-                "fnLMS_InitDevice",
-                api.dll.fnLMS_InitDevice(descriptor.device_id),
-            )
+            with api._lock:
+                _check_set_status(
+                    "fnLMS_InitDevice",
+                    api.dll.fnLMS_InitDevice(descriptor.device_id),
+                )
             self._api = api
             self._device_id = descriptor.device_id
             self._descriptor = descriptor
@@ -351,7 +362,8 @@ class VaunixLmsDevice:
                     is_blx=descriptor.model.upper().startswith("BLX"),
                 )
             except Exception:
-                api.dll.fnLMS_CloseDevice(descriptor.device_id)
+                with api._lock:
+                    api.dll.fnLMS_CloseDevice(descriptor.device_id)
                 self._api = None
                 self._device_id = None
                 self._descriptor = None
@@ -367,8 +379,10 @@ class VaunixLmsDevice:
         with self._lock:
             if self._device_id is None or self._api is None:
                 return
-            status = self._api.dll.fnLMS_CloseDevice(self._device_id)
+            with self._api._lock:
+                status = self._api.dll.fnLMS_CloseDevice(self._device_id)
             _check_set_status("fnLMS_CloseDevice", status)
+            self._api = None
             self._device_id = None
             self._descriptor = None
             self._capabilities = None
@@ -399,6 +413,35 @@ class VaunixLmsDevice:
 
     def set_internal_reference(self, enabled: bool) -> None:
         self._set("fnLMS_SetUseInternalRef", bool(enabled))
+
+    def configure_output(
+        self,
+        *,
+        frequency_hz: float,
+        power_dbm: float,
+        rf_on: bool,
+        internal_reference: bool,
+    ) -> None:
+        """Apply one output state as a DLL-serialized, preflighted operation."""
+
+        frequency = _finite(frequency_hz, "输出频率")
+        power = validate_power_dbm(power_dbm, "输出功率")
+        caps = self.capabilities
+        if not caps.minimum_frequency_hz <= frequency <= caps.maximum_frequency_hz:
+            raise ValueError(
+                f"输出频率必须在 {caps.minimum_frequency_hz:g} 至 "
+                f"{caps.maximum_frequency_hz:g} Hz 之间"
+            )
+        if not caps.minimum_power_dbm <= power <= caps.maximum_power_dbm:
+            raise ValueError(
+                f"输出功率必须在 {caps.minimum_power_dbm:g} 至 "
+                f"{caps.maximum_power_dbm:g} dBm 之间"
+            )
+        with self._lock:
+            self._set("fnLMS_SetUseInternalRef", bool(internal_reference))
+            self._set("fnLMS_SetFrequencyEx", _frequency_units(frequency))
+            self._set("fnLMS_SetPowerLevel", _power_units(power, "输出功率"))
+            self._set("fnLMS_SetRFOn", bool(rf_on))
 
     def configure_sweep(
         self,
@@ -703,27 +746,53 @@ class VaunixLmsDevice:
     def _set(self, function_name: str, *args: Any) -> None:
         with self._lock:
             api, device_id = self._require()
-            status = getattr(api.dll, function_name)(device_id, *args)
-            _check_set_status(function_name, status)
+            with api._lock:
+                for attempt in range(_HID_RETRY_ATTEMPTS + 1):
+                    status = getattr(api.dll, function_name)(device_id, *args)
+                    code = _unsigned_32(status)
+                    if code == 0:
+                        return
+                    if attempt < _HID_RETRY_ATTEMPTS and code in _TRANSIENT_STATUS_CODES:
+                        time.sleep(_HID_RETRY_DELAY_SECONDS)
+                        continue
+                    if attempt < _HID_RETRY_ATTEMPTS and code in _NOT_READY_STATUS_CODES:
+                        init_status = api.dll.fnLMS_InitDevice(device_id)
+                        if _unsigned_32(init_status) == 0:
+                            time.sleep(_HID_RETRY_DELAY_SECONDS)
+                            continue
+                    _check_set_status(function_name, status)
 
     def _get_int(self, function_name: str, *args: Any) -> int:
         api, device_id = self._require()
-        value = int(getattr(api.dll, function_name)(device_id, *args))
-        _raise_get_error(function_name, value)
-        return value
+        with api._lock:
+            for attempt in range(_HID_RETRY_ATTEMPTS + 1):
+                value = int(getattr(api.dll, function_name)(device_id, *args))
+                code = _unsigned_32(value)
+                if code not in _TRANSIENT_STATUS_CODES | _NOT_READY_STATUS_CODES:
+                    _raise_get_error(function_name, value)
+                    return value
+                if attempt < _HID_RETRY_ATTEMPTS and code in _TRANSIENT_STATUS_CODES:
+                    time.sleep(_HID_RETRY_DELAY_SECONDS)
+                    continue
+                if attempt < _HID_RETRY_ATTEMPTS and code in _NOT_READY_STATUS_CODES:
+                    init_status = api.dll.fnLMS_InitDevice(device_id)
+                    if _unsigned_32(init_status) == 0:
+                        time.sleep(_HID_RETRY_DELAY_SECONDS)
+                        continue
+                _raise_get_error(function_name, value)
+        raise AssertionError("Vaunix integer read retry loop exited unexpectedly")
 
     def _get_frequency(self, function_name: str, *args: Any) -> float:
-        api, device_id = self._require()
-        value = int(getattr(api.dll, function_name)(device_id, *args))
-        _raise_get_error(function_name, value)
-        return float(value) * 10.0
+        value = self._get_int(function_name, *args)
+        return float(_unsigned_32(value)) * 10.0
 
     def _get_float(self, function_name: str, *args: Any) -> float:
         api, device_id = self._require()
-        value = float(getattr(api.dll, function_name)(device_id, *args))
-        if value in {-1.0, -3.0, -4.0}:
-            raise VaunixLmsError(f"{function_name} 返回错误 {value:g}")
-        return value
+        with api._lock:
+            value = float(getattr(api.dll, function_name)(device_id, *args))
+            if value in {-1.0, -3.0, -4.0}:
+                raise VaunixLmsError(f"{function_name} 返回错误 {value:g}")
+            return value
 
 
 class VirtualVaunixLmsDevice:
@@ -825,6 +894,29 @@ class VirtualVaunixLmsDevice:
     def set_internal_reference(self, enabled: bool) -> None:
         self._delay()
         self.internal_reference = bool(enabled)
+
+    def configure_output(
+        self,
+        *,
+        frequency_hz: float,
+        power_dbm: float,
+        rf_on: bool,
+        internal_reference: bool,
+    ) -> None:
+        with self._lock:
+            self._delay()
+            frequency = _finite(frequency_hz, "输出频率")
+            power = validate_power_dbm(power_dbm, "输出功率")
+            if not self._caps.minimum_frequency_hz <= frequency <= self._caps.maximum_frequency_hz:
+                raise ValueError("输出频率超出虚拟设备范围")
+            if not self._caps.minimum_power_dbm <= power <= self._caps.maximum_power_dbm:
+                raise ValueError("输出功率超出虚拟设备范围")
+            self.internal_reference = bool(internal_reference)
+            self.frequency_hz = round(frequency / 10.0) * 10.0
+            self.power_dbm = (
+                round(power / POWER_RESOLUTION_DB) * POWER_RESOLUTION_DB
+            )
+            self.rf_on = bool(rf_on)
 
     def configure_sweep(self, **settings: Any) -> None:
         self._delay()

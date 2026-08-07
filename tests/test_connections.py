@@ -22,15 +22,17 @@ class FakeSession:
         self.disconnect_count += 1
         self.is_connected = False
 
-    def write(self, command: str) -> None:
+    def write(self, command: str, *, recover: bool = False) -> None:
+        del recover
         if not self.is_connected:
             raise RuntimeError("not connected")
 
-    def write_many(self, commands) -> None:
+    def write_many(self, commands, *, recover: bool = False) -> None:
         for command in commands:
-            self.write(command)
+            self.write(command, recover=recover)
 
-    def query(self, command: str) -> str:
+    def query(self, command: str, *, recover: bool = False) -> str:
+        del command, recover
         if not self.is_connected:
             raise RuntimeError("not connected")
         return "RIGOL,DG4162,TEST,1.0"

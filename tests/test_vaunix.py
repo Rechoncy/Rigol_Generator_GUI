@@ -1,11 +1,14 @@
 import time
 import unittest
+from threading import RLock
 
 from rigol_control.drivers.dg4000 import StepParameter, StepValue
 from rigol_control.drivers.vaunix_lms import (
     PAUSE_SEQUENCE,
     REPEAT_SEQUENCE,
     VIRTUAL_VAUNIX_RESOURCE,
+    VaunixCapabilities,
+    VaunixLmsDevice,
     VaunixSequenceElement,
     VirtualVaunixLmsDevice,
     _power_units,
@@ -18,6 +21,45 @@ from rigol_control.virtual_lab import VIRTUAL_NI_RESOURCE, VirtualLab
 
 
 class VaunixVirtualDeviceTests(unittest.TestCase):
+    def test_real_driver_retries_transient_hid_status_without_fixed_delay(self) -> None:
+        class FakeDll:
+            def __init__(self) -> None:
+                self.frequency_calls = 0
+                self.init_calls = 0
+
+            def fnLMS_SetFrequencyEx(self, _device_id, _frequency) -> int:
+                self.frequency_calls += 1
+                return 0x80020000 if self.frequency_calls == 1 else 0
+
+            def fnLMS_InitDevice(self, _device_id) -> int:
+                self.init_calls += 1
+                return 0
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.dll = FakeDll()
+                self._lock = RLock()
+
+        api = FakeApi()
+        device = VaunixLmsDevice("VAUNIX::LMS::123")
+        device._api = api
+        device._device_id = 7
+        device._capabilities = VaunixCapabilities(
+            model="LMS-TEST",
+            serial_number=123,
+            dll_version=0x010F,
+            minimum_frequency_hz=1e9,
+            maximum_frequency_hz=20e9,
+            minimum_power_dbm=-40.0,
+            maximum_power_dbm=10.0,
+            has_fast_pulse=False,
+            has_chirp=False,
+            is_blx=False,
+        )
+        device.set_frequency_hz(5e9)
+        self.assertEqual(api.dll.frequency_calls, 2)
+        self.assertEqual(api.dll.init_calls, 0)
+
     def test_sdk_version_uses_packed_decimal_minor_byte(self) -> None:
         self.assertEqual(format_dll_version(0x010F), "1.15")
 

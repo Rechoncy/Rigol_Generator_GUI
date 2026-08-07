@@ -160,8 +160,19 @@ class DG4000Driver:
     def write_many(self, commands: list[str] | tuple[str, ...]) -> None:
         self.session.write_many(commands)
 
+    def write_settings(self, commands: list[str] | tuple[str, ...]) -> None:
+        """Write idempotent settings with one automatic VISA recovery attempt."""
+        self.session.write_many(commands, recover=True)
+
     def query(self, command: str) -> str:
-        return self.session.query(command)
+        return self.session.query(command, recover=self.session.is_connected)
+
+    def _write_configuration(self, command: str) -> None:
+        """Retry an idempotent setting once after a transient VISA failure."""
+        self.session.write(command, recover=True)
+
+    def _write_configuration_many(self, commands: list[str]) -> None:
+        self.write_settings(commands)
 
     def identify(self) -> str:
         return self.query("*IDN?")
@@ -171,7 +182,7 @@ class DG4000Driver:
 
     def set_output(self, channel: int, enabled: bool) -> None:
         validate_channel(channel)
-        self.write(f":OUTP{channel} {'ON' if enabled else 'OFF'}")
+        self._write_configuration(f":OUTP{channel} {'ON' if enabled else 'OFF'}")
 
     def output_enabled(self, channel: int) -> bool:
         validate_channel(channel)
@@ -182,10 +193,12 @@ class DG4000Driver:
 
     def set_output_load(self, channel: int, load_ohms: int | None) -> None:
         validate_channel(channel)
-        self.write(f":OUTP{channel}:LOAD {output_load_value(load_ohms)}")
+        self._write_configuration(
+            f":OUTP{channel}:LOAD {output_load_value(load_ohms)}"
+        )
 
     def configure_basic(self, channel: int, waveform: BasicWaveform) -> None:
-        self.session.write_many(self._basic_commands(channel, waveform))
+        self._write_configuration_many(self._basic_commands(channel, waveform))
 
     def configure_waveform_output(
         self,
@@ -196,7 +209,7 @@ class DG4000Driver:
     ) -> None:
         """Apply waveform and output state without changing the configured load."""
 
-        self.session.write_many(
+        self._write_configuration_many(
             [
                 *self._basic_commands(channel, waveform),
                 f":OUTP{channel} {'ON' if enabled else 'OFF'}",
@@ -226,7 +239,7 @@ class DG4000Driver:
     ) -> None:
         """Apply load, waveform and output state as one serialized SCPI batch."""
 
-        self.session.write_many(
+        self._write_configuration_many(
             [
                 f":OUTP{channel}:LOAD {output_load_value(load_ohms)}",
                 *self._basic_commands(channel, waveform),
@@ -285,15 +298,17 @@ class DG4000Driver:
                     f":SOUR{channel}:MOD:{mode}:{parameter_word} {finite_number(parameter)}"
                 )
         commands.append(f":SOUR{channel}:MOD {'ON' if enabled else 'OFF'}")
-        self.session.write_many(commands)
+        self._write_configuration_many(commands)
 
     def apply_step(self, parameter: StepParameter, channel: int, value: float) -> None:
-        self.write(f"{parameter.command(channel)} {finite_number(value)}")
+        self._write_configuration(
+            f"{parameter.command(channel)} {finite_number(value)}"
+        )
 
     def apply_steps(self, values: list[StepValue] | tuple[StepValue, ...]) -> None:
         if not values:
             raise ValueError("联合扫描点至少需要一个参数")
-        self.write_many(
+        self._write_configuration_many(
             [
                 f"{item.parameter.command(item.channel)} {finite_number(item.value)}"
                 for item in values

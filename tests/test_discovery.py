@@ -2,8 +2,8 @@ import unittest
 from unittest.mock import patch
 
 from rigol_control.drivers.vaunix_lms import VIRTUAL_VAUNIX_RESOURCE
-from rigol_control.models import DeviceKind
-from rigol_control.services import DeviceDiscoveryService
+from rigol_control.models import DeviceKind, DeviceRecord
+from rigol_control.services import DeviceDiscoveryService, DeviceProbeService, ProbeState
 
 
 class DeviceDiscoveryTests(unittest.TestCase):
@@ -45,6 +45,30 @@ class DeviceDiscoveryTests(unittest.TestCase):
             resources = DeviceDiscoveryService().discover(DeviceKind.VAUNIX_LMS)
 
         self.assertEqual([item.resource for item in resources], [VIRTUAL_VAUNIX_RESOURCE])
+
+    def test_vaunix_probe_only_enumerates_and_never_opens_device(self) -> None:
+        class Descriptor:
+            resource = "VAUNIX::LMS::4210123"
+            model = "LMS-421D"
+            serial_number = 4210123
+
+        class FakeApi:
+            dll_version = 0x010F
+
+            def enumerate_devices(self):
+                return (Descriptor(),)
+
+        record = DeviceRecord.create(
+            kind=DeviceKind.VAUNIX_LMS,
+            name="Vaunix",
+            resource="VAUNIX::LMS::4210123",
+        )
+        with patch("rigol_control.services.VaunixLmsApi", return_value=FakeApi()):
+            result = DeviceProbeService().probe(record)
+
+        self.assertEqual(result.state, ProbeState.ONLINE)
+        self.assertIn("不会打开或关闭设备句柄", result.message)
+        self.assertIn("DLL 1.15", result.identity)
 
 
 if __name__ == "__main__":

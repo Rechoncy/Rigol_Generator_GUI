@@ -246,18 +246,21 @@ class VirtualScpiSession:
         with self._lock:
             self._generator.connected = False
 
-    def write(self, command: str) -> None:
+    def write(self, command: str, *, recover: bool = False) -> None:
+        del recover
         with self._lock:
             self._require_connection()
             self._generator.write(command)
 
-    def write_many(self, commands) -> None:
+    def write_many(self, commands, *, recover: bool = False) -> None:
+        del recover
         with self._lock:
             self._require_connection()
             for command in commands:
                 self._generator.write(command)
 
-    def query(self, command: str) -> str:
+    def query(self, command: str, *, recover: bool = False) -> str:
+        del recover
         with self._lock:
             self._require_connection()
             return self._generator.query(command)

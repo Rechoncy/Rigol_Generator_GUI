@@ -149,9 +149,25 @@ class DeviceConnectionManager:
             if record.kind is DeviceKind.NI_DAQ:
                 connected = record.id in self._ni_connected
             elif record.kind is DeviceKind.VAUNIX_LMS:
-                connected = record.id in self._vaunix_connected
+                device = self._vaunix_devices.get(record.id)
+                connected = (
+                    record.id in self._vaunix_connected
+                    and device is not None
+                    and device.is_connected
+                )
+                if not connected:
+                    self._vaunix_connected.discard(record.id)
+                    self._identities.pop(record.id, None)
             else:
-                connected = record.id in self._scpi_connected
+                session = self._sessions.get(record.id)
+                connected = (
+                    record.id in self._scpi_connected
+                    and session is not None
+                    and session.is_connected
+                )
+                if not connected:
+                    self._scpi_connected.discard(record.id)
+                    self._identities.pop(record.id, None)
             return ConnectionInfo(
                 record.id,
                 connected,
