@@ -230,6 +230,7 @@ class VirtualScpiSession:
     def __init__(self, generator: VirtualGenerator) -> None:
         self.resource = generator.resource
         self._generator = generator
+        self._identity = ""
         self._lock = RLock()
 
     @property
@@ -237,14 +238,21 @@ class VirtualScpiSession:
         with self._lock:
             return self._generator.connected
 
+    @property
+    def identity(self) -> str:
+        with self._lock:
+            return self._identity
+
     def connect(self) -> str:
         with self._lock:
             self._generator.connected = True
-            return self._generator.query("*IDN?")
+            self._identity = self._generator.query("*IDN?")
+            return self._identity
 
     def disconnect(self) -> None:
         with self._lock:
             self._generator.connected = False
+            self._identity = ""
 
     def write(self, command: str, *, recover: bool = False) -> None:
         del recover
@@ -263,7 +271,10 @@ class VirtualScpiSession:
         del recover
         with self._lock:
             self._require_connection()
-            return self._generator.query(command)
+            result = self._generator.query(command)
+            if command.strip().upper() == "*IDN?":
+                self._identity = result
+            return result
 
     def _require_connection(self) -> None:
         if not self._generator.connected:

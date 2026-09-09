@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from threading import RLock
 
 from .drivers.dg4000 import DG4000Driver
+from .drivers.newport_smc100 import Smc100Device, VirtualSmc100Device, parse_resource
 from .drivers.ni_analog import AnalogInputConfig, NIDaqAnalogInput
 from .drivers.ni_counter import NIDaqEdgeCounter
 from .drivers.scpi import ScpiSession
@@ -60,9 +61,25 @@ class DeviceConnectionManager:
         self._vaunix_resources: dict[str, str] = {}
         self._identities: dict[str, str] = {}
         self._leases: dict[str, str] = {}
+        self._newport_devices: dict[str, Smc100Device | VirtualSmc100Device] = {}
+        self._newport_connecting: set[str] = set()
         self._lock = RLock()
 
     def connect(self, record: DeviceRecord) -> ConnectionInfo:
+        if record.kind is DeviceKind.NEWPORT_SMC100:
+            with self._lock:
+                device = self.newport_device_for(record)
+                if record.id in self._newport_connecting:
+                    raise DeviceBusyError("Newport 正在连接")
+                self._newport_connecting.add(record.id)
+            try:
+                identity = device.connect()
+                with self._lock:
+                    self._identities[record.id] = identity
+                return ConnectionInfo(record.id, True, identity, "Newport 串口已连接")
+            finally:
+                with self._lock:
+                    self._newport_connecting.discard(record.id)
         if record.kind is DeviceKind.NI_DAQ:
             with self._lock:
                 if record.id in self._ni_connected:
@@ -84,8 +101,10 @@ class DeviceConnectionManager:
         if record.kind is DeviceKind.VAUNIX_LMS:
             device = self.vaunix_device_for(record)
             with self._lock:
-                if record.id in self._vaunix_connected:
+                if record.id in self._vaunix_connected and device.is_connected:
                     return self.info(record)
+                self._vaunix_connected.discard(record.id)
+                self._identities.pop(record.id, None)
             try:
                 identity = device.connect()
             except Exception as exc:
@@ -113,6 +132,15 @@ class DeviceConnectionManager:
             owner = self._leases.get(record.id)
         if owner is not None:
             raise DeviceBusyError(f"设备“{record.name}”正被联动任务占用，停止任务后才能断开")
+        if record.kind is DeviceKind.NEWPORT_SMC100:
+            with self._lock:
+                if record.id in self._newport_connecting:
+                    raise DeviceBusyError("Newport 正在连接，请等待操作完成")
+                device = self._newport_devices.get(record.id)
+                if device is not None:
+                    device.disconnect()
+                self._identities.pop(record.id, None)
+            return ConnectionInfo(record.id, False, message="Newport 已断开")
         if record.kind is DeviceKind.NI_DAQ:
             with self._lock:
                 self._ni_connected.discard(record.id)
@@ -127,6 +155,10 @@ class DeviceConnectionManager:
                     device.disconnect()
                 except Exception as exc:
                     raise DeviceConnectionError(str(exc)) from exc
+                finally:
+                    with self._lock:
+                        self._vaunix_connected.discard(record.id)
+                        self._identities.pop(record.id, None)
             with self._lock:
                 self._vaunix_connected.discard(record.id)
                 self._identities.pop(record.id, None)
@@ -148,6 +180,11 @@ class DeviceConnectionManager:
         with self._lock:
             if record.kind is DeviceKind.NI_DAQ:
                 connected = record.id in self._ni_connected
+            elif record.kind is DeviceKind.NEWPORT_SMC100:
+                device = self._newport_devices.get(record.id)
+                connected = device is not None and device.is_connected
+                if not connected:
+                    self._identities.pop(record.id, None)
             elif record.kind is DeviceKind.VAUNIX_LMS:
                 device = self._vaunix_devices.get(record.id)
                 connected = (
@@ -210,9 +247,14 @@ class DeviceConnectionManager:
         with self._lock:
             return self._leases.get(device_id)
 
+    def active_leases(self) -> dict[str, str]:
+        """Snapshot used to prevent configuration replacement during hardware work."""
+        with self._lock:
+            return dict(self._leases)
+
     def session_for(self, record: DeviceRecord) -> ScpiSession:
-        if record.kind in {DeviceKind.NI_DAQ, DeviceKind.VAUNIX_LMS}:
-            raise ValueError("NI DAQ 和 Vaunix LMS/BLX 不使用 SCPI 会话")
+        if record.kind in {DeviceKind.NI_DAQ, DeviceKind.VAUNIX_LMS, DeviceKind.NEWPORT_SMC100}:
+            raise ValueError("此设备不使用 SCPI 会话")
         with self._lock:
             resource_changed = (
                 record.id in self._sessions
@@ -258,6 +300,30 @@ class DeviceConnectionManager:
                 self._vaunix_devices[record.id] = device
                 self._vaunix_resources[record.id] = record.resource
             return device
+
+    def newport_device_for(self, record: DeviceRecord) -> Smc100Device | VirtualSmc100Device:
+        if record.kind is not DeviceKind.NEWPORT_SMC100:
+            raise ValueError("只有 Newport 设备可创建 SMC100 驱动")
+        record.validate()
+        with self._lock:
+            existing = self._newport_devices.get(record.id)
+            if existing is not None and existing.resource != record.resource:
+                if existing.is_connected or self._leases.get(record.id):
+                    raise DeviceBusyError("请先停止任务并断开旧 Newport 地址")
+                existing = None
+            # First release supports one connected axis per physical COM port.
+            # Reject aliases rather than creating competing serial sessions.
+            if not is_virtual_resource(record.resource):
+                port, _ = parse_resource(record.resource)
+                for key, other in self._newport_devices.items():
+                    if (key != record.id and (other.is_connected or key in self._newport_connecting)
+                            and getattr(other, "port", None) == port):
+                        raise DeviceBusyError(f"串口 {port} 已被另一 Newport 设备使用")
+            if existing is None:
+                existing = (VirtualSmc100Device(record.resource) if is_virtual_resource(record.resource)
+                            else Smc100Device(record.resource))
+                self._newport_devices[record.id] = existing
+            return existing
 
     def counter_for(
         self,
@@ -315,6 +381,7 @@ class DeviceConnectionManager:
             self._resources.pop(record.id, None)
             self._vaunix_devices.pop(record.id, None)
             self._vaunix_resources.pop(record.id, None)
+            self._newport_devices.pop(record.id, None)
 
     def close_all(self) -> None:
         with self._lock:
@@ -333,12 +400,13 @@ class DeviceConnectionManager:
             self._vaunix_connected.clear()
             self._identities.clear()
             self._leases.clear()
+            newport_devices = list(self._newport_devices.values())
         for session in sessions:
             try:
                 session.disconnect()
             except Exception:
                 pass
-        for device in vaunix_devices:
+        for device in [*vaunix_devices, *newport_devices]:
             try:
                 device.disconnect()
             except Exception:

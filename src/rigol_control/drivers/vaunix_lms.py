@@ -21,6 +21,9 @@ VIRTUAL_VAUNIX_RESOURCE = "SIM::VAUNIX_LMS::1"
 _VAUNIX_DLL_LOCK = RLock()
 _TRANSIENT_STATUS_CODES = {0x80020000, 0xFFFF0002}
 _NOT_READY_STATUS_CODES = {0x80030000, 0xFFFF0003}
+_CONNECTION_STATUS_CODES = (
+    _TRANSIENT_STATUS_CODES | _NOT_READY_STATUS_CODES | {0x80000000, 0xFFFF0000}
+)
 _HID_RETRY_ATTEMPTS = 2
 _HID_RETRY_DELAY_SECONDS = 0.02
 
@@ -89,6 +92,18 @@ class VaunixSequenceElement:
 
 
 @dataclass(frozen=True, slots=True)
+class VaunixOutputSnapshot:
+    connected: bool
+    identity: str
+    capabilities: VaunixCapabilities | None
+    frequency_hz: float
+    power_dbm: float
+    rf_on: bool
+    internal_reference: bool
+    device_status: int
+
+
+@dataclass(frozen=True, slots=True)
 class VaunixSnapshot:
     connected: bool
     identity: str
@@ -99,7 +114,7 @@ class VaunixSnapshot:
     internal_reference: bool
     sweep_start_hz: float
     sweep_end_hz: float
-    sweep_step_hz: float
+    sweep_step_hz: float | None
     sweep_time_ms: int
     dwell_time_ms: int
     idle_time_ms: int
@@ -275,13 +290,19 @@ class VaunixLmsApi:
             for index in range(min(reported, MAX_DEVICES)):
                 device_id = int(handles[index])
                 model_buffer = ctypes.create_string_buffer(MAX_MODEL_NAME)
-                self.dll.fnLMS_GetModelNameA(
+                model_length = self.dll.fnLMS_GetModelNameA(
                     device_id,
                     ctypes.cast(model_buffer, ctypes.c_void_p),
                 )
                 model = model_buffer.value.decode("ascii", errors="replace")
                 serial = int(self.dll.fnLMS_GetSerialNumber(device_id))
                 status = int(self.dll.fnLMS_GetDeviceStatus(device_id))
+                # Hot unplug can occur between the enumeration and these reads.
+                if any(_unsigned_32(value) in _STATUS_NAMES
+                       for value in (model_length, serial, status)):
+                    continue
+                if not model or serial <= 0 or not status & DEV_CONNECTED:
+                    continue
                 descriptors.append(
                     VaunixDeviceDescriptor(device_id, model, serial, status)
                 )
@@ -362,11 +383,7 @@ class VaunixLmsDevice:
                     is_blx=descriptor.model.upper().startswith("BLX"),
                 )
             except Exception:
-                with api._lock:
-                    api.dll.fnLMS_CloseDevice(descriptor.device_id)
-                self._api = None
-                self._device_id = None
-                self._descriptor = None
+                self._invalidate_connection()
                 raise
             self._identity = (
                 f"Vaunix {descriptor.model} · SN {descriptor.serial_number} · "
@@ -379,14 +396,26 @@ class VaunixLmsDevice:
         with self._lock:
             if self._device_id is None or self._api is None:
                 return
-            with self._api._lock:
-                status = self._api.dll.fnLMS_CloseDevice(self._device_id)
-            _check_set_status("fnLMS_CloseDevice", status)
-            self._api = None
-            self._device_id = None
-            self._descriptor = None
-            self._capabilities = None
-            self._identity = ""
+            try:
+                with self._api._lock:
+                    status = self._api.dll.fnLMS_CloseDevice(self._device_id)
+                _check_set_status("fnLMS_CloseDevice", status)
+            finally:
+                self._clear_connection()
+
+    def _clear_connection(self) -> None:
+        self._api = None
+        self._device_id = None
+        self._descriptor = None
+        self._capabilities = None
+        self._identity = ""
+
+    def _invalidate_connection(self) -> None:
+        # Preserve the original USB error even if releasing a stale handle fails.
+        try:
+            self.disconnect()
+        except Exception:
+            self._clear_connection()
 
     def set_frequency_hz(self, frequency_hz: float) -> None:
         value = _finite(frequency_hz, "输出频率")
@@ -460,12 +489,12 @@ class VaunixLmsDevice:
         caps = self.capabilities
         start = _finite(start_hz, "扫频起点")
         end = _finite(end_hz, "扫频终点")
-        step = _finite(step_hz, "扫频步长")
+        step = _finite(step_hz, "扫频步长") if caps.is_blx else None
         if not caps.minimum_frequency_hz <= start <= caps.maximum_frequency_hz:
             raise ValueError("扫频起点超出设备范围")
         if not caps.minimum_frequency_hz <= end <= caps.maximum_frequency_hz:
             raise ValueError("扫频终点超出设备范围")
-        if step <= 0:
+        if step is not None and step <= 0:
             raise ValueError("扫频步长必须大于 0")
         if upward and start >= end:
             raise ValueError("向上扫频要求起点小于终点")
@@ -474,8 +503,8 @@ class VaunixLmsDevice:
         with self._lock:
             self._set("fnLMS_SetStartFrequencyEx", _frequency_units(start))
             self._set("fnLMS_SetEndFrequencyEx", _frequency_units(end))
-            self._set("fnLMS_SetFrequencyStepEx", _frequency_units(step))
             if caps.is_blx:
+                self._set("fnLMS_SetFrequencyStepEx", _frequency_units(step))
                 self._set("fnLMS_SetDwellTime", max(10, int(dwell_time_ms)))
                 self._set("fnLMS_SetIdleTime", max(0, int(idle_time_ms)))
             else:
@@ -637,10 +666,30 @@ class VaunixLmsDevice:
             for item in normalized:
                 self.apply_step(item.parameter, item.channel, item.value)
 
+    def _connected_status(self) -> int:
+        status = self._get_int("fnLMS_GetDeviceStatus")
+        if status & (DEV_CONNECTED | DEV_OPENED) != (DEV_CONNECTED | DEV_OPENED):
+            self._invalidate_connection()
+            raise VaunixLmsError("Vaunix USB 已断开或句柄失效，请重新连接设备")
+        return status
+
+    def output_snapshot(self) -> VaunixOutputSnapshot:
+        """Connection metrics must not depend on optional sweep/sequence features."""
+        with self._lock:
+            status = self._connected_status()
+            return VaunixOutputSnapshot(
+                connected=True, identity=self._identity, capabilities=self.capabilities,
+                frequency_hz=self._get_frequency("fnLMS_GetFrequencyEx"),
+                power_dbm=self._get_int("fnLMS_GetAbsPowerLevel") / 4.0,
+                rf_on=bool(self._get_int("fnLMS_GetRF_On")),
+                internal_reference=bool(self._get_int("fnLMS_GetUseInternalRef")),
+                device_status=status,
+            )
+
     def snapshot(self) -> VaunixSnapshot:
         with self._lock:
             self._require()
-            status = self._get_int("fnLMS_GetDeviceStatus")
+            status = self._connected_status()
             count = self._get_int("fnLMS_GetSequenceCount") if self.capabilities.is_blx else 0
             count = min(MAX_SEQUENCE_ENTRIES, max(0, count))
             sequence = tuple(
@@ -681,7 +730,10 @@ class VaunixLmsDevice:
                 internal_reference=bool(self._get_int("fnLMS_GetUseInternalRef")),
                 sweep_start_hz=self._get_frequency("fnLMS_GetStartFrequencyEx"),
                 sweep_end_hz=self._get_frequency("fnLMS_GetEndFrequencyEx"),
-                sweep_step_hz=self._get_frequency("fnLMS_GetFrequencyStepEx"),
+                # The SDK implements frequency-step read/write for BLX only.
+                # LMS time sweeps return BAD_PARAMETER for these functions.
+                sweep_step_hz=(self._get_frequency("fnLMS_GetFrequencyStepEx")
+                               if self.capabilities.is_blx else None),
                 sweep_time_ms=(
                     0
                     if self.capabilities.is_blx
@@ -755,11 +807,8 @@ class VaunixLmsDevice:
                     if attempt < _HID_RETRY_ATTEMPTS and code in _TRANSIENT_STATUS_CODES:
                         time.sleep(_HID_RETRY_DELAY_SECONDS)
                         continue
-                    if attempt < _HID_RETRY_ATTEMPTS and code in _NOT_READY_STATUS_CODES:
-                        init_status = api.dll.fnLMS_InitDevice(device_id)
-                        if _unsigned_32(init_status) == 0:
-                            time.sleep(_HID_RETRY_DELAY_SECONDS)
-                            continue
+                    if code in _CONNECTION_STATUS_CODES:
+                        self._invalidate_connection()
                     _check_set_status(function_name, status)
 
     def _get_int(self, function_name: str, *args: Any) -> int:
@@ -769,16 +818,14 @@ class VaunixLmsDevice:
                 value = int(getattr(api.dll, function_name)(device_id, *args))
                 code = _unsigned_32(value)
                 if code not in _TRANSIENT_STATUS_CODES | _NOT_READY_STATUS_CODES:
+                    if code in _CONNECTION_STATUS_CODES:
+                        self._invalidate_connection()
                     _raise_get_error(function_name, value)
                     return value
                 if attempt < _HID_RETRY_ATTEMPTS and code in _TRANSIENT_STATUS_CODES:
                     time.sleep(_HID_RETRY_DELAY_SECONDS)
                     continue
-                if attempt < _HID_RETRY_ATTEMPTS and code in _NOT_READY_STATUS_CODES:
-                    init_status = api.dll.fnLMS_InitDevice(device_id)
-                    if _unsigned_32(init_status) == 0:
-                        time.sleep(_HID_RETRY_DELAY_SECONDS)
-                        continue
+                self._invalidate_connection()
                 _raise_get_error(function_name, value)
         raise AssertionError("Vaunix integer read retry loop exited unexpectedly")
 
@@ -791,6 +838,8 @@ class VaunixLmsDevice:
         with api._lock:
             value = float(getattr(api.dll, function_name)(device_id, *args))
             if value in {-1.0, -3.0, -4.0}:
+                if value in {-1.0, -3.0}:
+                    self._invalidate_connection()
                 raise VaunixLmsError(f"{function_name} 返回错误 {value:g}")
             return value
 
@@ -1083,6 +1132,17 @@ class VirtualVaunixLmsDevice:
         with self._lock:
             for item in normalized:
                 self.apply_step(item.parameter, item.channel, item.value)
+
+    def output_snapshot(self) -> VaunixOutputSnapshot:
+        with self._lock:
+            snapshot = self.snapshot()
+            return VaunixOutputSnapshot(
+                connected=snapshot.connected, identity=snapshot.identity,
+                capabilities=snapshot.capabilities, frequency_hz=snapshot.frequency_hz,
+                power_dbm=snapshot.power_dbm, rf_on=snapshot.rf_on,
+                internal_reference=snapshot.internal_reference,
+                device_status=snapshot.device_status,
+            )
 
     def snapshot(self) -> VaunixSnapshot:
         status = DEV_CONNECTED | PLL_LOCKED

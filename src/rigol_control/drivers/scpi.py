@@ -75,6 +75,7 @@ class ScpiSession:
         self.recovery_attempts = 1 if int(recovery_attempts) > 0 else 0
         self._backend_factory = backend_factory
         self._backend: ScpiBackend | None = None
+        self._identity = ""
         self._lock = RLock()
 
     @property
@@ -82,13 +83,20 @@ class ScpiSession:
         with self._lock:
             return self._backend is not None
 
+    @property
+    def identity(self) -> str:
+        with self._lock:
+            return self._identity
+
     def connect(self) -> str:
         with self._lock:
             if self._backend is not None:
-                return self._query_locked("*IDN?")
+                self._identity = self._query_locked("*IDN?")
+                return self._identity
             self._backend = self._backend_factory(self.resource, self.timeout_ms)
             try:
-                return self._query_locked("*IDN?")
+                self._identity = self._query_locked("*IDN?")
+                return self._identity
             except Exception:
                 self._close_locked()
                 raise
@@ -112,17 +120,20 @@ class ScpiSession:
         normalized = self._normalize(command)
         with self._lock:
             try:
-                return self._query_locked(normalized)
+                result = self._query_locked(normalized)
             except ScpiError as first_error:
                 if not recover or self.recovery_attempts < 1:
                     raise
                 self._recover_locked(normalized, first_error)
                 try:
-                    return self._query_locked(normalized)
+                    result = self._query_locked(normalized)
                 except ScpiError as retry_error:
                     raise ScpiError(
                         f"SCPI 查询在自动重连后仍失败 [{normalized}]：{retry_error}"
                     ) from retry_error
+            if normalized.upper() == "*IDN?":
+                self._identity = result
+            return result
 
     def _write_locked(
         self,
@@ -162,6 +173,7 @@ class ScpiSession:
             identity = str(backend.query("*IDN?")).strip()
             if not identity:
                 raise ScpiConnectionError("自动重连后 *IDN? 返回为空")
+            self._identity = identity
         except Exception as recovery_exc:
             self._close_locked_safely()
             raise ScpiConnectionError(
@@ -183,6 +195,7 @@ class ScpiSession:
 
     def _close_locked(self) -> None:
         backend, self._backend = self._backend, None
+        self._identity = ""
         if backend is not None:
             try:
                 backend.close()
@@ -191,6 +204,7 @@ class ScpiSession:
 
     def _close_locked_safely(self) -> None:
         backend, self._backend = self._backend, None
+        self._identity = ""
         if backend is not None:
             try:
                 backend.close()

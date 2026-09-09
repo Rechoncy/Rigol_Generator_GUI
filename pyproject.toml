@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 instrument = [
+    "pyserial>=3.5",
     "PyVISA>=1.14",
     "nidaqmx>=1.0",
 ]
@@ -25,3 +26,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+rigol_control = ["assets/*.svg", "assets/*.png", "assets/*.ico"]

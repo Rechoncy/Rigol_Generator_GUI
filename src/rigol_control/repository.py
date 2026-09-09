@@ -26,6 +26,8 @@ class DeviceRepository:
 
     def __init__(self, data_dir: Path | str | None = None) -> None:
         self.data_dir = Path(data_dir) if data_dir else default_data_dir()
+        from .config_archive import recover_pending_import
+        recover_pending_import(self.data_dir)
         self.path = self.data_dir / "devices.json"
 
     def list(self) -> list[DeviceRecord]:

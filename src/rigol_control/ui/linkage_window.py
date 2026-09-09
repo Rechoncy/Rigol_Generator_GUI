@@ -773,6 +773,18 @@ class LinkageTaskWindow(QMainWindow):
             ni_id = str(self.ni_source.currentData() or "")
             ni_record = next(item for item in records if item.id == ni_id)
             dg_records = [item for item in records if item.kind is DeviceKind.DG4000]
+            writers = {
+                record.id: self.connection_manager.dg_driver_for(record)
+                for record in dg_records
+            }
+            for point_index, point in enumerate(points, start=1):
+                for device_id, values in point.grouped().items():
+                    try:
+                        writers[device_id].validate_step_values(values)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"第 {point_index} 个跨设备联合点：{exc}"
+                        ) from exc
             owner = f"linkage:{self._current_task_id or id(self)}"
             self.connection_manager.acquire_devices(owner, tuple(item.id for item in records))
             self._lease_owner = owner
@@ -782,10 +794,6 @@ class LinkageTaskWindow(QMainWindow):
                 terminal=self.terminal.currentText(),
                 rising=self.edge.currentIndex() == 0,
             )
-            writers = {
-                record.id: self.connection_manager.dg_driver_for(record)
-                for record in dg_records
-            }
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             log_path = self.task_repository.data_dir / "run_logs" / f"linkage_{timestamp}.csv"
             controller = MultiDeviceTriggerController(

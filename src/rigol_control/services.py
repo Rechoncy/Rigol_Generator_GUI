@@ -45,6 +45,16 @@ class DeviceDiscoveryService:
     """Enumerate selectable VISA, NI-DAQmx, and Vaunix LMS/BLX resources."""
 
     def discover(self, kind: DeviceKind) -> list[DiscoveredResource]:
+        if kind is DeviceKind.NEWPORT_SMC100:
+            from .drivers.newport_smc100 import VIRTUAL_SMC100_RESOURCE
+            resources = [DiscoveredResource(VIRTUAL_SMC100_RESOURCE, "内置模拟器", "虚拟 PR50CC / SMC100CC")]
+            try:
+                from serial.tools.list_ports import comports
+                resources.extend(DiscoveredResource(f"{p.device}::1", "Newport RS-232", p.description)
+                                 for p in comports())
+            except (ImportError, OSError):
+                pass
+            return resources
         if kind is DeviceKind.NI_DAQ:
             virtual = DiscoveredResource(
                 VIRTUAL_NI_RESOURCE,
@@ -155,6 +165,11 @@ class DeviceProbeService:
     """Best-effort discovery with optional instrument packages loaded lazily."""
 
     def probe(self, record: DeviceRecord) -> ProbeResult:
+        if record.kind is DeviceKind.NEWPORT_SMC100:
+            if record.resource.startswith("SIM::"):
+                return ProbeResult(ProbeState.ONLINE, "虚拟旋转台可用", "SMC100CC VIRTUAL / PR50CC")
+            # Never open a background probe session on an actively used serial port.
+            return ProbeResult(ProbeState.UNCHECKED, "串口探测不打开设备；点击连接读取 SMC100CC 身份")
         if record.kind is DeviceKind.NI_DAQ:
             return self._probe_ni(record)
         if record.kind is DeviceKind.VAUNIX_LMS:

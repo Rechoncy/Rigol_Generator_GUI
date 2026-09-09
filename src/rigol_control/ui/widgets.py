@@ -96,6 +96,8 @@ class DeviceCard(QFrame):
 
     @staticmethod
     def _default_connection(kind: DeviceKind) -> str:
+        if kind is DeviceKind.NEWPORT_SMC100:
+            return "Newport RS-232"
         if kind is DeviceKind.NI_DAQ:
             return "NI-DAQmx 本机设备"
         if kind is DeviceKind.VAUNIX_LMS:
@@ -109,6 +111,9 @@ class DeviceCard(QFrame):
         elif result.state is ProbeState.DRIVER_MISSING:
             self.status.setObjectName("StatusPending")
             self.status.setText("● 缺少驱动")
+        elif result.state is ProbeState.UNCHECKED:
+            self.status.setObjectName("StatusPending")
+            self.status.setText("● 待连接验证")
         else:
             self.status.setObjectName("StatusOffline")
             self.status.setText("● 离线")

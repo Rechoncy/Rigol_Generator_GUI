@@ -15,6 +15,7 @@ class DeviceKind(str, Enum):
     DG4000 = "dg4000"
     NI_DAQ = "ni_daq"
     VAUNIX_LMS = "vaunix_lms"
+    NEWPORT_SMC100 = "newport_smc100"
     GENERIC_SCPI = "generic_scpi"
 
     @property
@@ -23,6 +24,7 @@ class DeviceKind(str, Enum):
             DeviceKind.DG4000: "RIGOL DG4000",
             DeviceKind.NI_DAQ: "NI 数据采集卡",
             DeviceKind.VAUNIX_LMS: "Vaunix LMS/BLX",
+            DeviceKind.NEWPORT_SMC100: "Newport SMC100CC",
             DeviceKind.GENERIC_SCPI: "通用 SCPI 设备",
         }[self]
 
@@ -32,6 +34,7 @@ class DeviceKind(str, Enum):
             DeviceKind.DG4000: "#18c9b8",
             DeviceKind.NI_DAQ: "#8f7cff",
             DeviceKind.VAUNIX_LMS: "#f08ab8",
+            DeviceKind.NEWPORT_SMC100: "#62b5f5",
             DeviceKind.GENERIC_SCPI: "#f3a84f",
         }[self]
 
@@ -76,6 +79,10 @@ class DeviceRecord:
             raise ValueError("设备名称不能为空")
         if not self.resource.strip():
             raise ValueError("资源地址/设备名不能为空")
+        if self.kind is DeviceKind.NEWPORT_SMC100:
+            from .drivers.newport_smc100 import VIRTUAL_SMC100_RESOURCE, parse_resource
+            if self.resource != VIRTUAL_SMC100_RESOURCE:
+                parse_resource(self.resource)
 
     def updated(self, **changes: Any) -> "DeviceRecord":
         record = replace(self, **changes, updated_at=utc_now())

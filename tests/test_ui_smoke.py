@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import QApplication, QPushButton, QTabWidget
 
 from rigol_control.app import create_application
 from rigol_control.connections import DeviceConnectionManager
-from rigol_control.drivers.dg4000 import StepParameter
+from rigol_control.drivers.dg4000 import StepParameter, dg4000_capabilities
 from rigol_control.drivers.vaunix_lms import VIRTUAL_VAUNIX_RESOURCE
 from rigol_control.models import DeviceKind, DeviceRecord
 from rigol_control.repository import DeviceParameterRepository, DeviceRepository
@@ -61,6 +61,45 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIsInstance(home.open_windows[self.ni.id], NIDeviceWindow)
         self.assertEqual(len(home.open_windows), 2)
         home.close()
+        self.app.processEvents()
+
+    def test_dg_frequency_editors_follow_connected_model(self) -> None:
+        window = DG4000Window(self.dg, [self.ni])
+        frequency_controls = [
+            window.channel_controls[1]["frequency"],
+            window.channel_controls[2]["frequency"],
+            window.modulation_controls["FSK"]["parameter"],
+            *window.sweep_frequency_controls,
+        ]
+        self.assertTrue(
+            all(control.maximum_base == 200_000_000 for control in frequency_controls)
+        )
+        window.channel_controls[1]["frequency"].set_unit("MHz")
+        window.channel_controls[1]["frequency"].setValue(200_000_000)
+        self.assertEqual(
+            window.channel_controls[1]["frequency"].display_value(),
+            200,
+        )
+
+        note = window._apply_frequency_capabilities(
+            dg4000_capabilities("RIGOL TECHNOLOGIES,DG4162,TEST,00.00")
+        )
+        self.assertIn("160 MHz", note)
+        self.assertTrue(
+            all(control.maximum_base == 160_000_000 for control in frequency_controls)
+        )
+        self.assertEqual(window.channel_controls[1]["frequency"].value(), 160_000_000)
+        self.assertEqual(window.scan_axes[0].start.maximum(), 160_000)
+
+        note = window._apply_frequency_capabilities(
+            dg4000_capabilities("RIGOL TECHNOLOGIES,DG4202,TEST,00.00")
+        )
+        self.assertIn("200 MHz", note)
+        self.assertTrue(
+            all(control.maximum_base == 200_000_000 for control in frequency_controls)
+        )
+        self.assertEqual(window.scan_axes[0].start.maximum(), 200_000)
+        window.close()
         self.app.processEvents()
 
     def test_device_parameters_restore_automatically_after_reopening(self) -> None:
@@ -393,6 +432,10 @@ class UiSmokeTests(unittest.TestCase):
         home.open_device(self.dg.id)
         window = home.open_windows[self.dg.id]
         self.assertTrue(window.driver.is_connected)
+        self.assertEqual(
+            window.channel_controls[1]["frequency"].maximum_base,
+            160_000_000,
+        )
         self.assertTrue(
             self._wait_for(
                 lambda: window.overview_metrics["connection"].text() == "已连接"
@@ -466,7 +509,7 @@ class UiSmokeTests(unittest.TestCase):
         home.create_virtual_lab()
         self.assertTrue(
             self._wait_for(
-                lambda: len(repository.list()) == 4
+                lambda: len(repository.list()) == 5
                 and all(manager.is_connected(item) for item in repository.list())
             )
         )
@@ -580,6 +623,35 @@ class UiSmokeTests(unittest.TestCase):
         home.close()
         self.app.processEvents()
 
+    def test_lms_window_uses_basic_readback_and_disables_only_blx_sweep_step(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        record = DeviceRecord.create(kind=DeviceKind.VAUNIX_LMS, name="LMS-802",
+                                     resource=VIRTUAL_VAUNIX_RESOURCE)
+        window = VaunixLmsWindow(record, [], parameter_repository=DeviceParameterRepository(self.temporary.name))
+        self.addCleanup(window.close)
+        device = window.device
+        device._caps = replace(device.capabilities, model="LMS-802", is_blx=False,
+                               has_fast_pulse=False, has_chirp=False)
+        device.connect()
+        basic = device.output_snapshot()
+        full = replace(device.snapshot(), sweep_step_hz=None)
+        with patch.object(device, "output_snapshot", return_value=basic) as read_basic, \
+             patch.object(device, "snapshot", side_effect=AssertionError("advanced read on connect")):
+            window._connected(device.identity)
+            self.assertTrue(self._wait_for(lambda: read_basic.called and
+                            window.overview_metrics["frequency"].text() != "—"))
+        self.assertFalse(window.sweep_step.isEnabled())
+        self.assertTrue(window.sweep_time.isEnabled())
+        self.assertTrue(window.trigger_frequency_step.isEnabled())
+        before = window.sweep_step.value()
+        with patch.object(device, "snapshot", return_value=full):
+            window._refresh_all()
+            self.assertTrue(self._wait_for(lambda: not window._call_tasks))
+        self.assertEqual(window.sweep_step.value(), before)
+        self.assertEqual(window.overview_metrics["power"].text(), f"{basic.power_dbm:.6g} dBm")
+
     def test_virtual_vaunix_full_window_and_ni_frequency_power_linkage(self) -> None:
         repository = DeviceRepository(Path(self.temporary.name) / "vaunix-ui")
         manager = DeviceConnectionManager()
@@ -587,7 +659,7 @@ class UiSmokeTests(unittest.TestCase):
         home.create_virtual_lab()
         self.assertTrue(
             self._wait_for(
-                lambda: len(repository.list()) == 4
+                lambda: len(repository.list()) == 5
                 and all(manager.is_connected(item) for item in repository.list())
             )
         )
@@ -826,7 +898,7 @@ class UiSmokeTests(unittest.TestCase):
         home.create_virtual_lab()
         self.assertTrue(
             self._wait_for(
-                lambda: len(repository.list()) == 4
+                lambda: len(repository.list()) == 5
                 and all(manager.is_connected(item) for item in repository.list())
             )
         )

@@ -4,9 +4,11 @@ import unittest
 
 from rigol_control.drivers.dg4000 import (
     BasicWaveform,
+    DG4000_FAMILY_MAX_FREQUENCY_HZ,
     DG4000Driver,
     StepParameter,
     StepValue,
+    dg4000_capabilities,
     output_load_value,
     parse_output_state,
 )
@@ -92,6 +94,63 @@ def wait_until(predicate, timeout: float = 1.0) -> bool:
 
 
 class ScpiDriverTests(unittest.TestCase):
+    def test_dg4000_model_frequency_capabilities_and_driver_guard(self) -> None:
+        expected = {
+            "DG4062": 60_000_000,
+            "DG4102": 100_000_000,
+            "DG4162": 160_000_000,
+            "DG4202": 200_000_000,
+        }
+        for model, maximum in expected.items():
+            with self.subTest(model=model):
+                capabilities = dg4000_capabilities(
+                    f"RIGOL TECHNOLOGIES,{model},TEST,00.00"
+                )
+                self.assertEqual(capabilities.model, model)
+                self.assertTrue(capabilities.model_recognized)
+                self.assertEqual(capabilities.maximum_frequency_hz, maximum)
+
+        virtual = dg4000_capabilities(
+            "RIGOL TECHNOLOGIES,DG4162-VIRTUAL,SIM0001,00.01"
+        )
+        self.assertEqual(virtual.model, "DG4162")
+        self.assertEqual(virtual.maximum_frequency_hz, 160_000_000)
+        unknown = dg4000_capabilities("RIGOL TECHNOLOGIES,DG4999,TEST,00.00")
+        self.assertFalse(unknown.model_recognized)
+        self.assertEqual(
+            unknown.maximum_frequency_hz,
+            DG4000_FAMILY_MAX_FREQUENCY_HZ,
+        )
+
+        dg4162_backend = FakeScpiBackend()
+        dg4162 = DG4000Driver(
+            ScpiSession(
+                "USB0::DG4162",
+                backend_factory=lambda _resource, _timeout: dg4162_backend,
+            )
+        )
+        dg4162.connect()
+        with self.assertRaisesRegex(ValueError, "DG4162.*160 MHz"):
+            dg4162.configure_basic(1, BasicWaveform("SIN", 200_000_000, 1.0))
+
+        class Dg4202Backend(FakeScpiBackend):
+            def query(self, command: str) -> str:
+                self.queries.append(command)
+                if command == "*IDN?":
+                    return "RIGOL TECHNOLOGIES,DG4202,TEST,00.00\n"
+                return "0"
+
+        dg4202_backend = Dg4202Backend()
+        dg4202 = DG4000Driver(
+            ScpiSession(
+                "USB0::DG4202",
+                backend_factory=lambda _resource, _timeout: dg4202_backend,
+            )
+        )
+        dg4202.connect()
+        dg4202.configure_basic(1, BasicWaveform("SIN", 200_000_000, 1.0))
+        self.assertIn(":SOUR1:FREQ 200000000", dg4202_backend.writes)
+
     def test_idempotent_settings_reconnect_once_after_transient_io_failure(self) -> None:
         class FailingWriteBackend(FakeScpiBackend):
             def write(self, command: str) -> None:

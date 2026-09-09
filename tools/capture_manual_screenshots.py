@@ -6,6 +6,8 @@ import sys
 import time
 from pathlib import Path
 
+from PyQt6.QtCore import QTimer
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -62,7 +64,7 @@ def main() -> int:
     home.create_virtual_lab()
     wait(
         app,
-        lambda: len(repository.list()) == 4
+        lambda: len(repository.list()) == 5
         and all(manager.is_connected(record) for record in repository.list()),
     )
     capture(home, "01-device-center.png", app)
@@ -179,6 +181,37 @@ def main() -> int:
     capture(ni_window, "08-ni-analog-input.png", app)
     ni_window._stop_analog_input()
     wait(app, lambda: ni_window.analog_controller.snapshot().state.value == "stopped")
+    newport = next(record for record in records if record.kind is DeviceKind.NEWPORT_SMC100)
+    home.open_device(newport.id)
+    newport_window = home.open_windows[newport.id]
+    newport_window.directory.setText(str(DATA / "rotation_runs"))
+    newport_window.refresh_button.click()
+    wait(app, lambda: not newport_window._manual_busy)
+    capture(newport_window, "20-newport-motion.png", app)
+    newport_window.count.setValue(3)
+    newport_window.ai_enabled.setChecked(True)
+    newport_window.ai_channels.setText("ai0,ai1")
+    newport_window._select_page(1)
+    newport_window.start_button.click()
+    wait(app, lambda: newport_window.controller is not None and newport_window.controller.snapshot().phase == "holding")
+    newport_window.inject_button.click()
+    wait(app, lambda: newport_window.controller.snapshot().completed == 1)
+    newport_window._tick()
+    capture(newport_window, "21-newport-rotation-scan.png", app)
+    newport_window._select_page(2)
+    wait(app, lambda: newport_window.plot.displayed_samples >= 2000)
+    capture(newport_window, "22-newport-analog.png", app)
+    newport_window.stop_button.click()
+    wait(app, lambda: not newport_window.controller.is_running)
+    config_export = DATA / "full-configuration.json"
+    home.export_configuration(config_export)
+    def capture_import_preview():
+        dialog = app.activeModalWidget()
+        if dialog is not None:
+            capture(dialog, "23-configuration-import.png", app)
+            dialog.reject()
+    QTimer.singleShot(100, capture_import_preview)
+    home.import_configuration(config_export)
     home.close()
     app.processEvents()
     print(f"已生成 {len(list(OUTPUT.glob('*.png')))} 张截图：{OUTPUT}")

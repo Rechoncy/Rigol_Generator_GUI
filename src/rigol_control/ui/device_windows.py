@@ -43,10 +43,14 @@ from ..analog import (
 from ..connections import ConnectionInfo, DeviceConnectionManager
 from ..drivers.dg4000 import (
     BasicWaveform,
+    DG4000Capabilities,
     DG4000Driver,
+    DG4000_FAMILY_MAX_FREQUENCY_HZ,
     StepParameter,
     StepValue,
+    dg4000_capabilities,
     output_load_value,
+    validate_dg4000_frequency,
 )
 from ..drivers.ni_analog import AnalogInputConfig, NIDaqAnalogInput
 from ..drivers.ni_counter import NIDaqEdgeCounter
@@ -245,6 +249,25 @@ class UnitValueWidget(QWidget):
 
     def setValue(self, base_value: float) -> None:
         self.spin.setValue(from_base(base_value, self.family, self._active_unit))
+
+    def set_base_range(self, minimum: float, maximum: float) -> bool:
+        """Update the physical range while preserving (or explicitly clamping) value.
+
+        Returns ``True`` when the previous value was outside the new range and
+        therefore had to be clamped.
+        """
+
+        minimum_base = float(minimum)
+        maximum_base = float(maximum)
+        if minimum_base > maximum_base:
+            raise ValueError("数值范围下限不能大于上限")
+        previous = self.value()
+        self.minimum_base = minimum_base
+        self.maximum_base = maximum_base
+        self._apply_display_range()
+        clamped = min(max(previous, minimum_base), maximum_base)
+        self.setValue(clamped)
+        return clamped != previous
 
     def current_unit(self) -> str:
         return self._active_unit
@@ -635,6 +658,8 @@ class DG4000Window(BaseDeviceWindow):
         self._last_trigger_error: str | None = None
         self._ui_connected = False
         self._ni_source_signature: tuple[tuple[str, str, str, bool], ...] = ()
+        self._frequency_capabilities = dg4000_capabilities("")
+        self.frequency_limit_controls: list[UnitValueWidget] = []
         self.channel_controls: dict[int, dict[str, Any]] = {}
         self.impedance_controls: dict[int, dict[str, Any]] = {}
         self.modulation_controls: dict[str, dict[str, Any]] = {}
@@ -688,6 +713,9 @@ class DG4000Window(BaseDeviceWindow):
         self.identity_label = QLabel("连接后读取 *IDN?")
         self.identity_label.setWordWrap(True)
         form.addRow("身份信息", self.identity_label)
+        self.frequency_capability_label = QLabel("未连接：按全系列最高 200 MHz 预配置")
+        self.frequency_capability_label.setWordWrap(True)
+        form.addRow("频率能力", self.frequency_capability_label)
         connection_layout.addLayout(form)
         buttons = QHBoxLayout()
         self.connect_button = QPushButton("连接设备")
@@ -764,6 +792,10 @@ class DG4000Window(BaseDeviceWindow):
 
     def _connected(self, identity: Any) -> None:
         identity_text = identity.identity if isinstance(identity, ConnectionInfo) else str(identity)
+        self.driver.set_identity(identity_text)
+        capability_note = self._apply_frequency_capabilities(
+            dg4000_capabilities(identity_text)
+        )
         self.identity_label.setText(identity_text)
         self.connect_button.setText("已连接")
         self.connect_button.setEnabled(False)
@@ -775,8 +807,51 @@ class DG4000Window(BaseDeviceWindow):
         self.driver_status.style().polish(self.driver_status)
         self._ui_connected = True
         self.overview_metrics["connection"].setText("已连接")
-        self.statusBar().showMessage("DG4000 VISA 会话已连接", 5000)
+        self.statusBar().showMessage(
+            f"DG4000 VISA 会话已连接；{capability_note}",
+            8000,
+        )
         self._refresh_output_states()
+
+    def _apply_frequency_capabilities(
+        self,
+        capabilities: DG4000Capabilities,
+    ) -> str:
+        self._frequency_capabilities = capabilities
+        clamped = False
+        for control in self.frequency_limit_controls:
+            clamped = (
+                control.set_base_range(1e-6, capabilities.maximum_frequency_hz)
+                or clamped
+            )
+        for control in self.frequency_limit_controls:
+            model = capabilities.model or "未识别型号"
+            control.setToolTip(
+                f"当前按 {model} 限制，最高 "
+                f"{capabilities.maximum_frequency_hz / 1_000_000:g} MHz"
+            )
+        for axis in getattr(self, "scan_axes", []):
+            self._configure_scan_axis_range(axis)
+        if capabilities.model_recognized:
+            note = (
+                f"已识别 {capabilities.model}，频率上限 "
+                f"{capabilities.maximum_frequency_hz / 1_000_000:g} MHz"
+            )
+        elif not self.driver.is_connected:
+            note = (
+                "未连接，编辑范围按 DG4000 全系列最高 "
+                f"{DG4000_FAMILY_MAX_FREQUENCY_HZ / 1_000_000:g} MHz 预配置"
+            )
+        else:
+            note = (
+                "型号未识别，编辑范围暂按 DG4000 全系列最高 "
+                f"{DG4000_FAMILY_MAX_FREQUENCY_HZ / 1_000_000:g} MHz"
+            )
+        self.frequency_capability_label.setText(note)
+        if clamped:
+            note += "；超出该型号上限的已恢复数值已收紧"
+            self.frequency_capability_label.setText(note)
+        return note
 
     def _refresh_output_states(self) -> None:
         if not self.driver.is_connected:
@@ -818,6 +893,8 @@ class DG4000Window(BaseDeviceWindow):
         )
 
     def _disconnected(self, _result: Any = None) -> None:
+        self.driver.set_identity("")
+        self._apply_frequency_capabilities(dg4000_capabilities(""))
         self.identity_label.setText("连接后读取 *IDN?")
         self.connect_button.setText("连接设备")
         self.connect_button.setEnabled(True)
@@ -850,7 +927,14 @@ class DG4000Window(BaseDeviceWindow):
             form = QFormLayout()
             waveform = QComboBox()
             waveform.addItems(["正弦波", "方波", "锯齿波", "脉冲", "噪声", "任意波"])
-            frequency = unit_value_spin(1000, 1e-6, 160e6, "frequency", "kHz")
+            frequency = unit_value_spin(
+                1000,
+                1e-6,
+                DG4000_FAMILY_MAX_FREQUENCY_HZ,
+                "frequency",
+                "kHz",
+            )
+            self.frequency_limit_controls.append(frequency)
             amplitude = unit_value_spin(1.0, 0.001, 20.0, "amplitude", "Vpp")
             offset = unit_value_spin(0, -10, 10, "voltage", "V")
             phase = unit_value_spin(0, 0, 360, "angle", "deg")
@@ -961,7 +1045,14 @@ class DG4000Window(BaseDeviceWindow):
             form.addRow("内部波形", shape)
             form.addRow("调制频率", internal_frequency)
             if mode == "FSK":
-                parameter = unit_value_spin(2000, 1e-6, 160e6, "frequency", "kHz")
+                parameter = unit_value_spin(
+                    2000,
+                    1e-6,
+                    DG4000_FAMILY_MAX_FREQUENCY_HZ,
+                    "frequency",
+                    "kHz",
+                )
+                self.frequency_limit_controls.append(parameter)
                 form.addRow("跳跃频率", parameter)
             elif mode == "PSK":
                 parameter = unit_value_spin(180, 0, 360, "angle", "deg")
@@ -1038,8 +1129,22 @@ class DG4000Window(BaseDeviceWindow):
         form = QFormLayout()
         mode = QComboBox()
         mode.addItems(["线性", "对数", "步进"])
-        sweep_start = unit_value_spin(1000, 1e-6, 160e6, "frequency", "kHz")
-        sweep_stop = unit_value_spin(10000, 1e-6, 160e6, "frequency", "kHz")
+        sweep_start = unit_value_spin(
+            1000,
+            1e-6,
+            DG4000_FAMILY_MAX_FREQUENCY_HZ,
+            "frequency",
+            "kHz",
+        )
+        sweep_stop = unit_value_spin(
+            10000,
+            1e-6,
+            DG4000_FAMILY_MAX_FREQUENCY_HZ,
+            "frequency",
+            "kHz",
+        )
+        self.sweep_frequency_controls = (sweep_start, sweep_stop)
+        self.frequency_limit_controls.extend(self.sweep_frequency_controls)
         sweep_time = unit_value_spin(1, 0.001, 500, "time", "s")
         form.addRow("扫频类型", mode)
         form.addRow("起始频率", sweep_start)
@@ -1096,6 +1201,20 @@ class DG4000Window(BaseDeviceWindow):
         trigger: QComboBox,
     ) -> None:
         if not self._require_connection():
+            return
+        try:
+            validate_dg4000_frequency(
+                start.value(),
+                self.driver.capabilities,
+                parameter_name="扫频起始频率",
+            )
+            validate_dg4000_frequency(
+                stop.value(),
+                self.driver.capabilities,
+                parameter_name="扫频终止频率",
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "扫频参数超出型号能力", str(exc))
             return
         spacing = {"线性": "LIN", "对数": "LOG", "步进": "STEP"}[mode.currentText()]
         source = {"内部": "INT", "外部": "EXT", "手动": "MAN"}[trigger.currentText()]
@@ -1439,6 +1558,7 @@ class DG4000Window(BaseDeviceWindow):
             active_parameter=parameter,
             active_unit=unit_key,
         )
+        self._configure_scan_axis_range(controls)
         parameter_box.currentIndexChanged.connect(
             lambda _index, axis=controls: self._axis_parameter_changed(axis)
         )
@@ -1541,6 +1661,7 @@ class DG4000Window(BaseDeviceWindow):
         axis.unit.blockSignals(False)
         axis.active_parameter = parameter
         axis.active_unit = unit_key
+        self._configure_scan_axis_range(axis)
         axis.start.setValue(start)
         axis.step.setValue(step)
         axis.count.setValue(count)
@@ -1560,9 +1681,32 @@ class DG4000Window(BaseDeviceWindow):
         start_base = to_base(axis.start.value(), family, axis.active_unit)
         step_base = to_base(axis.step.value(), family, axis.active_unit)
         axis.active_unit = new_unit
+        self._configure_scan_axis_range(axis)
         axis.start.setValue(from_base(start_base, family, new_unit))
         axis.step.setValue(from_base(step_base, family, new_unit))
         self._scan_configuration_changed()
+
+    def _configure_scan_axis_range(self, axis: ScanAxisControls) -> None:
+        if axis.active_parameter in {
+            StepParameter.FREQUENCY,
+            StepParameter.FSK_FREQUENCY,
+        }:
+            maximum = from_base(
+                self._frequency_capabilities.maximum_frequency_hz,
+                "frequency",
+                axis.active_unit,
+            )
+            minimum = from_base(1e-6, "frequency", axis.active_unit)
+            axis.start.setRange(minimum, maximum)
+            axis.step.setRange(-maximum, maximum)
+            model = self._frequency_capabilities.model or "DG4000 全系列"
+            axis.start.setToolTip(
+                f"{model} 最高 {self._frequency_capabilities.maximum_frequency_hz / 1_000_000:g} MHz"
+            )
+        else:
+            axis.start.setRange(-1e15, 1e15)
+            axis.step.setRange(-1e15, 1e15)
+            axis.start.setToolTip("")
 
     def _scan_axis_models(self) -> tuple[ScanAxis, ...]:
         return tuple(
@@ -1601,6 +1745,11 @@ class DG4000Window(BaseDeviceWindow):
             axes = self._scan_axis_models()
             mode = self.scan_mode.currentData()
             points = generate_scan_points(axes, mode)
+            for row, point in enumerate(points, start=1):
+                try:
+                    self.driver.validate_step_values(point.values)
+                except ValueError as exc:
+                    raise ValueError(f"第 {row} 个联合点：{exc}") from exc
         except ValueError as exc:
             QMessageBox.warning(self, "无法生成扫描表", str(exc))
             return
@@ -1677,6 +1826,10 @@ class DG4000Window(BaseDeviceWindow):
                     )
                 )
             points.append(ScanPoint(tuple(values)))
+            try:
+                self.driver.validate_step_values(points[-1].values)
+            except ValueError as exc:
+                raise ValueError(f"第 {row + 1} 行：{exc}") from exc
         return points
 
     def _sequence_values(self) -> list[float]:
@@ -3363,6 +3516,11 @@ def create_device_window(
     device_provider: Callable[[], list[DeviceRecord]] | None = None,
     parameter_repository: DeviceParameterRepository | None = None,
 ) -> BaseDeviceWindow:
+    if record.kind is DeviceKind.NEWPORT_SMC100:
+        from .newport_window import NewportWindow
+        return NewportWindow(record, all_devices, connection_manager,
+                             device_provider=device_provider,
+                             parameter_repository=parameter_repository)
     if record.kind is DeviceKind.DG4000:
         ni_devices = [item for item in all_devices if item.kind is DeviceKind.NI_DAQ]
         return DG4000Window(

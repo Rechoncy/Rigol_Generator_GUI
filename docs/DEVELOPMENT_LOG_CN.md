@@ -1,15 +1,15 @@
-# DG4000 + Vaunix + NI 多设备联动控制：开发日志与维护指南
+# DG4000 + Vaunix + Newport + NI 多设备联动控制：开发日志与维护指南
 
 文档版本：1.0
 
-对应软件版本：0.6.0
+对应软件版本：0.6.0（含尚未正式发布的后续开发，见第 12 节）
 
-最后更新：2026-08-06
+最后更新：2026-09-09
 适用仓库：`Rigol_Generator_GUI`
 
 ## 1. 文档目的
 
-本文面向接手项目的开发者、测试人员和实验室管理员，集中记录系统目标、代码结构、关键设计决策、版本演进、数据格式、测试方法、发布流程和已知限制。功能操作以 `docs/USER_MANUAL_CN.md` 和 PDF 使用说明为准；本文重点回答“为什么这样设计、改动应落在哪里、如何验证不会破坏现有联动”。
+本文面向接手项目的开发者、测试人员和实验室管理员，集中记录系统目标、代码结构、关键设计决策、版本演进、数据格式、测试方法、发布流程和已知限制。当前功能操作见 `docs/USER_MANUAL_CN.md`、`docs/NEWPORT_ROTATION_CN.md` 和 `docs/CONFIG_BACKUP_CN.md`；现有 PDF 尚未重建，不能作为新增功能的完整说明。本文重点回答“为什么这样设计、改动应落在哪里、如何验证不会破坏现有联动”。
 
 每次完成可发布功能后，应同步更新本文第 12 节的版本记录、相关设计决策、测试矩阵和已知限制。不要只修改界面而遗漏驱动、虚拟设备、持久化、自动测试或说明书。
 
@@ -17,20 +17,23 @@
 
 ### 2.1 当前目标
 
-- 在一个首页中保存、连接和管理多台 DG4000、Vaunix LMS/BLX、NI DAQ 与通用 SCPI 设备。
-- 为每台设备打开独立设置窗口，共享已建立的 VISA 会话。
+- 在一个首页中保存、连接和管理多台 DG4000、Vaunix LMS/BLX、Newport SMC100CC / PR50CC、NI DAQ 与通用 SCPI 设备。
+- 为每台设备打开独立设置窗口，通过连接管理器共享已建立的设备连接。
 - 覆盖 DG4000 常用功能，并保留原始 SCPI 控制台作为完整手册命令入口。
 - 使用 NI 硬件累计边沿计数触发 DG4000 参数步进，不使用 NI AO 电压控制信号发生器。
 - 支持频率、幅度、相位、PSK 相位和 FSK 频率的单机或跨设备多轴循环扫描。
 - 支持 NI 多通道硬件定时模拟输入、实时绘图和连续 CSV/TXT 文本记录。
 - 通过 Vaunix Windows SDK 1.15 完整控制 LMS/BLX，并用 NI 累计边沿驱动频率和绝对功率联合扫描。
+- 用 NI 外部触发推进 Newport PR50CC 小角度循环扫描，保持首点并在末点下一触发回跳；可在同一任务内记录连续模拟输入。
+- 通过版本化配置包迁移设备、参数、保存任务和连接恢复列表，导入不自动开启输出或运动。
+- 提供带软件图标的 Windows 启动器，随整个项目目录迁移并发现目标电脑的 Python 环境。
 - 在无硬件、无 PyVISA、无 NI-DAQmx 的环境中提供可重复的虚拟联调路径。
 
 ### 2.2 非目标和边界
 
 - 软件命令屏障不等于多台仪器的电气同时更新。微秒级同步需要公共硬件触发和仪器端预装载能力。
 - `:OUTP<n>:LOAD` 是外部负载匹配/幅度校准设置，不会把 DG4000 输出级的固有源阻抗物理改成任意数值。
-- 当前不在触发联动运行时并行占用同一 NI 设备做模拟输入；资源租约会阻止冲突任务。
+- 独立触发和模拟采集窗口仍互斥；新增 Newport 旋转任务可作为同一个租约所有者，在内部管理同卡 counter 与可选连续 AI，启动时由 DAQmx 验证资源组合。
 - 当前跨设备模式不提供事务回滚。后续设备失败时，先前设备可能已经更新。
 - 当前软件不以 NI AO 代替 VISA/SCPI 参数下发。
 
@@ -40,9 +43,11 @@
 PyQt6 UI
   ├─ 设备中心 / 单设备窗口 / 跨设备任务窗口
   ├─ DeviceConnectionManager（共享连接与设备租约）
-  ├─ 任务控制器（触发、跨设备、模拟采集）
-  ├─ 类型化驱动（DG4000、Vaunix LMS/BLX、NI counter、NI analog）
-  └─ PyVISA / vnx_fmsynth.dll / NI-DAQmx / VirtualLab
+  ├─ 任务控制器（触发、跨设备、旋转扫描、模拟采集）
+  ├─ 类型化驱动（DG4000、Vaunix LMS/BLX、Newport、NI counter、NI analog）
+  └─ PyVISA / vnx_fmsynth.dll / pyserial / NI-DAQmx / VirtualLab
+
+Windows 启动：Lab Control Center.exe -> tools/launch_app.py -> 本目录 src
 
 本地数据目录
   ├─ devices.json
@@ -51,6 +56,9 @@ PyQt6 UI
   ├─ linkage_tasks.json
   ├─ run_logs/*.csv
   └─ 用户指定的模拟输入 CSV/TXT
+
+配置迁移：四个配置文件 + 连接恢复列表 -> 带校验和的 JSON 配置包
+旋转任务目录：config.json（含点表）/ rotation.csv / 可选原始 AI CSV
 ```
 
 UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监视和模拟采集均不能在 UI 线程中执行长时间阻塞操作。所有回调到界面的状态必须通过既有提交/信号路径处理。
@@ -62,11 +70,13 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 | `src/rigol_control/app.py` | CLI、Qt 应用创建、字体和主题启动 | 新增命令行参数时补 smoke test |
 | `src/rigol_control/models.py` | 设备类型和不可变设备记录 | 字段变化需考虑旧 JSON 兼容 |
 | `src/rigol_control/repository.py` | `devices.json` 与 `device_parameters.json` 读写、唯一性和原子替换 | 格式不兼容时提升 schema version 并提供迁移 |
+| `src/rigol_control/config_archive.py` | 完整配置包校验、备份、恢复日志与原子替换 | 不迁移采集数据；保留稳定 ID，导入不得启动输出或运动 |
 | `src/rigol_control/connections.py` | VISA 会话共享、NI 逻辑连接、设备租约、虚拟/实机工厂 | 新任务必须先获取租约并在所有退出路径释放 |
 | `src/rigol_control/services.py` | VISA/NI 资源发现与设备探测 | 未安装厂商驱动时必须返回可解释状态 |
 | `src/rigol_control/drivers/scpi.py` | 单 VISA 会话串行化、查询和批量写入 | 不允许多个线程绕过会话锁直接访问同一资源 |
 | `src/rigol_control/drivers/dg4000.py` | DG4000 类型化命令、负载、步进参数命令映射 | 新命令需同时覆盖格式校验和 fake backend 测试 |
 | `src/rigol_control/drivers/vaunix_lms.py` | Vaunix SDK 1.15 ctypes 绑定、稳定序列号连接、完整 LMS/BLX 控制和虚拟设备 | DLL 句柄不是稳定身份；频率为 10 Hz 单位；功率编码为 0.25 dB、实际分辨率为 0.5 dB |
+| `src/rigol_control/drivers/newport_smc100.py` | SMC100 串口协议、控制器/旋转台身份、状态与运动 | 型号与完整 ID 分离；运动命令不重试，连接不归零或移动 |
 | `src/rigol_control/drivers/ni_counter.py` | NI-DAQmx 累计边沿计数 | PFI、计数器和边沿必须来自真实设备能力 |
 | `src/rigol_control/drivers/ni_analog.py` | NI 多通道连续采样和数据块模型 | 保持一个任务内通道同步和样本形状一致 |
 | `src/rigol_control/units.py` | UI 显示单位与 SCPI 基准单位换算 | 内部值始终使用 Hz、V、度、秒等基准单位 |
@@ -74,30 +84,35 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 | `src/rigol_control/scan.py` | 扫描轴、同步/笛卡尔联合点生成与校验 | 控制最大联合点数，避免 UI/内存失控 |
 | `src/rigol_control/trigger.py` | 单 DG 累计触发监视与有序写入 | 不添加人为最小触发间隔或静默丢弃 |
 | `src/rigol_control/linkage.py` | 跨设备点分组、严格顺序屏障、CSV 运行日志 | 完成计数必须在本点全部设备成功后增加 |
+| `src/rigol_control/rotation_scan.py` | Newport 循环点表、运动/稳定屏障、触发异常停止与可选 AI | 启动保持 P0，首触发 P1；忙时触发和跳增不得补跑 |
 | `src/rigol_control/step_tasks.py` | 单机步进任务持久化 | 结构变化需做 schema 兼容 |
 | `src/rigol_control/linkage_tasks.py` | 跨设备任务持久化 | 设备引用使用稳定 device ID，不用显示名 |
 | `src/rigol_control/analog.py` | 连续文本写入、有限内存缓存、采集控制器 | 磁盘完整流和绘图缓存必须保持解耦 |
-| `src/rigol_control/virtual_lab.py` | 两台虚拟 DG、虚拟 NI 触发与四路模拟输入 | 新硬件功能优先增加虚拟等价路径和状态快照 |
+| `src/rigol_control/virtual_lab.py` | 两台虚拟 DG、Vaunix、Newport、NI 触发与四路模拟输入 | 新硬件功能优先增加虚拟等价路径和状态快照 |
 | `src/rigol_control/ui/main_window.py` | 多设备首页、连接/断开、窗口管理 | 不在卡片组件内创建第二份连接会话 |
 | `src/rigol_control/ui/dialogs.py` | 添加/编辑设备和资源下拉发现 | 保留手工输入作为驱动缺失时的后备路径 |
 | `src/rigol_control/ui/device_windows.py` | DG/NI 单设备页面和任务入口 | 文件较大，新增逻辑优先抽到模型/控制器后再接 UI |
 | `src/rigol_control/ui/vaunix_window.py` | Vaunix 全功能页面、BLX 序列和 NI 频率/功率联动 | 依据连接型号能力禁用不支持操作；页面参数必须自动持久化 |
+| `src/rigol_control/ui/newport_window.py` | 旋转台运动、NI 扫描和采集页面 | 参数恢复不运动，运行期间锁定配置并共享设备租约 |
 | `src/rigol_control/ui/linkage_window.py` | 跨设备轴编辑、任务保存、运行指标 | 修改轴后必须把旧点表标为过期 |
 | `src/rigol_control/ui/waveform.py` | 多通道实时曲线 | 只显示有限窗口，不承担完整数据归档 |
 | `tools/capture_manual_screenshots.py` | 无硬件生成说明书截图 | 新增关键页面后更新截图脚本和 Markdown 标记 |
 | `tools/build_user_manual.py` | Markdown 到 PDF 的受控排版 | 发版必须重建并目视检查每页 |
+| `tools/windows_launcher.cs`、`tools/launch_app.py` | Windows 运行时发现、项目定位、启动与错误日志 | 不写死开发机路径，启动必须使用 EXE 同目录源码 |
+| `tools/create_shortcut.ps1`、`tools/windows_shortcut.cs` | 生成指向同目录启动器的相对快捷方式 | `.lnk` 不纳入 Git；下载后用 `create_shortcut.cmd` 生成 |
+| `tools/build_windows_launcher.ps1`、`tools/build_app_icon.py` | 重建 EXE 和图标资源 | 修改启动器或图标后同步对应产物 |
 
 ## 5. 关键运行流程
 
 ### 5.1 设备连接与共享
 
 1. 首页从 `DeviceRepository` 读取设备记录。
-2. `DeviceConnectionManager.connect()` 按设备类型选择 PyVISA、Vaunix DLL、NI 探测或虚拟实验室。
+2. `DeviceConnectionManager.connect()` 按设备类型选择 PyVISA、Vaunix DLL、Newport 串口、NI 探测或虚拟实验室。
 3. SCPI 会话以 device ID 缓存，首页和设置窗口通过同一 manager 获取同一会话。
 4. 关闭设置窗口不自动断开设备；显式断开或应用退出才释放会话。
 5. 设备被任务租约占用时禁止断开或被另一个任务复用。
 
-### 5.2 单设备触发步进
+### 5.2 DG4000 / Vaunix 单设备触发步进
 
 ```text
 NI 硬件累计计数 -> monitor thread 更新 received_count
@@ -135,6 +150,19 @@ writer thread 在 applied_count < received_count 时逐个补发
 5. NI 联动复用 `TriggerStepController` 的累计计数、首触发 P0 和有序积压契约；在 Vaunix 驱动内把频率轴映射为 `SetFrequencyEx`，功率轴映射为绝对 `SetPowerLevel`。
 6. 启动时原子租用 Vaunix 与 NI；停止、错误和关闭窗口释放。设备端 BLX 序列与软件 NI 逐点联动不得同时运行。
 
+### 5.6 Newport 旋转扫描与可选采集
+
+1. 启动要求 READY，读取当前位置为 P0；不自动归零或移动到其他起点。
+2. 首个 NI 边沿移动到 P1，后续边沿依次推进；到达末点后保持，下一边沿绝对定位回 P0，继续循环。
+3. READY、位置回读容差和连续稳定时间共同确定到位。运动或稳定期间触发、计数跳增/回退、超时及设备故障会停止任务，不按 DG/Vaunix 的积压规则补跑。
+4. 同一任务租用 Newport 与 NI，在内部管理 counter 与可选连续 AI。原始采集数据独立写盘；阶段日志时间为主机观测时间，不能视为逐样本的硬件角度标签。
+
+### 5.7 配置迁移与启动器更新
+
+导出前读取已打开窗口的最新参数；导入先校验版本、校验和、设备与任务引用，再备份并替换四个配置文件。导入恢复连接时不应用参数或启动任务；运行中的任务和后台硬件操作会阻止导入。重启时先恢复未完成的导入事务，再初始化仓库。
+
+迁移时保留整个项目文件夹，并在目标电脑安装运行依赖；旧快捷方式通过 `create_shortcut.cmd` 重建。EXE 直接启动同目录源码，后续 Python 驱动修复同步源码并完全重启即可生效；修改 C# 启动器后才需重编 EXE。
+
 ## 6. 设计决策记录
 
 ### ADR-001：NI 只提供触发和采集，不用 AO 控制 DG4000
@@ -149,9 +177,9 @@ writer thread 在 applied_count < received_count 时逐个补发
 
 状态：已采纳。系统不主动节流或合并边沿，超出 DG4000 SCPI 吞吐的触发形成可观测积压。实验设计者应根据可接受延迟控制触发速率。
 
-### ADR-004：第一个触发才应用 P0
+### ADR-004：DG4000 / Vaunix 第一个触发才应用 P0
 
-状态：已采纳。任务启动仅准备计数器和线程，不预先写入起始点。第一个有效边沿写 P0，随后逐点推进并永久循环。
+状态：已采纳，适用于 DG4000 / Vaunix。任务启动仅准备计数器和线程，不预先写入起始点。第一个有效边沿写 P0，随后逐点推进并永久循环。Newport 使用 ADR-015 的保持首点语义。
 
 ### ADR-005：跨设备采用点级完成屏障
 
@@ -188,6 +216,18 @@ writer thread 在 applied_count < received_count 时逐个补发
 ### ADR-013：Vaunix 型号能力来自运行时查询，不以型号字符串硬编码
 
 状态：已采纳。连接后读取频率/功率范围、快速脉冲和 Chirp 能力；BLX 序列能力只由 BLX 系列身份启用。UI 首次显示宽范围编辑器，连接后收紧量程并禁用不支持按钮，驱动层继续做最终校验。虚拟设备选择全功能 BLX-403，用于覆盖所有页面，而非冒充任意实机型号。
+
+### ADR-014：DG4000 频率总上限由 `*IDN?` 型号决定
+
+状态：已采纳，自 2026-08-15 起生效。未连接状态使用全系列最高 200 MHz，确保 DG4202 保存值和预配置不会被原先固定的 160 MHz 截断；连接后从身份字符串提取型号并套用 DG4062=60 MHz、DG4102=100 MHz、DG4162=160 MHz、DG4202=200 MHz。同一能力对象同时约束 CH1/CH2 基本频率、FSK 跳跃频率、原生扫频起止值、单机触发点和跨设备联合点。UI 范围用于即时反馈，驱动层校验是最终类型化命令边界；原始 SCPI 控制台仍不解析命令，以保留型号/固件特有功能。未知型号暂用家族最高值并在界面说明，不能冒充已经识别。
+
+### ADR-015：Newport 保持首点，机械忙时触发明确停止
+
+状态：已采纳。当前位置作为 P0，首边沿移动到 P1，末点下一边沿回到 P0；每次运动后必须满足到位与稳定条件才能接受下一边沿。用户目标触发为 3 Hz、3.3 V，步长绝对值小于 1°，但这些输入不保证实机能在每个周期内完成运动；遇到忙时边沿或累计跳增时停止并记录原因，不补跑积压。该约定是 ADR-002/003 的旋转任务专用处理，DG/Vaunix 行为保持不变。
+
+### ADR-016：控制器版本、旋转台型号和完整标识分别保留
+
+状态：已采纳。VE 用于控制器版本识别，兼容现场 `SMC_CC - Controller-driver version 3.1.2`；ID? 首个下划线前的型号段需匹配 PR50CC。`stage_identifier` 保留包括 PN/UD 的完整标识用于显示和记录，避免将 `PR50CC_PN:B2210116_UD:01/10/2021` 误判为其他型号。错误控制器和相似但不同的型号仍拒绝连接。
 
 ## 7. DG4000 命令约定
 
@@ -234,6 +274,9 @@ SDK 返回状态必须统一经过 `_check_set_status()`；读取型函数不能
 | `linkage_tasks.json` | schema 1 | NI 触发源、跨设备扫描轴、模式、设备顺序和点表 |
 | `run_logs/*.csv` | CSV | 每个跨设备触发的点级和设备级执行证据 |
 | 用户选择的 `.csv`/`.txt` | Continuous Analog Input CSV v2 | 完整连续样本、时间和各通道电压 |
+| 用户导出的配置包 `.json` | `rigol-control-configuration` schema 1 | 四个配置文件、连接恢复列表及 SHA-256 校验 |
+| `.config-import-pending.json` | 导入恢复日志 | 导入被中断后恢复旧配置；由程序管理 |
+| 旋转任务 `config.json` / `rotation.csv` | JSON / CSV | 点表、完整设备身份、阶段、触发和完成记录；可附原始 AI CSV |
 
 JSON 保存采用临时文件写入后替换，避免正常保存中途留下半文件。新增必填字段时不要直接破坏旧文件；应提升 `SCHEMA_VERSION`、实现明确迁移或给出可操作错误。
 
@@ -271,17 +314,21 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 | 层级 | 重点 | 主要文件 |
 |---|---|---|
 | 纯模型 | 单位换算、扫描点、首触发循环、任务序列化 | `test_scan.py`、`test_sequence.py`、`test_step_tasks.py` |
-| 驱动 | SCPI 命令、负载范围、NI 配置映射、Vaunix 全功能状态与单位编码 | `test_hardware_core.py`、`test_vaunix.py` |
-| 控制器 | 无丢失积压、停止/异常、连续文本和缓存丢弃 | `test_analog.py`、`test_linkage.py` |
+| 驱动 | SCPI 命令、型号范围、NI 配置、Vaunix 能力和失效连接、Newport 现场回包 | `test_hardware_core.py`、`test_vaunix.py`、`test_vaunix_recovery.py`、`test_newport.py` |
+| 控制器 | DG/Vaunix 有序积压、Newport 回跳/忙时停止、连续文本和缓存丢弃 | `test_analog.py`、`test_linkage.py`、`test_newport.py` |
 | 基础设施 | 资源发现、连接共享、设备租约、原子仓库 | `test_discovery.py`、`test_connections.py`、`test_repository.py` |
-| 虚拟实验室 | DG/Vaunix 状态、触发、四通道采集、默认 50 Ω | `test_virtual_lab.py`、`test_vaunix.py` |
-| UI 端到端 | 四设备首页、下拉多选、负载独立应用、DG 跨设备联动、Vaunix 频率/功率联动 | `test_ui_smoke.py` |
+| 虚拟实验室 | DG/Vaunix/Newport 状态、触发、四通道采集、默认 50 Ω | `test_virtual_lab.py`、`test_vaunix.py`、`test_newport.py` |
+| UI 端到端 | 五台虚拟设备、动态范围、DG/Vaunix 联动、Newport 身份与运动状态 | `test_ui_smoke.py`、`test_newport_ui.py` |
+| 配置迁移 | 往返、备份、损坏包、写入失败/中断恢复、连接恢复和运行互斥 | `test_config_archive.py`、`test_config_archive_ui.py` |
+| Windows 入口 | 目录迁移、特殊字符路径、解释器回退、失败日志 | `test_windows_launcher.py` |
 
 关键回归契约：
 
 - 启动任务前 DG 不应自动收到 P0。
-- 第一个触发应用 P0，点表结束后循环回 P0。
-- 快速触发形成积压且最终按序追平。
+- DG/Vaunix 第一个触发应用 P0，点表结束后循环回 P0。
+- DG/Vaunix 快速触发形成积压且最终按序追平。
+- Newport 启动保持当前位置 P0，首触发移至 P1，末点下一触发回跳；忙时触发、计数跳增和超时必须停止。
+- Newport 连接接受现场 SMC_CC 版本和带 PN/UD 的 PR50CC 标识；连接/状态刷新不发送运动命令，错误型号继续拒绝。
 - 跨设备部分失败不增加完成计数。
 - 同一资源不能被两个运行任务占用。
 - 多通道采集文件每行列数一致，样本序号无间断。
@@ -293,6 +340,9 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 - Vaunix 首个 NI 触发应用频率/功率 P0，计数跳变必须完整补发且末点循环。
 - Vaunix `-7.5 dBm` 必须编码为 `-30`；`-7.25 dBm` 虽能形成整数编码，但必须在驱动、BLX 序列和 NI 点表预检中被拒绝。
 - 不支持快速脉冲、Chirp 或 BLX 序列的型号不得强行下发相关命令。
+- LMS 不调用 BLX 的 FrequencyStep / DwellTime / IdleTime；总览回读只依赖基础输出状态。
+- 配置恢复保留稳定 ID，损坏包不写入，失败可恢复；导入不自动下发参数、开启输出或移动。
+- Windows 启动器在旧目录失效后仍使用新目录源码，不依赖开发机 Python 地址。
 
 ## 11. 实机验收清单
 
@@ -301,7 +351,7 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 3. 在输出关闭状态下设置 CH1/CH2 负载，确认默认 50 Ω、75 Ω、高阻和一个自定义值。
 4. 修改频率/幅度后再次查询 LOAD，确认没有被波形应用覆盖。
 5. 用低风险幅度验证 CH1/CH2 波形、调制、扫频和脉冲串。
-6. 用慢速外部触发验证首边沿 P0、循环顺序和停止行为。
+6. 用慢速外部触发验证 DG 首边沿 P0、循环顺序和停止行为。
 7. 逐步提高触发速率，记录积压、平均下发时延和可接受上限。
 8. 跨两台 DG 验证设备顺序、点级屏障、运行 CSV 和断线错误。
 9. NI AI 先以低采样率验证四通道，再提高到目标速率并检查文件增长和 CPU/磁盘占用。
@@ -309,10 +359,100 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 11. 用本地 x64 SDK 搜索 Vaunix，核对型号、序列号、SDK 1.15、频率/功率范围与能力位。
 12. 保持 RF 关闭，验证频率、绝对功率、参考、扫频、脉冲/Chirp/BLX 序列的设置和回读；不支持功能应禁用。
 13. 用 NI 单步及批量触发验证 Vaunix 频率/功率同步和组合扫描、首触发 P0、循环、积压与停止释放。
+14. 关闭厂商串口工具后连接 Newport，保存 VE / ID? 原始回复，确认 PR50CC、READY、当前位置和速度；先完成只读连接验收。
+15. 按 `docs/NEWPORT_ROTATION_CN.md` 验证小角度移动、首点保持、逐点稳定和末点下一触发回跳，再确认 3 Hz 连续扫描能完成运动及稳定；忙时触发必须停止。
+16. 在 DAQmx/NI MAX 核对用户所称 USB6364 的实际产品型号、计数器/PFI 和 3.3 V 电气规格；验证同任务 counter + AI 的资源组合与原始数据记录。
 
 实体输出测试必须由实验负责人确认幅度、偏置、负载、端接方式、PFI 电平、接地和被测电路耐压。自动测试不能替代这些电气检查。
 
 ## 12. 版本开发日志
+
+### 未发布：开发汇总与源码同步 — 2026-09-09
+
+- 本轮纳入 GitHub 功能分支 `codex/continuous-ni-text-recording` 的改动：DG4000 型号频率上限、Newport 循环旋转扫描及现场 VE/ID? 回包兼容、完整配置导入导出、Vaunix LMS-802 能力分流和失效连接清理、软件图标及跨电脑启动器。
+- 补齐维护指南的架构、源码地图、配置格式、测试矩阵和故障排查；同步 README，明确 DG/Vaunix 首触发 P0 与 Newport 首触发 P1、忙时停止的区别。
+- 提交前最近一次代码验证：130 项自动测试全部通过（约 20.9 秒）；包括现场完整 VE/ID? 回包的协议与 UI 回归、Vaunix 真实 DLL 隔离 Test Mode、配置恢复和 Windows 入口测试。根目录 EXE 的无界面 smoke test 返回 0；未操作实体仪器。本次日志整理仅修改文档。
+- 软件版本保持 0.6.0；本次为功能分支源码同步，不创建版本标签或 GitHub Release，现有 PDF 未重建。下面各日期条目保留当时的验证结果与提交状态，当前提交范围以本条为准。
+- 换电脑时同步整个项目目录，运行 `create_shortcut.cmd` 生成当地快捷方式；保留或导入原配置。启动器直接使用本目录 `src`，Python 驱动更新后须完全重启应用。
+- 尚待现场验收：LMS-802 和 PR50CC 实物重新连接、机械稳定时间、末点回跳，以及实际 NI 型号与 3.3 V / 3 Hz 触发和可选 AI 联动；协议替身及虚拟测试不代表这些实机项目已经通过。
+
+### 未发布：PR50CC 带 PN/UD 附加信息的 ID? 回包解析 — 2026-09-09
+
+- 现场完整 ID? 回包为 `PR50CC_PN:B2210116_UD:01/10/2021`。控制器 VE 已识别成功，但前版把完整标识与裸型号 PR50CC 比较，导致错误拒绝连接。
+- 使用下划线分隔的首段作为型号，规范化为 stage_model=PR50CC；stage_identifier 和 identity 保留完整回包（去除两端空白），供身份栏、连接缓存和扫描日志使用。连接失败或断开时清除缓存。
+- 保留型号边界校验：PR50PP_PN:...、PR50CCX_PN:...、OTHER_PR50CC、_PN:PR50CC 不会被当作 PR50CC。附加信息的顺序、大小写不影响型号识别。
+- 用现场完整 VE / ID 字符串先复现原错误，再验证连接与 READY/位置回读；测试覆盖完整元数据、单项元数据、顺序变化、裸型号和不同型号。补充真实驱动配假串口的共享连接与窗口刷新测试，避免仅测试正则表达式。
+- 修改仍只需同步 src/rigol_control/drivers/newport_smc100.py 并完全重启软件；无需重编 EXE。验证仅使用协议替身与模拟设备，未对现场旋转架执行操作。
+- 验证结果：130 项自动测试全部通过；新增的现场回包 UI 回归覆盖共享连接、完整身份显示、-5.2° 位置/READY/速度刷新，确认没有运动写入；EXE 启动检查与 git diff --check 通过。
+
+### 未发布：现场 SMC_CC 固件 3.1.2 名称识别修复 — 2026-09-09
+
+- 新截图给出实际 VE 回包 `SMC_CC - Controller-driver version 3.1.2`。前一版仅识别 SMC / SMC100 / SMC100CC，遗漏 SMC_CC，串口已正常收到数据却在型号判断处中止。
+- 精确加入 SMC_CC 名称，继续检查名称结束边界、忽略大小写；不解析版本数字格式，因此版本数字间空格不影响识别。SMC_PP、SMC100PP、SMC_CCX、非 SMC 前缀仍拒绝；旋转台仍通过 ID? 精确验证 PR50CC。
+- 使用现场 VE 字符串先复现旧错误，再验证修复后的连接、READY 与位置回读。测试确认连接及回读仅发送 VE / ID? / TS / TP，无配置写入或运动命令，并扩展错误控制器与错误旋转台边界测试。
+- 本次更新文件为 src/rigol_control/drivers/newport_smc100.py。Windows EXE 启动器直接导入所在项目的 src，无需重编；另一电脑须同步更新后的源码并完全退出、重新启动软件。
+- 验证结果：128 项自动测试全部通过，EXE 启动检查与 git diff --check 通过；现场实物仍需重新连接复核。
+
+### 未发布：Windows 快捷方式跨电脑迁移修复 — 2026-09-09
+
+- 根因：旧快捷方式的 TargetPath 指向开发机绝对路径 pythonw.exe，Arguments/WorkingDirectory/IconLocation 也固定为旧项目路径；另一电脑的解释器或项目位置不同就无法启动。
+- 新增带内嵌图标的 Lab Control Center.exe，用自身所在目录定位源码，发现当前电脑可用的 64 位 Python 3.10+ 与 PyQt6。发现来源包括环境变量 LAB_CONTROL_PYTHON、项目内环境、PATH、py Launcher、注册表和 Conda；失效候选跳过，不安装或修改目标电脑环境。对子进程清理旧 PYTHONHOME/PYTHONPATH，按当前项目启动。
+- 使用 Windows IShellLinkW / SetRelativePath 生成同目录启动器快捷方式，移除 Python 参数、固定工作目录和独立图标绝对路径；嵌入图标跟随 EXE。原有快捷方式运行 create_shortcut.cmd 更新一次，后续整文件夹移动；单独移动桌面快捷方式无法携带项目内容。
+- 启动失败显示中文错误和日志路径，日志保存到 LOCALAPPDATA/RigolGeneratorControl/logs。run_app.cmd 复用同一启动流程；无 Python/依赖时给出安装说明，非完整免安装运行时。
+- 新增 4 项 Windows 集成回归：原路径失效后 Shell 快捷方式仍解析到新目录，中文/空格/撇号/特殊字符参数完整传递，失效 Python 候选回退，应用失败/项目缺失返回错误并记录日志。迁移测试仅重命名临时测试目录，不移动用户项目。
+- Windows 相对链接依据：[IShellLinkW::SetRelativePath](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ishelllinkw-setrelativepath)。源码为 tools/windows_launcher.cs、tools/windows_shortcut.cs，构建入口为 tools/build_windows_launcher.ps1。
+- 验证结果：127 项自动测试全部通过，EXE 与 run_app.cmd 启动检查通过，git diff --check 通过。
+
+### 未发布：LMS-802 BAD_PARAMETER 与 PR50CC 识别修复 — 2026-09-09
+
+- 现场截图确认 Vaunix LMS-802 / SN 35730 已连接，失败点是 `fnLMS_GetFrequencyStepEx`。本地 Windows SDK 1.15 Test Mode 可复现相同 BAD_PARAMETER；旧 GetFrequencyStep 接口也不能用于 LMS。
+- 根因依据：厂商 Windows 示例 LMSTest.cpp 将步长读取放在 BLX 分支；同包 Linux SDK 的 `fnLMS_GetFrequencyStepEx` 明确限制为 BLX，否则返回 BAD_PARAMETER。修复按型号分流读写：LMS 只使用 SweepTime，BLX 使用 FrequencyStep / DwellTime / IdleTime。LMS 的 sweep_step_hz 返回 None 表示不适用，不伪造 0。
+- 总览连接后及应用输出后的回读改为独立 output_snapshot，仅读取频率、功率、RF、参考源和状态，不依赖扫频/序列功能。LMS 界面禁用并说明“BLX 频率步长”，完整回读不覆盖该输入框；NI 触发频率步进保持可用。BLX 实际参数错误仍正常上报。
+- Newport 原实现错误要求 VE 回包包含 SMC100CC。官方手册给出的合法回包为 `1VE SMC - Controller-driver version 1.00r`，VE 表示控制器版本，旋转台型号由 `ID?` 读取。现兼容通用 SMC / SMC100 固件格式，再读取并验证 PR50CC；身份栏同时显示固件和旋转台。拒绝明确的 SMC100PP、其他控制器或不同旋转台，并报告原始识别值。
+- 连接期间仅发送 VE 和 ID?，不改写旋转台配置、不触发归零或运动。协议测试覆盖旧版/新版回包、空格、错误控制器与错误旋转台；Vaunix 增加真实 DLL 独立进程 Test Mode 回归，以免纯虚拟测试遗漏厂商能力限制。
+- 协议依据：[Newport 官方用户手册，ID 与 VE 命令](https://www.newport.com/medias/sys_master/resources/hb8/he4/9966292729886/SMC100CC%20and%20SMC100PP%20-%20User%20Manual/SMC100CC-and-SMC100PP-User-Manual.pdf)。以上测试不替代现场 LMS-802 / PR50CC 实物复核。
+- 验证结果：123 项测试全部通过（本次新增 8 项），包括真实 Vaunix DLL 的隔离 Test Mode 测试；Qt 启动、compileall 和 git diff --check 通过。
+
+### 未发布：Vaunix 失效连接清理与软件图标 — 2026-09-08
+
+- 修复关闭设备报错后仍保留句柄、能力缓存和连接标志的问题；原始 USB 错误不会被后续清理错误覆盖。
+- 修复连接管理器在底层已断开、UI 尚未轮询时，直接返回旧缓存而没有执行重连的问题。重连按序列号枚举获取新句柄。
+- 替代 0.6.0 的 DEVICE_NOT_READY 自动重初始化策略：失效或未就绪句柄直接结束会话，等待显式重连；BAD_HID_IO 保留最多两次短暂重试，耗尽后结束会话。参数范围错误不触发断开。
+- 回读检查 DEV_CONNECTED/DEV_OPENED，避免状态为 0 时仍返回 connected=True；枚举忽略热拔插期间返回错误码的条目。闲置 UI 不做额外 USB 轮询。
+- 新增可编辑 SVG、PNG、包含 16–256 像素的 ICO，接入 Qt 默认窗口图标和 Windows AppUserModelID，并将资源纳入安装包。图形使用波形、采样点和旋转箭头。
+- 新增 create_shortcut.cmd / tools/create_shortcut.ps1，在项目目录生成无终端窗口的 Python 启动快捷方式；支持指定 Python 路径。tools/build_app_icon.py 可用 PyQt6 和 Pillow 重新生成图标。
+- 验证：115 项自动测试全部通过，其中新增 8 项覆盖失效句柄、关闭失败、枚举拔线、缓存重连以及合法负功率/高频数值。实机只读检查成功加载本地 x64 DLL 1.15，但枚举为 0 台，尚不能确认用户现场问题已解决。
+
+### 未发布：完整配置导入、导出与连接恢复 — 2026-09-08
+
+- 设备中心新增“导出配置 / 导入配置”。单个带版本及 SHA-256 校验的 JSON 包覆盖 `devices.json`、`device_parameters.json`、`step_tasks.json`、`linkage_tasks.json` 和导出时已连接设备 ID；导出同步读取全部已打开设备窗口的最新参数。
+- 导入保留稳定 ID、任务引用、旧参数绑定结构和原有自定义字段。预览后整体替换，默认可恢复备份中的连接；不自动下发设备参数、启用输出、移动或启动任务。未知格式/设备、损坏校验和重复 ID/资源在写入前拒绝。
+- 导入前保留可重新导入的旧配置包及原文件字节备份；固定文件名写入采用临时文件替换与恢复日志，失败时回滚，程序中断后在设备仓库初始化前恢复。当前配置损坏时仍保留原始字节并允许用有效包修复。
+- 运行中的任务或后台硬件操作会阻止导入；确认导入后关闭旧窗口，防止自动保存覆盖新参数。配置恢复在后台执行，连接恢复复用已有连接管理器。修正旧窗口延迟销毁时可能移除同 ID 新窗口引用的问题。
+- 新增配置服务与 UI 测试，覆盖五类设备/参数/任务往返、保留引用、旧参数、备份、损坏包、写入失败、模拟进程中断、取消导入、运行中阻止导入及虚拟连接恢复。新增 `docs/CONFIG_BACKUP_CN.md`，截图脚本增加导入预览。
+- 验证：全量 107 项 unittest 通过，新增配置服务 10 项与 UI 4 项；无界面 smoke test 与 `git diff --check` 通过。截图脚本生成 16 张页面图，首页配置入口与导入预览已目视检查。连接恢复使用虚拟设备验证，未操作实体仪器。
+- 兼容性：原四个配置文件 schema 不变，新完整配置包 schema 为 1；保留既有设备 ID 和自动保存路径。不包含采集数据、仪器运行状态或厂商驱动。当前为未发布功能，未提交或推送。
+
+### 未发布：Newport SMC100CC / PR50CC 循环旋转步进 — 2026-09-08
+
+- 新增设备类型、串口枚举、共享连接管理及独立运动/扫描/采集窗口；资源格式 COM3::1。串口按 57600/8N1/XON-XOFF/CRLF 连接，TS 非零错误不可吞掉，运动指令不重试；首版同串口只允许一个连接地址。
+- 新增 `drivers/newport_smc100.py` 与 `rotation_scan.py`。启动读取当前位置为 P0，不运动；首触发 P1；末点下一触发绝对定位回 P0，持续循环；步长支持正负且绝对值小于 1°。
+- READY + 回读容差 + 连续稳定时间构成到位屏障。忙时触发、累计跳增/回退、超时、限位和故障明确停止，不补跑；停止/错误尝试 ST，停止未确认时报告状态未知。
+- 同一任务原子租用 Newport 与 NI，内部可选运行 counter + 连续 AI；采集不推进运动。运行目录保存配置、点表、运动阶段日志与可选原始 AI CSV，数据块日志仅标记主机接收观测时间，不冒充逐样本硬件角度同步。
+- 参数使用稳定语义键，NI 使用稳定设备 ID，恢复不自动运动、不改绑已删除设备。虚拟实验室新增带运动耗时的 PR50CC，五台设备共同供 UI/测试使用。
+- 新增协议、循环/回跳、忙时、停止/超时、资源、采集、UI 按钮与持久化测试；截图脚本增加三张 Newport 页面。
+- 验证：`PYTHONPATH=src python -m unittest discover -s tests -q` 共 93 项通过；`python -m rigol_control --smoke-test --data-dir tmp/newport-smoke` 通过；`git diff --check` 通过。截图脚本生成 15 张页面图，Newport 运动、扫描、采集三页已目视检查。3 Hz 虚拟测试包含两轮及回跳；不代表实机机械性能。
+- 保留用户已有 DG4000 动态频率范围与通信修改；DG/Vaunix 首触发 P0 和补发积压规则不变。作为 0.6.0 后的未发布功能，本次未执行版本发布、提交或推送。
+- 详情和实机步骤见 `docs/NEWPORT_ROTATION_CN.md`。未实机验证；用户称 NI USB6364，准确产品型号和 3.3 V PFI 电气规格待 DAQmx/NI MAX 确认。
+
+### 未发布：DG4000 型号动态频率上限 — 2026-08-15
+
+- 删除 CH1/CH2 基本频率、FSK 跳跃频率和原生扫频起止值中固定的 160 MHz UI 上限；未连接时统一允许到 DG4000 家族最高 200 MHz。
+- VISA 会话缓存连接和自动重连返回的 `*IDN?`；DG 驱动解析 DG4062、DG4102、DG4162、DG4202，并分别采用 60、100、160、200 MHz 型号总上限。
+- 打开已连接设备窗口或从首页同步连接状态时，所有相关单位输入器和频率扫描轴同步收紧；DG4202 可输入和下发 200 MHz，DG4162 恢复到 200 MHz 的旧值会明确收紧到 160 MHz。
+- 基本波形、FSK 类型化设置、单机触发点和跨设备联合点在发送/启动前执行第二层型号校验；错误包含联合点序号、通道、参数、识别型号和允许上限。
+- 新增四个型号、虚拟型号后缀、未知型号回退、DG4162 拒绝 200 MHz、DG4202 接受 200 MHz，以及 UI 全入口动态范围回归测试。
+- 兼容性：`devices.json`、`device_parameters.json` 和任务文件格式不变；未连接配置仍可覆盖全系列，连接后才按当前实体型号收紧。未使用 DG4202 实机验证，发布前需保持输出关闭并用 `*IDN?`、`:SYST:ERR?` 和低幅度信号完成验收。
 
 ### 0.6.0 硬件通信可靠性修复 — 2026-08-07
 
@@ -462,6 +602,9 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 | Vaunix DLL 缺失或位数不匹配 | 自动搜索、环境变量、明确错误、虚拟设备后备 | 发布包携带经过授权和版本锁定的厂商运行库 |
 | Vaunix 型号能力不同 | 连接后动态范围/能力读取和双层校验 | 建立实机型号验收矩阵 |
 | 软件 NI 触发快于 Vaunix USB 下发 | 累计计数、有序积压、实时指标 | 优先使用 BLX 设备端序列或公共硬件触发 |
+| Newport 单周期运动/稳定未完成 | 忙时触发或累计跳增立即停止，不补跑 | 实测 3 Hz 下步进与回跳耗时，调整扫描参数 |
+| Newport AI 与角度时间对应 | 保留原始采样及主机观测阶段日志 | 需要逐样本对应时另行设计硬件同步 |
+| 迁移电脑缺少运行环境 | 启动器发现 Python/PyQt6 并显示失败日志 | 目标电脑安装依赖，整体迁移项目 |
 | UI 主文件增长 | 业务逻辑已下沉控制器 | 继续拆分 DG 和 NI 页面组件 |
 
 ## 16. 故障定位顺序
@@ -501,6 +644,20 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 3. 核对资源中的序列号，而不是记录 SDK 临时 `DEVID`。
 4. 连接后查看总览范围和能力；快速脉冲、Chirp、BLX 序列只能按驱动真实报告使用。
 5. 功率使用绝对 dBm，不能把 `GetPowerLevel` 的相对衰减语义混入 UI；当前回读使用 `GetAbsPowerLevel`。
+6. LMS-802 的 `GetFrequencyStepEx` 报 BAD_PARAMETER 时确认已更新 LMS/BLX 能力分流版本；LMS 只使用扫频时间，总览不依赖 BLX 步长读取。保留其他接口的具体错误码，不笼统忽略 BAD_PARAMETER。
+
+### Newport 已响应但无法识别或扫描停止
+
+1. 关闭 Newport 原软件，核对 COM 端口和控制器地址；保留报错中的 VE 与 ID? 完整回复。
+2. 当前识别支持 `SMC_CC - Controller-driver version 3.1.2` 和 `PR50CC_PN:B2210116_UD:01/10/2021`。若相同回包仍被拒绝，先确认启动的项目目录已更新 `src/rigol_control/drivers/newport_smc100.py` 并完全重启。
+3. 控制器版本与旋转台身份分别验证；不要为连接成功而跳过 PR50CC 型号检查或写入其他型号配置。
+4. 扫描前确认 READY，检查运行目录的 `rotation.csv` 区分忙时触发、累计跳增、超时、限位与设备错误；降低频率或调整步长/稳定参数后重新验收。
+
+### Windows 迁移后快捷方式无法启动
+
+1. 确认复制了整个项目目录，包含 EXE、`src`、`tools`；从该目录运行 `create_shortcut.cmd` 重建旧链接。
+2. 直接运行 `Lab Control Center.exe`，读取弹窗和 `%LOCALAPPDATA%\RigolGeneratorControl\logs\launcher-*.log`。
+3. 确认目标电脑具备 64 位 Python 3.10+、PyQt6 和所需仪器依赖；自定义解释器位置可用 `LAB_CONTROL_PYTHON` 指定。启动器不自动安装依赖。
 
 ## 17. 新变更记录模板
 

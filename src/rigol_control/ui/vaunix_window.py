@@ -37,6 +37,7 @@ from ..drivers.vaunix_lms import (
     VIRTUAL_VAUNIX_RESOURCE,
     VaunixCapabilities,
     VaunixLmsDevice,
+    VaunixOutputSnapshot,
     VaunixSequenceElement,
     VaunixSnapshot,
     VirtualVaunixLmsDevice,
@@ -218,7 +219,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
         self.sweep_external_trigger = QCheckBox("使用外部扫频/Chirp 触发")
         form.addRow("起始频率", self.sweep_start)
         form.addRow("终止频率", self.sweep_end)
-        form.addRow("频率步长", self.sweep_step)
+        form.addRow("BLX 频率步长", self.sweep_step)
         form.addRow("LMS 扫频时间", self.sweep_time)
         form.addRow("BLX 点驻留", self.sweep_dwell)
         form.addRow("BLX 空闲时间", self.sweep_idle)
@@ -618,6 +619,11 @@ class VaunixLmsWindow(BaseDeviceWindow):
             f"Chirp={'支持' if caps.has_chirp else '不支持'}"
         )
         self.sweep_time.setEnabled(not caps.is_blx)
+        self.sweep_step.setEnabled(caps.is_blx)
+        self.sweep_step.setToolTip(
+            "BLX 内部扫频的频率步长" if caps.is_blx else
+            "LMS 使用扫频时间，不支持独立设置内部扫频步长；NI 触发步进仍可设置频率步长。"
+        )
         self.sweep_dwell.setEnabled(caps.is_blx)
         self.sweep_idle.setEnabled(caps.is_blx)
         self.pulse_enabled.setEnabled(caps.has_fast_pulse)
@@ -653,9 +659,9 @@ class VaunixLmsWindow(BaseDeviceWindow):
     def _refresh_metrics_only(self) -> None:
         if not self.device.is_connected:
             return
-        self.submit(self.device.snapshot, on_success=self._metrics_refreshed)
+        self.submit(self.device.output_snapshot, on_success=self._metrics_refreshed)
 
-    def _metrics_refreshed(self, snapshot: VaunixSnapshot) -> None:
+    def _metrics_refreshed(self, snapshot: VaunixSnapshot | VaunixOutputSnapshot) -> None:
         self.overview_metrics["frequency"].setText(
             f"{snapshot.frequency_hz / 1e6:.9g} MHz"
         )
@@ -678,7 +684,8 @@ class VaunixLmsWindow(BaseDeviceWindow):
         )
         self.sweep_start.setValue(snapshot.sweep_start_hz)
         self.sweep_end.setValue(snapshot.sweep_end_hz)
-        self.sweep_step.setValue(max(10.0, snapshot.sweep_step_hz))
+        if snapshot.sweep_step_hz is not None:
+            self.sweep_step.setValue(max(10.0, snapshot.sweep_step_hz))
         if snapshot.sweep_time_ms:
             self.sweep_time.setValue(snapshot.sweep_time_ms / 1000.0)
         if snapshot.dwell_time_ms:
@@ -714,7 +721,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
             self.sequence_idle.setValue(snapshot.sequence_idle_ms / 1000.0)
         self.statusBar().showMessage("已从 Vaunix 设备读取全部参数", 5000)
 
-    def _set_status_text(self, snapshot: VaunixSnapshot) -> None:
+    def _set_status_text(self, snapshot: VaunixSnapshot | VaunixOutputSnapshot) -> None:
         bits = []
         for flag, label in (
             (0x1, "CONNECTED"),

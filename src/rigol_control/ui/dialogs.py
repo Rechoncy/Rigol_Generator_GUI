@@ -122,6 +122,12 @@ class DeviceDialog(QDialog):
             self.hint.setText("自动读取 NI-DAQmx 中已注册的设备；也可手动输入 NI MAX 中的设备名。")
             if not current_name:
                 self.name.setPlaceholderText("例如 NI USB-6363")
+        elif selected is DeviceKind.NEWPORT_SMC100:
+            self.connection.addItems(["Newport RS-232", "内置模拟器"])
+            self.resource.lineEdit().setPlaceholderText("COM3::1")
+            self.hint.setText("SMC100CC + PR50CC；串口::控制器地址，例如 COM3::1。搜索只枚举串口。")
+            if not current_name:
+                self.name.setPlaceholderText("例如 Newport PR50CC")
         elif selected is DeviceKind.VAUNIX_LMS:
             self.connection.addItems(["Vaunix USB DLL", "内置模拟器"])
             self.resource.lineEdit().setPlaceholderText(

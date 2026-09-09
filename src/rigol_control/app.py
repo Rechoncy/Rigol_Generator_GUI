@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QTimer
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPalette
 from PyQt6.QtWidgets import QApplication
 
 from .repository import DeviceRepository
@@ -27,7 +27,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def create_application(argv: list[str] | None = None) -> QApplication:
+    if sys.platform == "win32":
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "RigolGeneratorControl.LabControlCenter"
+        )
     app = QApplication(argv if argv is not None else sys.argv)
+    app.setWindowIcon(QIcon(str(Path(__file__).parent / "assets" / "app_icon.ico")))
     app.setApplicationName("DG4000 Vaunix NI Control Center")
     app.setOrganizationName("RigolGeneratorControl")
     app.setStyle("Fusion")

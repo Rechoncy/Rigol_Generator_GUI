@@ -1,10 +1,75 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from enum import Enum
 
 from .scpi import ScpiSession
+
+
+DG4000_MODEL_MAX_FREQUENCY_HZ: dict[str, float] = {
+    "DG4062": 60_000_000.0,
+    "DG4102": 100_000_000.0,
+    "DG4162": 160_000_000.0,
+    "DG4202": 200_000_000.0,
+}
+DG4000_FAMILY_MAX_FREQUENCY_HZ = max(DG4000_MODEL_MAX_FREQUENCY_HZ.values())
+_DG4000_MODEL_PATTERN = re.compile(r"(?<![A-Z0-9])(DG\d{4})(?![A-Z0-9])", re.IGNORECASE)
+
+
+@dataclass(frozen=True, slots=True)
+class DG4000Capabilities:
+    """Frequency capability inferred from the model token in ``*IDN?``."""
+
+    model: str | None
+    maximum_frequency_hz: float
+    model_recognized: bool
+
+
+def dg4000_capabilities(identity: str) -> DG4000Capabilities:
+    """Return a safe UI capability profile for one DG4000 identity.
+
+    Before a connection exists (or for an unknown future model), the editor
+    uses the widest range of the documented DG4000 family. Once ``*IDN?``
+    identifies a known model, all typed controls and commands use that model's
+    actual sine-wave frequency ceiling.
+    """
+
+    match = _DG4000_MODEL_PATTERN.search(str(identity or ""))
+    model = match.group(1).upper() if match else None
+    maximum = DG4000_MODEL_MAX_FREQUENCY_HZ.get(
+        model or "",
+        DG4000_FAMILY_MAX_FREQUENCY_HZ,
+    )
+    return DG4000Capabilities(
+        model=model,
+        maximum_frequency_hz=maximum,
+        model_recognized=model in DG4000_MODEL_MAX_FREQUENCY_HZ,
+    )
+
+
+def validate_dg4000_frequency(
+    value_hz: float,
+    capabilities: DG4000Capabilities,
+    *,
+    parameter_name: str = "频率",
+) -> float:
+    """Validate an absolute output/FSK frequency against a model profile."""
+
+    value = float(value_hz)
+    if not math.isfinite(value):
+        raise ValueError(f"{parameter_name}必须是有限数值")
+    if value <= 0:
+        raise ValueError(f"{parameter_name}必须大于 0 Hz")
+    if value > capabilities.maximum_frequency_hz:
+        model = capabilities.model or "DG4000 系列"
+        maximum_mhz = capabilities.maximum_frequency_hz / 1_000_000.0
+        raise ValueError(
+            f"{parameter_name} {value / 1_000_000.0:g} MHz 超过 "
+            f"{model} 的 {maximum_mhz:g} MHz 上限"
+        )
+    return value
 
 
 class StepParameter(str, Enum):
@@ -143,16 +208,33 @@ class DG4000Driver:
 
     def __init__(self, session: ScpiSession) -> None:
         self.session = session
+        self._identity = ""
 
     @property
     def is_connected(self) -> bool:
         return self.session.is_connected
 
+    @property
+    def identity(self) -> str:
+        return str(getattr(self.session, "identity", "") or self._identity)
+
+    @property
+    def capabilities(self) -> DG4000Capabilities:
+        return dg4000_capabilities(self.identity)
+
+    def set_identity(self, identity: str) -> None:
+        """Remember identity supplied by the shared connection manager."""
+
+        self._identity = str(identity or "").strip()
+
     def connect(self) -> str:
-        return self.session.connect()
+        identity = self.session.connect()
+        self.set_identity(identity)
+        return identity
 
     def disconnect(self) -> None:
         self.session.disconnect()
+        self._identity = ""
 
     def write(self, command: str) -> None:
         self.session.write(command)
@@ -175,7 +257,9 @@ class DG4000Driver:
         self.write_settings(commands)
 
     def identify(self) -> str:
-        return self.query("*IDN?")
+        identity = self.query("*IDN?")
+        self.set_identity(identity)
+        return identity
 
     def error(self) -> str:
         return self.query(":SYST:ERR?")
@@ -218,6 +302,11 @@ class DG4000Driver:
 
     def _basic_commands(self, channel: int, waveform: BasicWaveform) -> list[str]:
         validate_channel(channel)
+        validate_dg4000_frequency(
+            waveform.frequency_hz,
+            self.capabilities,
+            parameter_name=f"CH{channel} 输出频率",
+        )
         function = self.FUNCTIONS.get(waveform.function.upper(), self.FUNCTIONS.get(waveform.function))
         if function is None:
             raise ValueError(f"不支持的基本波形：{waveform.function}")
@@ -294,6 +383,12 @@ class DG4000Driver:
                 "OSK": "TIME",
             }.get(mode)
             if parameter_word:
+                if mode == "FSK":
+                    validate_dg4000_frequency(
+                        parameter,
+                        self.capabilities,
+                        parameter_name=f"CH{channel} FSK 跳跃频率",
+                    )
                 commands.append(
                     f":SOUR{channel}:MOD:{mode}:{parameter_word} {finite_number(parameter)}"
                 )
@@ -301,6 +396,7 @@ class DG4000Driver:
         self._write_configuration_many(commands)
 
     def apply_step(self, parameter: StepParameter, channel: int, value: float) -> None:
+        self.validate_step_value(StepValue(parameter, channel, value))
         self._write_configuration(
             f"{parameter.command(channel)} {finite_number(value)}"
         )
@@ -308,9 +404,31 @@ class DG4000Driver:
     def apply_steps(self, values: list[StepValue] | tuple[StepValue, ...]) -> None:
         if not values:
             raise ValueError("联合扫描点至少需要一个参数")
+        self.validate_step_values(values)
         self._write_configuration_many(
             [
                 f"{item.parameter.command(item.channel)} {finite_number(item.value)}"
                 for item in values
             ]
         )
+
+    def validate_step_value(self, item: StepValue) -> None:
+        validate_channel(item.channel)
+        if item.parameter in {
+            StepParameter.FREQUENCY,
+            StepParameter.FSK_FREQUENCY,
+        }:
+            validate_dg4000_frequency(
+                item.value,
+                self.capabilities,
+                parameter_name=f"CH{item.channel} {item.parameter.short_label}",
+            )
+        else:
+            finite_number(item.value)
+
+    def validate_step_values(
+        self,
+        values: list[StepValue] | tuple[StepValue, ...],
+    ) -> None:
+        for item in values:
+            self.validate_step_value(item)

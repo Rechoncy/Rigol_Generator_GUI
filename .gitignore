@@ -9,4 +9,5 @@ dist/
 .vscode/
 runtime-data/
 tmp/
+*.lnk
 
