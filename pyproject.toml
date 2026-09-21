@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rigol-generator-gui"
-version = "0.6.0"
-description = "DG4000, Vaunix LMS/BLX, and NI DAQ multi-device control center"
+version = "0.7.0"
+description = "Portable DG4000, SIGLENT SSG, Vaunix, Newport and NI DAQ control center"
 requires-python = ">=3.10"
 dependencies = [
     "PyQt6>=6.7",

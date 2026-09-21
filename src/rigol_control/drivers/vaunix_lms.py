@@ -10,6 +10,7 @@ from threading import RLock
 from typing import Any, Callable
 
 from .dg4000 import StepParameter, StepValue
+from ..runtime import bundle_root, executable_dir, is_frozen
 
 
 MAX_DEVICES = 64
@@ -143,19 +144,29 @@ def locate_vaunix_dll() -> Path:
     if configured:
         candidates.append(Path(configured).expanduser())
     module_path = Path(__file__).resolve()
-    repository_root = module_path.parents[3]
-    candidates.extend(
-        (
-            Path.cwd() / "vnx_fmsynth.dll",
-            repository_root / "vnx_fmsynth.dll",
+    resource_root = bundle_root()
+    if is_frozen():
+        candidates.extend((
+            executable_dir() / "vendor" / "vaunix" / "vnx_fmsynth.dll",
+            resource_root / "vendor" / "vaunix" / "vnx_fmsynth.dll",
+            executable_dir() / "vnx_fmsynth.dll",
+            resource_root / "vnx_fmsynth.dll",
             module_path.parent / "vnx_fmsynth.dll",
-        )
-    )
+        ))
+        search_roots = ()
+    else:
+        search_roots = (Path.cwd(), resource_root)
+        candidates.extend((
+            resource_root / "vendor" / "vaunix" / "vnx_fmsynth.dll",
+            Path.cwd() / "vnx_fmsynth.dll",
+            resource_root / "vnx_fmsynth.dll",
+            module_path.parent / "vnx_fmsynth.dll",
+        ))
     patterns = (
         "lms-sdk-*/LMS_Windows_SDK_*/x64/Release/vnx_fmsynth.dll",
         "lms-sdk-*/LMS_Windows_SDK_*/Python_Example/vnx_fmsynth.dll",
     )
-    for root in dict.fromkeys((Path.cwd(), repository_root)):
+    for root in dict.fromkeys(search_roots):
         for pattern in patterns:
             candidates.extend(sorted(root.glob(pattern), reverse=True))
     for candidate in candidates:
@@ -163,7 +174,8 @@ def locate_vaunix_dll() -> Path:
         if resolved.is_file():
             return resolved
     raise VaunixLmsError(
-        "未找到 Vaunix vnx_fmsynth.dll。请保留 lms-sdk 文件夹，或设置 "
+        "未找到 Vaunix vnx_fmsynth.dll。请将厂商 Windows x64 DLL 放到 "
+        "EXE 旁的 vendor/vaunix/ 文件夹（源码版也支持 lms-sdk 文件夹），或设置 "
         "VAUNIX_LMS_DLL 指向 Windows x64 DLL。"
     )
 

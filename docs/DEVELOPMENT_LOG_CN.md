@@ -1,15 +1,15 @@
 # DG4000 + SIGLENT SSG + Vaunix + Newport + NI 多设备联动控制：开发日志与维护指南
 
-文档版本：1.1
+文档版本：1.2
 
-对应软件版本：0.6.0（含尚未正式发布的后续开发，见第 12 节）
+对应软件版本：0.7.0（Windows x64 便携发行；阶段记录见第 12 节）
 
 最后更新：2026-09-21
 适用仓库：`Rigol_Generator_GUI`
 
 ## 1. 文档目的
 
-本文面向接手项目的开发者、测试人员和实验室管理员，集中记录系统目标、代码结构、关键设计决策、版本演进、数据格式、测试方法、发布流程和已知限制。当前功能操作见[总使用说明](USER_MANUAL_CN.md)、[鼎阳 SSG 详细使用说明](SIGLENT_SSG_CN.md)、[Newport 操作说明](NEWPORT_ROTATION_CN.md)和[配置备份](CONFIG_BACKUP_CN.md)；鼎阳命令、状态与测试交接见[SSG 开发说明](SIGLENT_SSG_DEVELOPMENT_CN.md)；现有 PDF 尚未重建，不能作为新增功能的完整说明。本文重点回答“为什么这样设计、改动应落在哪里、如何验证不会破坏现有联动”。
+本文面向接手项目的开发者、测试人员和实验室管理员，集中记录系统目标、代码结构、关键设计决策、版本演进、数据格式、测试方法、发布流程和已知限制。当前功能操作见[总使用说明](USER_MANUAL_CN.md)、[鼎阳 SSG 详细使用说明](SIGLENT_SSG_CN.md)、[Newport 操作说明](NEWPORT_ROTATION_CN.md)和[配置备份](CONFIG_BACKUP_CN.md)；鼎阳命令、状态与测试交接见[SSG 开发说明](SIGLENT_SSG_DEVELOPMENT_CN.md)；便携运行、构建和迁移见[发行说明](../release/README.md)及[0.7.0 变更](../release/NOTES-0.7.0.md)；现有 PDF 尚未重建，不能作为新增功能的完整说明。本文重点回答“为什么这样设计、改动应落在哪里、如何验证不会破坏现有联动”。
 
 每次完成可发布功能后，应同步更新本文第 12 节的版本记录、相关设计决策、测试矩阵和已知限制。不要只修改界面而遗漏驱动、虚拟设备、持久化、自动测试或说明书。
 
@@ -27,7 +27,7 @@
 - 通过 Vaunix Windows SDK 1.15 完整控制 LMS/BLX，并用 NI 累计边沿驱动频率和绝对功率联合扫描。
 - 用 NI 外部触发推进 Newport PR50CC 小角度循环扫描，保持首点并在末点下一触发回跳；可在同一任务内记录连续模拟输入。
 - 通过版本化配置包迁移设备、参数、保存任务和连接恢复列表，导入不自动开启输出或运动。
-- 提供带软件图标的 Windows 启动器，随整个项目目录迁移并发现目标电脑的 Python 环境。
+- 提供内置 Python/Qt 的 Windows x64 目录 ZIP 和单文件 EXE，目标电脑免 Python 安装；保留原有源码启动器供开发使用。
 - 在无硬件、无 PyVISA、无 NI-DAQmx 的环境中提供可重复的虚拟联调路径。
 
 ### 2.2 非目标和边界
@@ -48,7 +48,11 @@ PyQt6 UI
   ├─ 类型化驱动（DG4000、SIGLENT SSG、Vaunix LMS/BLX、Newport、NI counter、NI analog）
   └─ PyVISA / vnx_fmsynth.dll / pyserial / NI-DAQmx / VirtualLab
 
-Windows 启动：Lab Control Center.exe -> tools/launch_app.py -> 本目录 src
+Windows 发行：PyInstaller EXE -> 内置 Python/Qt/Python 仪器接口 -> 应用
+  ├─ 目录 ZIP：EXE + _internal + docs + licenses，配置在 EXE 旁 data
+  └─ 单文件 EXE：运行时解压到临时目录，配置仍在原 EXE 旁 data
+
+Windows 源码：根目录旧 Lab Control Center.exe -> tools/launch_app.py -> 本目录 src
 
 本地数据目录
   ├─ devices.json
@@ -101,10 +105,14 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 | `src/rigol_control/ui/linkage_window.py` | 跨设备轴编辑、任务保存、运行指标 | 修改轴后必须把旧点表标为过期 |
 | `src/rigol_control/ui/waveform.py` | 多通道实时曲线 | 只显示有限窗口，不承担完整数据归档 |
 | `tools/capture_manual_screenshots.py` | 无硬件生成说明书截图 | 新增关键页面后更新截图脚本和 Markdown 标记 |
-| `tools/build_user_manual.py` | Markdown 到 PDF 的受控排版 | 发版必须重建并目视检查每页 |
+| `tools/build_user_manual.py` | Markdown 到 PDF 的受控排版 | 重新发布 PDF 前重建并目视检查；保留旧 PDF 时注明覆盖范围 |
 | `tools/windows_launcher.cs`、`tools/launch_app.py` | Windows 运行时发现、项目定位、启动与错误日志 | 不写死开发机路径，启动必须使用 EXE 同目录源码 |
 | `tools/create_shortcut.ps1`、`tools/windows_shortcut.cs` | 生成指向同目录启动器的相对快捷方式 | `.lnk` 不纳入 Git；下载后用 `create_shortcut.cmd` 生成 |
-| `tools/build_windows_launcher.ps1`、`tools/build_app_icon.py` | 重建 EXE 和图标资源 | 修改启动器或图标后同步对应产物 |
+| `tools/build_windows_launcher.ps1`、`tools/build_app_icon.py` | 重建源码启动器和图标资源 | 不得将旧小型启动器视为内置 Python 的发行包 |
+| `tools/build_release.ps1`、`tools/build_release.py` | 独立构建环境、PyInstaller 目录/单文件产物、许可材料、清单及校验和 | 目标 Windows x64；完整复制运行时，不能依赖开发机 Python |
+| `src/rigol_control/runtime.py`、`tools/frozen_entry.py` | 编译/源码运行路径、可写目录检查、独立运行时自检与启动错误日志 | 不把单文件临时资源目录用于保存用户配置；自检仅使用虚拟设备 |
+| `tools/lab_control.spec`、`release/requirements-build.txt`、`.github/workflows/release.yml` | 固定依赖、打包资源与动态后端、自动构建和标签发布 | 两种产物共用依赖；更新版本后重新检查许可材料与发行清单 |
+| `release/README.md`、`release/NOTES-0.7.0.md` | 便携运行、数据迁移、硬件依赖和版本交付说明 | 构建验证与实机验收分别记录 |
 
 ## 5. 关键运行流程
 
@@ -256,6 +264,14 @@ writer thread 在 applied_count < received_count 时逐个补发
 
 状态：已采纳。已知型号通信失效时关闭会话以隔离旧回复，并保留扫描占用；重连不重放输出或启动。确认扫描 OFF 后释放租约。停止与 RF 关闭可排队，但不能打断正在执行的通信。
 
+### ADR-020：运行时随发行产物携带，构建环境与目标电脑分离
+
+Windows 发布使用 PyInstaller，提供目录 ZIP 与单文件 EXE，内置固定 Python、Qt 和 Python 仪器接口。构建机通过专用 `build/release-venv/` 准备依赖；用户机器启动时无需下载 Python 或创建 venv。VISA、NI-DAQmx、USB 串口等系统驱动仍独立安装。目录包必须整体复制；单文件解压到临时目录不改变持久化位置。
+
+### ADR-021：编译版默认保存到 EXE 旁，迁移路径显式可控
+
+编译版默认 `data/` 位于实际启动的 EXE 同目录，而不是 PyInstaller 临时资源目录或当前工作目录。优先级为 `--data-dir`、`RIGOL_GUI_DATA_DIR`、默认目录；源码默认继续使用 AppData。不会自动合并旧 AppData 数据，迁移通过现有配置导入导出或关闭程序后复制数据完成，避免意外覆盖实验配置。
+
 ## 7. DG4000 命令约定
 
 ### 7.1 DG4000 SCPI
@@ -291,7 +307,7 @@ SDK 返回状态必须统一经过 `_check_set_status()`；读取型函数不能
 
 ## 8. 持久化和输出文件
 
-默认数据目录为 `%APPDATA%\RigolGeneratorControl`，也可用 `--data-dir` 或 `RIGOL_GUI_DATA_DIR` 覆盖。
+编译发行版默认数据目录为实际 EXE 旁的 `data/`；源码运行默认仍为 `%APPDATA%\RigolGeneratorControl`。两者都可由 `--data-dir` 或 `RIGOL_GUI_DATA_DIR` 覆盖，命令行优先。编译版不自动迁移旧 AppData；配置迁移和采集文件迁移分别处理。单文件 EXE 的临时解压目录只存运行时，不用于持久化用户数据。
 
 | 文件 | 版本/格式 | 用途 |
 |---|---|---|
@@ -334,7 +350,7 @@ python tools\capture_manual_screenshots.py
 python tools\build_user_manual.py
 ```
 
-Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不要读写用户真实的 `%APPDATA%\RigolGeneratorControl`。
+Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1`，完整构建和产物说明见[发行文档](../release/README.md#7-开发者构建)。测试必须使用临时数据目录，不要读写用户真实的 AppData 或便携版 `data/`。
 
 ## 10. 自动测试策略
 
@@ -349,9 +365,11 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 | 鼎阳 SSG | 原生扫描、两级触发、型号约束、脉冲 BUS、配置保存、失联租约 | `test_siglent_ssg.py`、`test_ssg3021x_compatibility.py`、`test_siglent_ui.py` |
 | 旋转点表 | 未知起点、负步长、回跳/停止状态、10000 点刷新 | `test_rotation_table.py` |
 | 配置迁移 | 往返、备份、损坏包、写入失败/中断恢复、连接恢复和运行互斥 | `test_config_archive.py`、`test_config_archive_ui.py` |
-| Windows 入口 | 目录迁移、特殊字符路径、解释器回退、失败日志 | `test_windows_launcher.py` |
+| Windows 源码入口 | 目录迁移、特殊字符路径、解释器回退、失败日志 | `test_windows_launcher.py` |
+| 便携发行 | 冻结路径、数据目录优先级、权限错误、厂商 DLL 定位、打包文件选择 | `test_runtime.py`、`test_release_build.py` |
+| 编译产物自检 | 依赖来自包内、Qt 插件/图标、六台虚拟设备和窗口、普通 GUI 启动 | `tools/frozen_entry.py`、`tools/build_release.py` |
 
-最近一轮功能回归：2026-09-21 脉冲 BUS 加入后全项目 **201 项通过**（22.401 s）。历史记录中的 180/194 为对应阶段的测试数；尚无 SSG 实机验收。文档整理不新增功能测试数。
+最近一轮功能回归：2026-09-21 在正式构建环境 CPython 3.13.15 中全项目 **215 项通过**（23.021 s），包括新增 12 项便携运行路径测试和 2 项构建测试。历史记录中的 180/194/201 为对应阶段的测试数；目录包、单文件 EXE 及 ZIP 二次解压的实际运行验收均通过，尚无 SSG 实机验收。
 
 关键回归契约：
 
@@ -403,6 +421,19 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 实体输出测试必须由实验负责人确认幅度、偏置、负载、端接方式、PFI 电平、接地和被测电路耐压。自动测试不能替代这些电气检查。
 
 ## 12. 版本开发日志
+
+### 0.7.0：内置 Python 的 Windows 便携发行 — 2026-09-21
+
+- 新增 Windows x64 构建入口，要求官方非 Conda 的 64 位 CPython（推荐 3.13），避免 Conda ICU DLL 与 Qt 冲突；源码运行不受此构建限制。在 `build/release-venv/` 建立专用构建环境，使用 PyInstaller 输出目录便携 ZIP 与单文件 EXE。内置 Python、Qt、PyVISA、pyserial 和 nidaqmx，目标机器无需 Python/pip，也无需首次启动联网安装环境。
+- 产物写入 `dist/release/`，同时生成 `SHA256SUMS.txt`、`release-manifest.json` 和源码快照，携带操作文档及组件许可材料。Vaunix x64 SDK DLL 为可选构建/外置材料，本次默认产物不包含该 DLL，清单记录为 false。
+- 编译版默认使用 EXE 旁 `data/`，单文件的临时解压目录不参与持久化。允许环境变量与命令行覆盖，源码版沿用 AppData；不自动导入旧数据，原配置归档继续可用。
+- 新增 GitHub Actions 工作流：手动触发保留构建附件，推送版本标签时要求版本匹配，在构建与回归成功后上传 GitHub Release。
+- 保留根目录小型源码启动器与 `run_app.cmd`；README 优先提供发行包入口，并明确新旧 EXE 与数据位置区别。
+- 增加[发行使用与构建说明](../release/README.md)和[0.7.0 版本说明](../release/NOTES-0.7.0.md)，说明整体复制、单文件迁移、驱动边界、校验和及升级步骤。将此前 SSG、Newport 与配置迁移功能纳入本版，下面历史条目的“未发布”保留当时阶段含义。
+- 验证：正式构建环境 CPython 3.13.15 全量 215 项测试通过（23.021 s），其中本次新增便携运行路径 12 项、构建 2 项。
+- 实际产物验收通过：目录包、单文件 EXE、ZIP 二次解压三次冻结自检成功，依赖和 Qt 插件均来自包内，六台虚拟设备与六个窗口连接/关闭正常，临时配置清除。程序迁移到中文、空格、撇号路径后，在清除外部 Python 搜索路径并设置无效 PYTHONHOME/PYTHONPATH 的环境中运行通过；两种 EXE 的普通 Windows Qt GUI 启动检查也通过。
+- 修复构建环境的 Conda/Poppler ICU DLL 混入问题：采用官方 CPython、清理构建 PATH，并在 PyInstaller 的二进制收集结果中执行来源白名单检查，确认没有 Conda/Poppler 的外部 DLL 被打包。目录 ZIP 约 52.5 MiB、单 EXE 约 51.5 MiB，最终大小/校验和记录于发行清单。
+- 四份发行相关文档的 31 个本地 Markdown 链接/锚点与代码围栏检查通过，保留随包文档相对路径。实测均在当前 Windows 机器完成，未操作实体硬件；旧 PDF 尚未重建，新增内容以 Markdown 为准。
 
 ### 未发布：鼎阳详细使用说明与开发交接 — 2026-09-21
 
@@ -669,10 +700,11 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 3. 更新 `pyproject.toml`、`src/rigol_control/__init__.py`、首页版本文本和 PDF 构建脚本中的版本号。
 4. 更新 README、用户手册和本开发日志。
 5. 运行全量 unittest、无界面 smoke test 和 `git diff --check`。
-6. 重拍自动截图，重建 PDF，并逐页目视检查乱码、溢出、截断和错误截图。
-7. 在有硬件条件时执行第 11 节验收；无硬件发布必须明确标注实机未验证。
-8. 检查 `git diff` 后再提交，提交信息说明用户可见变化与关键兼容决策。
-9. 推送功能分支，经审查后合并 main；合并后再次确认 GitHub 默认分支内容和发布产物。
+6. 同步截图和操作文档；重新发布 PDF 时重建并逐页目视检查。若保留旧 PDF，必须标明其未覆盖的新功能，不让旧版本号冒充本次说明。
+7. 运行 `tools/build_release.ps1`，验证目录 ZIP 与单文件 EXE：独立运行时、依赖加载、默认/覆盖数据目录、配置恢复、虚拟设备和中文/空格路径。保留构建清单、组件许可与 SHA-256。
+8. 在有硬件条件时执行第 11 节验收；无硬件发布必须明确标注实机未验证。
+9. 检查 `git diff` 后再提交，提交信息说明用户可见变化与关键兼容决策。`build/`、`dist/` 和用户 `data/` 不进入源码提交。
+10. 推送并合并后再次确认 GitHub 默认分支内容；创建 GitHub Release 时上传发行附件、校验和与清单，发布说明记录实际验证结果。
 
 版本号使用语义化意图：补丁版本用于兼容修复和局部 UI/行为完善；次版本用于新增显著功能；主版本用于不兼容的数据、协议或工作流变化。
 
@@ -696,7 +728,9 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 | 软件 NI 触发快于 Vaunix USB 下发 | 累计计数、有序积压、实时指标 | 优先使用 BLX 设备端序列或公共硬件触发 |
 | Newport 单周期运动/稳定未完成 | 忙时触发或累计跳增立即停止，不补跑 | 实测 3 Hz 下步进与回跳耗时，调整扫描参数 |
 | Newport AI 与角度时间对应 | 保留原始采样及主机观测阶段日志 | 需要逐样本对应时另行设计硬件同步 |
-| 迁移电脑缺少运行环境 | 启动器发现 Python/PyQt6 并显示失败日志 | 目标电脑安装依赖，整体迁移项目 |
+| 迁移电脑缺少 Python | 0.7.0 发行产物内置运行时，旧源码启动器仍依赖外部 Python | 明确区分下载附件和源码入口，保持两种产物验证 |
+| 目标电脑缺少系统硬件驱动 | 发行包包含 Python 接口，真实驱动另装 | 保留虚拟启动路径与对应 VISA/DAQmx/串口错误 |
+| 便携数据目录不可写或复制遗漏 | 支持显式数据目录；说明整体迁移与配置导入 | 验证只读目录提示，备份采集文件与外部路径 |
 | UI 主文件增长 | 业务逻辑已下沉控制器 | 继续拆分 DG 和 NI 页面组件 |
 
 ## 16. 故障定位顺序
@@ -754,7 +788,15 @@ Windows 也可运行 `run_app.cmd`。测试必须使用临时数据目录，不�
 5. 失联不代表停止，重连只读状态，必要时面板关闭 RF；确认扫描 OFF 后再释放占用。
 6. 具体查询、接口和操作顺序见[鼎阳故障处理](SIGLENT_SSG_CN.md#12-诊断与故障处理)。
 
-### Windows 迁移后快捷方式无法启动
+### 便携发行版启动或迁移异常
+
+1. 核对使用的是 `dist/release/` 或 GitHub Release 的编译产物，而不是仓库根目录旧小型启动器。
+2. 目录包完整解压并保留 `_internal/`；单文件版本核对临时目录可用及程序旁 `data/` 可写。
+3. 配置丢失先检查是否复制 `data/`，再核对 `--data-dir` 与 `RIGOL_GUI_DATA_DIR`；不从旧 AppData 自动推断用户意图。
+4. 界面能启动但硬件失败时检查对应 Windows 驱动与厂商 DLL，不要求用户补装 Python。
+5. 使用 `SHA256SUMS.txt` 验证文件，并记录 `release-manifest.json`、系统版本和具体错误。
+
+### 旧源码版迁移后快捷方式无法启动
 
 1. 确认复制了整个项目目录，包含 EXE、`src`、`tools`；从该目录运行 `create_shortcut.cmd` 重建旧链接。
 2. 直接运行 `Lab Control Center.exe`，读取弹窗和 `%LOCALAPPDATA%\RigolGeneratorControl\logs\launcher-*.log`。

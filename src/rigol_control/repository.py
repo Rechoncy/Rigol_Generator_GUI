@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any, Iterable
 
 from .models import DeviceRecord
+from .runtime import resolve_data_dir
 
 
 class DuplicateDeviceError(ValueError):
@@ -13,19 +13,14 @@ class DuplicateDeviceError(ValueError):
 
 
 def default_data_dir() -> Path:
-    override = os.environ.get("RIGOL_GUI_DATA_DIR")
-    if override:
-        return Path(override).expanduser().resolve()
-    app_data = os.environ.get("APPDATA")
-    base = Path(app_data) if app_data else Path.home() / ".config"
-    return base / "RigolGeneratorControl"
+    return resolve_data_dir()
 
 
 class DeviceRepository:
     SCHEMA_VERSION = 1
 
     def __init__(self, data_dir: Path | str | None = None) -> None:
-        self.data_dir = Path(data_dir) if data_dir else default_data_dir()
+        self.data_dir = resolve_data_dir(data_dir)
         from .config_archive import recover_pending_import
         recover_pending_import(self.data_dir)
         self.path = self.data_dir / "devices.json"
@@ -77,13 +72,13 @@ class DeviceRepository:
                 raise DuplicateDeviceError("该类型和资源地址的设备已经存在")
 
     def _write(self, devices: Iterable[DeviceRecord]) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": self.SCHEMA_VERSION,
             "devices": [item.to_dict() for item in devices],
         }
         temporary = self.path.with_suffix(".json.tmp")
         try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
             temporary.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
@@ -99,7 +94,7 @@ class DeviceParameterRepository:
     SCHEMA_VERSION = 1
 
     def __init__(self, data_dir: Path | str | None = None) -> None:
-        self.data_dir = Path(data_dir) if data_dir else default_data_dir()
+        self.data_dir = resolve_data_dir(data_dir)
         self.path = self.data_dir / "device_parameters.json"
 
     def load(self, device_id: str, *, kind: str | None = None) -> dict[str, Any]:
@@ -151,13 +146,13 @@ class DeviceParameterRepository:
         return devices
 
     def _write(self, devices: dict[str, Any]) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": self.SCHEMA_VERSION,
             "devices": devices,
         }
         temporary = self.path.with_suffix(".json.tmp")
         try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
             temporary.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",

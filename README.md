@@ -2,7 +2,9 @@
 
 这是一个面向 RIGOL DG4000、鼎阳 SIGLENT SSG、Vaunix Lab Brick LMS/BLX 信号源、Newport SMC100CC / PR50CC 旋转台与 NI DAQ 的多设备桌面控制程序。首页用于保存和管理多台设备；点击设备卡片后，会打开独立的设备设置窗口，多台设备窗口可同时存在。
 
-软件图标以波形、采样点和旋转箭头表示信号源、采集与循环扫描。Windows 下直接双击项目中的 `Lab Control Center.exe` 启动。旧版快捷方式需先双击 `create_shortcut.cmd` 更新一次；新版 `Lab Control Center.lnk` 指向同目录启动器，支持随整个项目文件夹迁移。不要只复制快捷方式或 EXE。启动器自动寻找当前电脑可用的 64 位 Python 3.10+ / PyQt6，不再记录开发机的 Python 地址；它不是包含 Python 和厂商驱动的完整安装包。
+**Windows 便携版：** 0.7.0 提供内置 Python/Qt 与 Python 仪器接口的目录 ZIP 和单文件 EXE；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。具体下载文件、数据迁移、实机驱动及编译方法见 [发行版使用与构建说明](release/README.md)和[0.7.0 发行说明](release/NOTES-0.7.0.md)。
+
+软件图标以波形、采样点和旋转箭头表示信号源、采集与循环扫描。仓库根目录原有的 `Lab Control Center.exe` 是供源码运行的小型启动器，依赖目标电脑的 64 位 Python 3.10+ / PyQt6；它不是上述发行附件。开发者可继续使用它或 `run_app.cmd`。
 
 ## 当前已实现
 
@@ -12,9 +14,9 @@
 - 首页设备卡片支持连接和断开；VISA 会话在首页与设置窗口之间共享，关闭设置窗口不会自动断开。
 - 添加/编辑设备时自动搜索 VISA 资源或 NI-DAQmx 设备，并通过可编辑下拉框选择；未安装驱动时仍可手动输入。
 - 支持 DG4000、鼎阳 SSG、Vaunix LMS/BLX、Newport SMC100CC、NI DAQ 和通用 SCPI 六类设备记录。
-- 鼎阳 SSG 基础控制：USB/LAN、频率/功率/RF、仪器原生 STEP/LIST 扫描、独立扫描/点触发、AM/FM/PM/单脉冲、矢量机型命令分支与 IQ 状态回读。使用仪器自己的触发步进，不使用 NI 逐点下发。详见 [鼎阳 SSG 详细使用说明](docs/SIGLENT_SSG_CN.md)和[开发说明与变更记录](docs/SIGLENT_SSG_DEVELOPMENT_CN.md)。SSG3021X / SSG3032X 已加入脉冲 BUS、实际回读及全局触发按钮。当前未发布，尚未实机验收。
+- 鼎阳 SSG 基础控制：USB/LAN、频率/功率/RF、仪器原生 STEP/LIST 扫描、独立扫描/点触发、AM/FM/PM/单脉冲、矢量机型命令分支与 IQ 状态回读。使用仪器自己的触发步进，不使用 NI 逐点下发。详见 [鼎阳 SSG 详细使用说明](docs/SIGLENT_SSG_CN.md)和[开发说明与变更记录](docs/SIGLENT_SSG_DEVELOPMENT_CN.md)。SSG3021X / SSG3032X 已加入脉冲 BUS、实际回读及全局触发按钮。已纳入 0.7.0，尚未实机验收。
 - Newport PR50CC 循环旋转步进：支持指定初始位置或以启动时当前位置为 P0，提供“使用当前位置 / 移动到 P0”操作。启动保持首点，首个 NI 触发移动到 P1，末点下一触发回跳 P0；运动或稳定期间触发、计数跳增时明确停止，不补跑积压。
-- Newport 窗口支持定位、微动、归零、速度和停止，参数按稳定设备 ID 保存；可由同一旋转任务同时管理 NI 连续模拟采集和计数，保存原始数据与主机观测阶段日志。详见 [Newport 操作说明](docs/NEWPORT_ROTATION_CN.md)。当前为未发布功能，尚未实机验证。
+- Newport 窗口支持定位、微动、归零、速度和停止，参数按稳定设备 ID 保存；可由同一旋转任务同时管理 NI 连续模拟采集和计数，保存原始数据与主机观测阶段日志。详见 [Newport 操作说明](docs/NEWPORT_ROTATION_CN.md)。已纳入 0.7.0，尚未实机验证。
 - Newport 扫描页显示实际角度、扫描目标和当前点，提供含绝对角度、相对偏移与执行状态的只读点表；运行中跟随高亮，停止后保留记录，也可读取位置重新预览。
 - Vaunix 自动发现：直接加载本项目 `lms-sdk` 中的 Windows x64 `vnx_fmsynth.dll`，枚举真实型号和序列号，并用 `VAUNIX::LMS::<序列号>` 作为稳定资源地址。
 - Vaunix 完整控制窗口：当前频率、绝对输出功率、RF、内/外参考、LMS/BLX 扫频、内/外触发、快速脉冲、Chirp、BLX 50 项频率/功率序列、状态位、能力读取和设备非易失设置保存。
@@ -47,8 +49,12 @@
 
 ## 运行环境
 
-- Windows 10/11
-- Python 3.10 或更高版本
+便携发行版使用 Windows 10/11 x64，已包含 Python、PyQt6/Qt、PyVISA、pyserial 和 nidaqmx。日常使用无需安装下列 Python 开发环境；真实仪器所需系统驱动仍需另外安装，详见[驱动说明](release/README.md#4-实机驱动与-python-依赖的区别)。
+
+从源码运行或重新构建时：
+
+- Windows 10/11 x64
+- 64 位 Python 3.10 或更高版本
 - PyQt6
 - DG4000/鼎阳 SSG 实机通信需要 NI-VISA 或其他可用 VISA Backend，以及 Python 包 `PyVISA`；NI 实机控制另需 NI-DAQmx 驱动和 `nidaqmx`。
 - Newport 实机控制需要串口驱动和 `pyserial`；安装下述 `.[instrument]` 可同时安装所需 Python 包。
@@ -58,7 +64,18 @@
 
 ## 安装与启动
 
-Windows 迁移到其他电脑时，复制整个项目文件夹后双击 `Lab Control Center.exe` 或新版快捷方式。启动器依次检查 `LAB_CONTROL_PYTHON`、项目内 runtime/python/.venv/venv 环境、PATH、Python Launcher、注册表及常见 Conda 环境。可用环境必须安装 PyQt6；仪器控制所需 Python 包及 NI-DAQmx/VISA 驱动仍需在目标电脑安装。使用不常见位置的 Python 时，可在该电脑设置 `LAB_CONTROL_PYTHON` 为 `python.exe` 完整路径，无需修改快捷方式。
+### 使用便携发行版
+
+从 [GitHub Releases](https://github.com/Rechoncy/Rigol_Generator_GUI/releases) 获取该版本附件；本地构建的文件位于 `dist/release/`：
+
+- `Lab-Control-Center-0.7.0-windows-x64-portable.zip`：完整解压后运行 `Lab Control Center.exe`，保留 `_internal/`。
+- `Lab-Control-Center-0.7.0-windows-x64.exe`：单文件启动，内置运行时临时解压，持久化配置保存在 EXE 旁 `data/`。
+
+两种格式默认使用 EXE 旁的 `data/`；`--data-dir` 和 `RIGOL_GUI_DATA_DIR` 可以覆盖。迁移时复制程序与 `data/`，用户另选位置的采集文件需一并迁移。旧源码版 AppData 配置不会自动迁移，可用首页“导出配置 / 导入配置”。详见[便携迁移与升级](release/README.md#3-保存迁移与升级)。
+
+### 从源码运行
+
+Windows 迁移源码到其他电脑时，复制整个项目文件夹后双击根目录旧启动器 `Lab Control Center.exe` 或新版快捷方式。启动器依次检查 `LAB_CONTROL_PYTHON`、项目内 runtime/python/.venv/venv 环境、PATH、Python Launcher、注册表及常见 Conda 环境。可用环境必须安装 PyQt6；仪器控制所需 Python 包及 NI-DAQmx/VISA 驱动仍需在目标电脑安装。使用不常见位置的 Python 时，可在该电脑设置 `LAB_CONTROL_PYTHON` 为 `python.exe` 完整路径，无需修改快捷方式。
 
 启动失败会显示错误说明，并保存日志至 `%LOCALAPPDATA%\RigolGeneratorControl\logs\launcher-*.log`。`run_app.cmd` 也使用相同的环境发现与日志流程。启动器源码为 `tools/windows_launcher.cs`，Windows 上运行 `tools/build_windows_launcher.ps1` 可用系统 .NET Framework 编译器重建 EXE，不需要额外安装编译工具。
 
@@ -82,7 +99,7 @@ $env:PYTHONPATH = "src"
 python -m rigol_control
 ```
 
-设备列表默认保存在 `%APPDATA%\RigolGeneratorControl\devices.json`，各设备参数按稳定设备 ID 自动保存在同目录的 `device_parameters.json`。参数修改后约 500 ms 自动落盘，关闭窗口前还会强制保存；重新打开时只恢复界面，不会自动向实体仪器下发。开发和测试时可指定独立目录：
+源码运行的设备列表默认保存在 `%APPDATA%\RigolGeneratorControl\devices.json`，各设备参数按稳定设备 ID 自动保存在同目录的 `device_parameters.json`；编译发行版默认改为 EXE 旁的 `data/`。参数修改后约 500 ms 自动落盘，关闭窗口前还会强制保存；重新打开时只恢复界面，不会自动向实体仪器下发。开发和测试时可指定独立目录：
 
 ```powershell
 python -m rigol_control --data-dir .\runtime-data
@@ -97,7 +114,7 @@ python -m rigol_control --data-dir .\runtime-data
 ## 无硬件快速体验
 
 1. 启动软件并点击首页“虚拟实验室”。
-2. 等待两台虚拟 DG4162、虚拟 NI USB-6363、虚拟 Vaunix BLX-403 和虚拟 Newport PR50CC 显示“已连接”。
+2. 等待两台虚拟 DG4162、虚拟 SSG6082A-V、虚拟 NI USB-6363、虚拟 Vaunix BLX-403 和虚拟 Newport PR50CC 共六台设备显示“已连接”。
 3. 点击首页“跨设备联动”，为不同扫描轴分别选择两台虚拟 DG。
 4. 生成联合点表、保存任务并点击“启动联动”。
 5. 在联动窗口点击“虚拟触发 +1”或“虚拟触发 +10”，观察各设备耗时、完成偏差和积压。
@@ -105,7 +122,7 @@ python -m rigol_control --data-dir .\runtime-data
 7. 打开虚拟 Vaunix 的“NI 触发步进”，同时启用频率和功率轴，选择同步或组合扫描并生成点表；用“虚拟触发 +1/+10”验证首触发 P0、循环和积压。
 8. 在虚拟 NI 的“模拟输入”页选择通道和连续记录文件后开始采集；软件会实时显示波形，并在采集过程中持续追加 CSV/TXT 文本。
 
-虚拟资源为 `SIM::DG4000::1`、`SIM::DG4000::2`、`SIM::NI_DAQ::1`、`SIM::VAUNIX_LMS::1` 和 `SIM::SMC100::1`，不产生任何物理输出。
+虚拟资源为 `SIM::DG4000::1`、`SIM::DG4000::2`、`SIM::SIGLENT::SSG6082A-V`、`SIM::NI_DAQ::1`、`SIM::VAUNIX_LMS::1` 和 `SIM::SMC100::1`，不产生任何物理输出。
 
 当前操作、实机接线、时序解释和故障排查见 [中文使用说明](docs/USER_MANUAL_CN.md)、[Newport 操作说明](docs/NEWPORT_ROTATION_CN.md)和[配置备份与恢复](docs/CONFIG_BACKUP_CN.md)。[现有 PDF](output/pdf/DG4000_NI_Control_User_Manual_CN.pdf)尚未重建，不包含本轮全部新增功能。架构、版本演进、测试、发布和扩展约定见 [开发日志与维护指南](docs/DEVELOPMENT_LOG_CN.md)。
 
@@ -156,6 +173,18 @@ Vaunix DLL 属于进程级共享 USB 状态，软件对资源搜索、探测、�
 7. 运行时查看接收数、完成数、积压、当前点、各设备下发耗时和完成偏差。日志自动写入配置目录下的 `run_logs`。
 
 当前采用“严格顺序下发”：按扫描轴中首次出现的设备顺序，逐台发送本设备参数批次。它保证顺序可复现，但不等于电气同步。若需要微秒级多机同步，应改用预装载序列和公共硬件触发线。
+
+## 构建 Windows 便携发行版
+
+构建电脑使用 Windows x64 和官方 64 位 CPython（推荐 3.13），在仓库根目录执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1
+```
+
+脚本自动创建 `build/release-venv/` 并打包目录 ZIP、单文件 EXE、SHA-256 校验和及发行清单，输出到 `dist/release/`。这些产物内置应用运行环境，不依赖目标电脑 Python；系统硬件驱动不会被自动安装。发行构建会拒绝 Conda 环境，以免其 DLL 与 Qt 混用；源码运行仍可使用原 Conda 环境。完整步骤见[构建说明](release/README.md#7-开发者构建)。
+
+0.7.0 已完成 215 项自动测试，以及目录包、单文件 EXE、ZIP 二次解压的实际运行检查；依赖均由包内加载，六台虚拟设备及窗口验证通过。具体环境、产物大小及实机边界见[本版验证记录](release/NOTES-0.7.0.md#验证与边界)。
 
 ## 测试
 

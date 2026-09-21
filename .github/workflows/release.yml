@@ -1,0 +1,54 @@
+name: Windows portable release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: x64
+      - name: Build and validate both portable formats
+        shell: pwsh
+        run: ./tools/build_release.ps1
+      - name: Run application regression tests
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: src
+        run: |
+          & ./build/release-venv/Scripts/python.exe -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-release
+          path: dist/release/*
+          if-no-files-found: error
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-release
+          path: release-assets
+      - name: Publish verified artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python -c 'import json,os; m=json.load(open("release-assets/release-manifest.json")); assert "v"+m["version"] == os.environ["RELEASE_TAG"], "Tag must match application version"'
+          gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "Lab Control Center $RELEASE_TAG" --notes-file release-assets/RELEASE-NOTES.md

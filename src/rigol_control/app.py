@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from PyQt6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPalette
 from PyQt6.QtWidgets import QApplication
 
 from .repository import DeviceRepository
+from .runtime import package_resource, prepare_data_dir, prepare_qt_environment
 from .ui.main_window import DeviceCenterWindow
 from .ui.theme import APP_STYLE
 
@@ -27,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def create_application(argv: list[str] | None = None) -> QApplication:
+    prepare_qt_environment()
     if sys.platform == "win32":
         import ctypes
 
@@ -34,7 +37,7 @@ def create_application(argv: list[str] | None = None) -> QApplication:
             "RigolGeneratorControl.LabControlCenter"
         )
     app = QApplication(argv if argv is not None else sys.argv)
-    app.setWindowIcon(QIcon(str(Path(__file__).parent / "assets" / "app_icon.ico")))
+    app.setWindowIcon(QIcon(str(package_resource("assets", "app_icon.ico"))))
     app.setApplicationName("DG4000 Vaunix NI Control Center")
     app.setOrganizationName("RigolGeneratorControl")
     app.setStyle("Fusion")
@@ -76,9 +79,12 @@ def load_ui_font() -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    data_dir = prepare_data_dir(args.data_dir)
+    # All per-device default recording paths must follow --data-dir as well.
+    os.environ["RIGOL_GUI_DATA_DIR"] = str(data_dir)
     qt_argv = [sys.argv[0]]
     app = create_application(qt_argv)
-    repository = DeviceRepository(args.data_dir)
+    repository = DeviceRepository(data_dir)
     window = DeviceCenterWindow(repository)
     window.show()
     if args.smoke_test:
