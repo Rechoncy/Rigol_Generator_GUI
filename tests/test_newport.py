@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from rigol_control.analog import AnalogAcquisitionController
 from rigol_control.connections import DeviceBusyError, DeviceConnectionManager
@@ -261,6 +262,115 @@ class RotationTests(unittest.TestCase):
         self.assertIsNone(self.manager.lease_owner(self.stage.id))
         config = json.loads((Path(self.tmp.name) / "run/config.json").read_text(encoding="utf-8"))
         self.assertEqual(config["points_deg"][0], 12)
+        self.assertIsNone(config["config"]["initial_position_deg"])
+        self.assertEqual(config["initial_position_mode"], "current")
+
+    def test_selected_p0_rejects_unpositioned_or_out_of_limits_without_arming(self):
+        for initial in (3.0, -361.0, 359.9):
+            with self.subTest(initial=initial):
+                analog = Mock()
+                c = self.make_controller(
+                    RotationScanConfig(point_count=3, initial_position_deg=initial), analog=analog,
+                    directory=Path(self.tmp.name) / str(initial))
+                c.counter.start = Mock(wraps=c.counter.start)
+                c.counter.stop = Mock(wraps=c.counter.stop)
+                stop_count = self.device.stop_count
+                c.start()
+                self.assertTrue(wait_until(lambda: not c.is_running))
+                self.assertIn("先移动到初始位置" if initial == 3.0 else "限位", c.snapshot().error)
+                self.assertEqual(self.device.move_history, [])
+                self.assertEqual(self.device.stop_count, stop_count)
+                c.counter.start.assert_not_called()
+                c.counter.stop.assert_not_called()
+                analog.start.assert_not_called()
+                analog.stop.assert_not_called()
+                self.assertIsNone(self.manager.lease_owner(self.stage.id))
+                self.assertIsNone(self.manager.lease_owner(self.ni.id))
+
+    def test_selected_p0_preserves_grid_with_actual_offset_and_wraps_to_selected_start(self):
+        self.device.move_absolute(12.005)
+        self.assertTrue(wait_until(lambda: self.device.status().ready))
+        self.device.move_history.clear()
+        c = self.make_controller(RotationScanConfig(
+            point_count=3, settle_seconds=0.02, initial_position_deg=12.0))
+        self.arm(c)
+        self.assertEqual(self.device.move_history, [])
+        self.assertEqual(c.points, (12.0, 12.2, 12.4))
+        self.assertEqual(c.snapshot().target_deg, 12.0)
+        self.assertAlmostEqual(c.snapshot().actual_deg, 12.005)
+        for k, angle in enumerate((12.2, 12.4, 12.0), 1):
+            self.edge()
+            self.assertTrue(wait_until(lambda: c.snapshot().completed == k), c.snapshot())
+            self.assertAlmostEqual(self.device.position(), angle)
+        c.stop()
+        self.assertEqual(self.device.move_history, [12.2, 12.4, 12.0])
+        config = json.loads((Path(self.tmp.name) / "run/config.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["config"]["initial_position_deg"], 12.0)
+        self.assertEqual(config["initial_position_mode"], "specified")
+        self.assertEqual(config["points_deg"], [12.0, 12.2, 12.4])
+        self.assertAlmostEqual(config["measured_initial_position_deg"], 12.005)
+        self.assertAlmostEqual(config["armed_position_deg"], 12.005)
+
+    def test_selected_p0_needs_continuous_ready_and_stable_interval_before_arming(self):
+        position = [0.0]
+        state = [MotionStatus(0, 0x33)]
+        self.device.position = lambda: position[0]
+        self.device.status = lambda: state[0]
+        c = self.make_controller(RotationScanConfig(
+            initial_position_deg=0, settle_seconds=0.08, motion_timeout_seconds=1))
+        c.counter.start = Mock(wraps=c.counter.start)
+        c.start()
+        self.assertTrue(wait_until(lambda: c.snapshot().elapsed_ms > 0))
+        position[0] = 0.02
+        time.sleep(0.1)
+        c.counter.start.assert_not_called()
+        position[0] = 0
+        state[0] = MotionStatus(0, 0x28)
+        time.sleep(0.1)
+        c.counter.start.assert_not_called()
+        resumed = time.monotonic()
+        state[0] = MotionStatus(0, 0x33)
+        self.assertTrue(wait_until(lambda: c.snapshot().phase == "holding"), c.snapshot())
+        self.assertGreaterEqual(time.monotonic() - resumed, 0.075)
+        c.counter.start.assert_called_once()
+        self.assertEqual(self.device.move_history, [])
+
+    def test_selected_p0_settling_can_be_cancelled_without_arming_or_stop_command(self):
+        analog = Mock()
+        c = self.make_controller(RotationScanConfig(
+            initial_position_deg=0, settle_seconds=0.5), analog=analog)
+        c.counter.start = Mock(wraps=c.counter.start)
+        stop_count = self.device.stop_count
+        c.start()
+        self.assertTrue(wait_until(lambda: c.snapshot().elapsed_ms > 0))
+        c.stop()
+        self.assertEqual(c.snapshot().phase, "stopped")
+        c.counter.start.assert_not_called()
+        analog.start.assert_not_called()
+        self.assertEqual(self.device.move_history, [])
+        self.assertEqual(self.device.stop_count, stop_count)
+        self.assertIsNone(self.manager.lease_owner(self.stage.id))
+
+    def test_selected_p0_drift_timeout_does_not_arm_or_command_motion(self):
+        position_reads = 0
+        def drifting_position():
+            nonlocal position_reads
+            position_reads += 1
+            return 0 if position_reads == 1 else 0.02
+        self.device.status = lambda: MotionStatus(0, 0x33)
+        self.device.position = drifting_position
+        analog = Mock()
+        c = self.make_controller(RotationScanConfig(
+            initial_position_deg=0, settle_seconds=0.02, motion_timeout_seconds=0.07), analog=analog)
+        c.counter.start = Mock(wraps=c.counter.start)
+        stop_count = self.device.stop_count
+        c.start()
+        self.assertTrue(wait_until(lambda: not c.is_running))
+        self.assertIn("初始位置 P0 稳定等待超时", c.snapshot().error)
+        c.counter.start.assert_not_called()
+        analog.start.assert_not_called()
+        self.assertEqual(self.device.move_history, [])
+        self.assertEqual(self.device.stop_count, stop_count)
 
     def test_negative_scan_and_no_trigger_holds(self):
         c = self.make_controller(RotationScanConfig(step_deg=-0.1, point_count=2, settle_seconds=0))
@@ -465,7 +575,8 @@ class RotationTests(unittest.TestCase):
     def test_config_validation_and_discovery(self):
         for kwargs in ({"step_deg": 0}, {"step_deg": 1}, {"step_deg": math.nan},
                        {"point_count": 1}, {"point_count": True}, {"tolerance_deg": 0.1},
-                       {"settle_seconds": -1}):
+                       {"settle_seconds": -1}, {"initial_position_deg": math.nan},
+                       {"initial_position_deg": math.inf}, {"initial_position_deg": -math.inf}):
             with self.assertRaises(ValueError):
                 RotationScanConfig(**kwargs).validate()
         resources = DeviceDiscoveryService().discover(DeviceKind.NEWPORT_SMC100)
@@ -476,6 +587,15 @@ class RotationTests(unittest.TestCase):
         self.assertIs(self.device, self.manager.newport_device_for(self.stage))
         with self.assertRaises(ValueError):
             self.manager.session_for(self.stage)
+
+    def test_points_use_selected_p0_and_legacy_positional_config_stays_compatible(self):
+        legacy = RotationScanConfig(-0.2, 3, 0.01, 0.02, 10.0, 0.01)
+        self.assertIsNone(legacy.initial_position_deg)
+        self.assertEqual(legacy.points(5, (-360, 360)), (5, 4.8, 4.6))
+        specified = RotationScanConfig(step_deg=-0.2, point_count=3, initial_position_deg=5)
+        self.assertEqual(specified.points(5.005, (-360, 360)), (5, 4.8, 4.6))
+        with self.assertRaisesRegex(ValueError, "限位"):
+            RotationScanConfig(step_deg=-0.2, initial_position_deg=-360).points(0, (-360, 360))
 
 
 if __name__ == "__main__":

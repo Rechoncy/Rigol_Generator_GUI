@@ -13,6 +13,7 @@ def utc_now() -> str:
 
 class DeviceKind(str, Enum):
     DG4000 = "dg4000"
+    SIGLENT_SSG = "siglent_ssg"
     NI_DAQ = "ni_daq"
     VAUNIX_LMS = "vaunix_lms"
     NEWPORT_SMC100 = "newport_smc100"
@@ -22,6 +23,7 @@ class DeviceKind(str, Enum):
     def label(self) -> str:
         return {
             DeviceKind.DG4000: "RIGOL DG4000",
+            DeviceKind.SIGLENT_SSG: "鼎阳 SIGLENT SSG",
             DeviceKind.NI_DAQ: "NI 数据采集卡",
             DeviceKind.VAUNIX_LMS: "Vaunix LMS/BLX",
             DeviceKind.NEWPORT_SMC100: "Newport SMC100CC",
@@ -32,6 +34,7 @@ class DeviceKind(str, Enum):
     def accent(self) -> str:
         return {
             DeviceKind.DG4000: "#18c9b8",
+            DeviceKind.SIGLENT_SSG: "#f2be60",
             DeviceKind.NI_DAQ: "#8f7cff",
             DeviceKind.VAUNIX_LMS: "#f08ab8",
             DeviceKind.NEWPORT_SMC100: "#62b5f5",

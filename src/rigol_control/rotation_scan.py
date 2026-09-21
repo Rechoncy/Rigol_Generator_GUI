@@ -1,4 +1,4 @@
-"""Trigger-paced cyclic rotation; P0 is captured, first edge moves to P1."""
+"""Trigger-paced cyclic rotation; P0 is held, first edge moves to P1."""
 from __future__ import annotations
 
 import csv
@@ -22,12 +22,15 @@ class RotationScanConfig:
     settle_seconds: float = 0.03
     motion_timeout_seconds: float = 10.0
     poll_seconds: float = 0.01
+    initial_position_deg: float | None = None
 
     def validate(self) -> None:
         for value in (self.step_deg, self.tolerance_deg, self.settle_seconds,
                       self.motion_timeout_seconds, self.poll_seconds):
             if not math.isfinite(value):
                 raise ValueError("扫描参数必须为有限数值")
+        if self.initial_position_deg is not None and not math.isfinite(self.initial_position_deg):
+            raise ValueError("初始位置 P0 必须为有限数值")
         if not 0 < abs(self.step_deg) < 1:
             raise ValueError("角度步长绝对值必须大于 0 且小于 1°")
         if isinstance(self.point_count, bool) or not isinstance(self.point_count, int) or not 2 <= self.point_count <= 10000:
@@ -44,6 +47,8 @@ class RotationScanConfig:
         low, high = limits
         if not all(math.isfinite(x) for x in (initial, low, high)) or low >= high:
             raise ValueError("当前位置或软件限位无效")
+        if self.initial_position_deg is not None:
+            initial = self.initial_position_deg
         points = tuple(initial + i * self.step_deg for i in range(self.point_count))
         if any(not low <= p <= high for p in points):
             raise ValueError(f"扫描范围超出控制器软件限位 [{low}, {high}]°")
@@ -157,6 +162,34 @@ class RotationScanController:
             if s.state is not AnalogAcquisitionState.RUNNING:
                 raise MotionError(f"联动采集已停止或失败：{s.error or s.state.value}")
 
+    def _wait_initial_stable(self, target: float) -> float | None:
+        """Observe an explicitly selected P0 without commanding any motion.
+
+        A short drift resets the continuous settling interval. No NI task is
+        armed until the requested position is READY and has stayed in tolerance.
+        """
+        started = time.monotonic()
+        stable_since = None
+        while not self._stop.is_set():
+            state = self.device.status()
+            state.check()
+            actual = self.device.position()
+            if not math.isfinite(actual):
+                raise MotionError("初始位置回读无效")
+            now = time.monotonic()
+            self._update(actual_deg=actual, elapsed_ms=(now - started) * 1000)
+            if now - started > self.config.motion_timeout_seconds:
+                raise MotionError("初始位置 P0 稳定等待超时；请先移动到初始位置并确认 READY")
+            if state.ready and abs(actual - target) <= self.config.tolerance_deg:
+                if stable_since is None:
+                    stable_since = now
+                if now - stable_since >= self.config.settle_seconds:
+                    return actual
+            else:
+                stable_since = None
+            self._stop.wait(self.config.poll_seconds)
+        return None
+
     def _run(self) -> None:
         leased = False
         counter_started = False
@@ -173,13 +206,29 @@ class RotationScanController:
                 raise MotionError("启动要求 READY；请先手动完成归零，扫描不会自动移动到起点")
             initial = self.device.position()
             self.points = self.config.points(initial, self.device.limits())
+            target = self.points[0]
+            actual = initial
+            self._update(target_deg=target, actual_deg=actual)
+            if (self.config.initial_position_deg is not None
+                    and abs(actual - target) > self.config.tolerance_deg):
+                raise MotionError(
+                    f"当前位置 {actual:.6f}° 未到初始位置 P0 {target:.6f}°"
+                    f"（容差 {self.config.tolerance_deg:g}°）；请先移动到初始位置，再开始扫描"
+                )
             velocity = self.device.velocity()
             if not math.isfinite(velocity) or velocity <= 0:
                 raise MotionError("控制器速度回读无效")
+            if self.config.initial_position_deg is not None:
+                actual = self._wait_initial_stable(target)
+                if actual is None:
+                    return
             if self.run_directory is not None:
                 self.run_directory.mkdir(parents=True, exist_ok=True)
                 payload = {"schema_version": 1, "config": asdict(self.config),
                            "points_deg": self.points, "velocity_deg_s": velocity,
+                           "initial_position_mode": "specified" if self.config.initial_position_deg is not None else "current",
+                           "measured_initial_position_deg": initial,
+                           "armed_position_deg": actual,
                            "identity": self.device.identity, "metadata": self.metadata,
                            "semantics": "start=P0; edge k=P[k mod N]; busy edge=error",
                            "timestamps": "host observations; not hardware edge timestamps",
@@ -192,8 +241,10 @@ class RotationScanController:
                                     "received", "completed", "point_index", "cycle",
                                     "target_deg", "actual_deg", "elapsed_ms", "error",
                                     "first_sample_index", "sample_count", "sample_rate_hz"])
-            self._update(target_deg=initial, actual_deg=initial)
+            self._update(target_deg=target, actual_deg=actual, elapsed_ms=0.0)
             self._record("initial_position")
+            if self._stop.is_set():
+                return
             if self.analog is not None:
                 analog_started = True
                 self.analog.start()

@@ -8,10 +8,11 @@ from pathlib import Path
 from threading import Event
 from uuid import uuid4
 
-from PyQt6.QtCore import QTimer
-from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                             QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-                            QPushButton, QSpinBox, QScrollArea)
+                            QPushButton, QSpinBox, QScrollArea, QHeaderView,
+                            QProgressBar, QSizePolicy, QTableView, QTabWidget, QWidget, QFrame)
 
 from ..analog import AnalogAcquisitionController
 from ..connections import DeviceConnectionManager
@@ -21,7 +22,9 @@ from ..models import DeviceKind
 from ..repository import default_data_dir
 from ..rotation_scan import RotationScanConfig, RotationScanController
 from ..virtual_lab import is_virtual_resource
-from .device_windows import BaseDeviceWindow, page_shell
+from .device_windows import BaseDeviceWindow, page_shell, panel
+from .rotation_table import RotationPointTableModel
+from .widgets import metric_card
 from .waveform import WaveformPlot
 
 
@@ -49,6 +52,11 @@ class NewportWindow(BaseDeviceWindow):
         self._last_position = None
         self._last_velocity = None
         self._saved_ni_id = None
+        self._display_run = False
+        self._run_position_valid = False
+        self._plan_signature = None
+        self._follow_row = None
+        self._scan_message = ""
         super().__init__(record, [("运动控制", self._motion_page),
                                  ("NI 循环旋转步进", self._scan_page),
                                  ("联动连续采集", self._analog_page)], parameter_repository)
@@ -136,9 +144,89 @@ class NewportWindow(BaseDeviceWindow):
         return self._scroll(page)
 
     def _scan_page(self):
-        page, layout = page_shell("NI 触发循环旋转", "启动保持当前位置 P0；首触发 P1；末点的下一触发回跳 P0。运动/稳定期间触发会报错停止，不补跑。")
-        form = QFormLayout()
-        form.setVerticalSpacing(4)
+        page, layout = page_shell("NI 循环旋转步进", "每个触发推进一个位置 · 到位后保持 · 末点下一触发回到 P0")
+        layout.setContentsMargins(22, 18, 22, 12)
+        layout.setSpacing(12)
+        metrics = QHBoxLayout()
+        metrics.setSpacing(10)
+        for caption, key, accent, note in (
+            ("当前位置 · 实际回读", "actual", "#55d9cc", "读取位置后显示"),
+            ("扫描位置 · 当前目标", "target", "#9bb8ff", "启动保持 P0，首触发移动到 P1"),
+            ("扫描点位", "point", "#e9bb71", "等待开始扫描"),
+        ):
+            card, value = metric_card(caption, "—", accent)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            hint = QLabel(note)
+            hint.setObjectName("Muted")
+            hint.setWordWrap(True)
+            card.layout().addWidget(hint)
+            card.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            setattr(self, f"scan_{key}_value", value)
+            setattr(self, f"scan_{key}_hint", hint)
+            metrics.addWidget(card, 1)
+        layout.addLayout(metrics)
+
+        origin_panel = QFrame()
+        origin_panel.setObjectName("Panel")
+        origin = QHBoxLayout(origin_panel)
+        origin.setContentsMargins(12, 9, 12, 9)
+        origin.setSpacing(8)
+        origin.addWidget(QLabel("初始位置 P0"))
+        self.initial_mode = QComboBox()
+        self.initial_mode.addItem("启动时当前位置", "current")
+        self.initial_mode.addItem("指定初始位置", "specified")
+        self._set_parameter_key(self.initial_mode, "newport.initial_mode")
+        self.initial_mode.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.initial_mode.setMinimumWidth(125)
+        self.initial_angle = self._number("initial_angle", 0, -1e6, 1e6, " °", decimals=6)
+        self.initial_angle.setMinimumWidth(100)
+        self.initial_angle.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.initial_angle.setToolTip("指定扫描首点的绝对角度；修改数值只更新预览，点击“移动到 P0”才会运动。")
+        self.use_current_button = QPushButton("使用当前位置")
+        self.move_initial_button = QPushButton("移动到 P0")
+        self.move_initial_button.setToolTip("移动到设定的初始位置，等待到位；此操作不启动扫描或触发计数。")
+        self.use_current_button.setToolTip("重新读取设备位置，并填入指定初始位置；不移动设备。")
+        self.use_current_button.clicked.connect(lambda: self._manual(lambda: None, capture_initial=True))
+        self.move_initial_button.clicked.connect(self._move_to_initial)
+        origin.addWidget(self.initial_mode, 1)
+        origin.addWidget(self.initial_angle, 1)
+        origin.addWidget(self.use_current_button)
+        origin.addWidget(self.move_initial_button)
+        layout.addWidget(origin_panel)
+
+        actions = QHBoxLayout()
+        self.start_button = QPushButton("开始循环扫描")
+        self.start_button.setObjectName("PrimaryButton")
+        self.stop_button = QPushButton("停止扫描")
+        self.stop_button.setObjectName("DangerButton")
+        self.scan_refresh_button = QPushButton("读取位置 / 更新预览")
+        self.inject_button = QPushButton("虚拟触发 +1")
+        self.start_button.clicked.connect(self._start_scan)
+        self.stop_button.clicked.connect(self._stop)
+        self.scan_refresh_button.clicked.connect(lambda: self._manual(lambda: None))
+        self.inject_button.clicked.connect(self._inject)
+        for button in (self.start_button, self.stop_button, self.scan_refresh_button):
+            actions.addWidget(button)
+        actions.addStretch()
+        actions.addWidget(self.inject_button)
+        layout.addLayout(actions)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        setup, setup_layout = panel("扫描设置")
+        setup.setFixedWidth(280)
+        setup_layout.setSpacing(9)
+        setup.setStyleSheet("QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { padding:4px 6px; }")
+        settings_tabs = QTabWidget()
+        forms = []
+        for title in ("旋转参数", "NI 触发"):
+            fields = QWidget()
+            form = QFormLayout(fields)
+            form.setContentsMargins(10, 8, 10, 8)
+            form.setVerticalSpacing(6)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            forms.append(form)
+            settings_tabs.addTab(fields, title)
         self.ni_combo = QComboBox()
         self.ni_combo.setProperty("skipDeviceParameterPersistence", True)
         for d in self.ni_devices:
@@ -159,38 +247,91 @@ class NewportWindow(BaseDeviceWindow):
         self.settle = self._number("settle", 0.03, 0, 60, " s")
         self.timeout = self._number("timeout", 10, 0.1, 3600, " s")
         self.directory = self._line("directory", str(default_data_dir() / "rotation_runs"))
-        for label, widget in (("NI 设备", self.ni_combo), ("计数器", self.counter_name),
-                              ("触发端口", self.terminal), ("边沿", self.edge),
-                              ("角度步长（可负）", self.step), ("位置数（包含 P0）", self.count),
-                              ("到位容差", self.tolerance), ("到位后稳定时间", self.settle),
-                              ("单次运动超时（含回跳）", self.timeout), ("保存目录", self.directory)):
-            form.addRow(label, widget)
-        layout.addLayout(form)
+        for group, label, widget in ((1, "NI 设备", self.ni_combo), (1, "计数器", self.counter_name),
+                              (1, "触发端口", self.terminal), (1, "边沿", self.edge),
+                              (0, "角度步长", self.step), (0, "位置数", self.count),
+                              (0, "到位容差", self.tolerance), (0, "稳定时间", self.settle),
+                              (0, "运动超时", self.timeout)):
+            widget.setMinimumWidth(0)
+            widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            forms[group].addRow(label, widget)
+        self.step.setToolTip("允许负步长；绝对值必须大于 0 且小于 1°")
+        self.count.setToolTip("位置总数包含启动时的 P0；每轮需要相同数量的触发才能回到 P0")
+        self.timeout.setToolTip("每次运动的超时，包括末点回跳和稳定等待")
+        setup_layout.addWidget(settings_tabs)
         self.preview = QLabel()
         self.preview.setWordWrap(True)
-        layout.addWidget(self.preview)
-        self.scan_status = QLabel("未启动")
+        self.preview.setObjectName("Muted")
+        setup_layout.addWidget(self.preview)
+        setup_layout.addStretch()
+        timing = QLabel("运动 / 稳定期间触发会停止。\n3 Hz 触发间隔约 333 ms。")
+        timing.setObjectName("Muted")
+        timing.setWordWrap(True)
+        setup_layout.addWidget(timing)
+        body.addWidget(setup)
+
+        table_panel, table_layout = panel("扫描点表")
+        table_layout.setSpacing(8)
+        self.table_summary = QLabel("预览 · 尚未读取首点位置")
+        self.table_summary.setObjectName("Muted")
+        self.table_summary.setWordWrap(True)
+        table_layout.addWidget(self.table_summary)
+        self.scan_table = QTableView()
+        self.scan_table.setObjectName("RotationTable")
+        self.scan_table.setProperty("skipDeviceParameterPersistence", True)
+        self.scan_table.setStyleSheet(
+            "QTableView { background:#111823; alternate-background-color:#141e2c;"
+            "border:1px solid #2a3549; border-radius:8px; gridline-color:#283347;"
+            "selection-background-color:#245a5a; }"
+        )
+        self.scan_table_model = RotationPointTableModel(self)
+        self.scan_table.setModel(self.scan_table_model)
+        self.scan_table.setAlternatingRowColors(True)
+        self.scan_table.setShowGrid(False)
+        self.scan_table.verticalHeader().hide()
+        self.scan_table.verticalHeader().setDefaultSectionSize(35)
+        self.scan_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.scan_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.scan_table.setColumnWidth(0, 58)
+        self.scan_table.horizontalHeader().setMinimumSectionSize(65)
+        self.scan_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.scan_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.scan_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.scan_table.setMinimumWidth(280)
+        self.scan_table.setMinimumHeight(200)
+        table_layout.addWidget(self.scan_table, 1)
+        self.scan_progress = QProgressBar()
+        self.scan_progress.setTextVisible(False)
+        self.scan_progress.setFixedHeight(6)
+        self.scan_progress.setStyleSheet(
+            "QProgressBar { border:0; border-radius:3px; background:#263044; }"
+            "QProgressBar::chunk { border-radius:3px; background:#55d9cc; }"
+        )
+        table_layout.addWidget(self.scan_progress)
+        self.scan_counts = QLabel("收到触发 0   ·   完成步进 0   ·   完成回跳 0")
+        self.scan_counts.setObjectName("Muted")
+        self.scan_counts.setWordWrap(True)
+        table_layout.addWidget(self.scan_counts)
+        self.scan_status = QLabel("未启动 · 读取位置以预览绝对角度")
         self.scan_status.setWordWrap(True)
-        self.scan_status.setTextInteractionFlags(self.position_label.textInteractionFlags())
-        layout.addWidget(self.scan_status)
-        actions = QHBoxLayout()
-        self.start_button = QPushButton("开始循环扫描")
-        self.start_button.setObjectName("PrimaryButton")
-        self.stop_button = QPushButton("停止扫描")
-        self.stop_button.setObjectName("DangerButton")
-        self.inject_button = QPushButton("虚拟触发 +1")
+        self.scan_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.scan_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        table_layout.addWidget(self.scan_status)
+        body.addWidget(table_panel, 1)
+        layout.addLayout(body, 1)
+        save = QHBoxLayout()
+        save.addWidget(QLabel("保存目录"))
+        save.addWidget(self.directory, 1)
         self.browse_button = QPushButton("选择保存目录")
-        self.start_button.clicked.connect(self._start_scan)
-        self.stop_button.clicked.connect(self._stop)
-        self.inject_button.clicked.connect(self._inject)
         self.browse_button.clicked.connect(self._browse)
-        for button in (self.start_button, self.stop_button, self.inject_button, self.browse_button):
-            actions.addWidget(button)
-        layout.addLayout(actions)
-        self.scan_controls = [self.ni_combo, self.counter_name, self.terminal, self.edge, self.step,
+        save.addWidget(self.browse_button)
+        layout.addLayout(save)
+        self.scan_controls = [self.initial_mode, self.initial_angle, self.ni_combo, self.counter_name, self.terminal, self.edge, self.step,
                               self.count, self.tolerance, self.settle, self.timeout, self.directory,
                               self.browse_button]
-        layout.addStretch()
+        self.initial_mode.currentIndexChanged.connect(self._reset_scan_preview)
+        for widget in (self.initial_angle, self.step, self.count, self.tolerance, self.settle, self.timeout):
+            widget.valueChanged.connect(self._reset_scan_preview)
         return self._scroll(page)
 
     def _analog_page(self):
@@ -267,7 +408,7 @@ class NewportWindow(BaseDeviceWindow):
     def _busy(self):
         return self._manual_busy or (self.controller is not None and self.controller.is_running)
 
-    def _manual(self, operation, *, wait_motion=False):
+    def _manual(self, operation, *, wait_motion=False, capture_initial=False):
         if self._busy():
             return
         self._manual_busy = True
@@ -312,19 +453,29 @@ class NewportWindow(BaseDeviceWindow):
                     self.connection_manager.release_devices(self._manual_owner)
                 self._manual_done.set()
 
-        self.submit(work, on_success=self._manual_result, on_error=self._manual_error)
+        self.submit(work, on_success=lambda result: self._manual_result(result, capture_initial=capture_initial),
+                    on_error=self._manual_error)
 
-    def _manual_result(self, result):
+    def _manual_result(self, result, *, capture_initial=False):
         self._manual_busy = False
+        self._display_run = False
+        self._scan_message = ""
         if result is not None:
             position, state, velocity = result
             self._last_position, self._last_velocity = position, velocity
             self.position_label.setText(f"当前位置：{position:.6f}° · 状态 0x{state.state:02X} · 速度 {velocity:g}°/s")
+            if capture_initial and not self._cancel_manual.is_set():
+                self.initial_angle.setValue(position)
+                self.initial_mode.setCurrentIndex(self.initial_mode.findData("specified"))
         self.operation_label.setText("操作完成" if not self._cancel_manual.is_set() else "已请求停止")
         self._tick()
 
     def _manual_error(self, message):
         self._manual_busy = False
+        self._last_position = self._last_velocity = None
+        self._display_run = False
+        self._scan_message = f"位置未确认：{message}"
+        self.position_label.setText("当前位置：未知 · 读取失败")
         self.operation_label.setText(message)
         self._tick()
 
@@ -359,6 +510,14 @@ class NewportWindow(BaseDeviceWindow):
         value = self.velocity.value()
         self._manual(lambda: self.device.set_velocity(value))
 
+    def _specified_initial(self):
+        return self.initial_angle.value() if self.initial_mode.currentData() == "specified" else None
+
+    def _move_to_initial(self):
+        angle = self._specified_initial()
+        if angle is not None:
+            self._move(angle)
+
     def _start_scan(self):
         if self._busy():
             return
@@ -373,7 +532,8 @@ class NewportWindow(BaseDeviceWindow):
             if not re.fullmatch(r"PFI[0-9]+", self.terminal.text().strip()):
                 raise ValueError("触发端口格式为 PFI0")
             config = RotationScanConfig(self.step.value(), self.count.value(), self.tolerance.value(),
-                                        self.settle.value(), self.timeout.value())
+                                        self.settle.value(), self.timeout.value(),
+                                        initial_position_deg=self._specified_initial())
             config.validate()
             if not self.directory.text().strip():
                 raise ValueError("请指定保存目录")
@@ -401,11 +561,16 @@ class NewportWindow(BaseDeviceWindow):
                 analog=self.analog, run_directory=run, metadata=metadata)
             self._last_plot_end = 0
             self.plot.clear()
+            self._display_run = True
+            self._run_position_valid = True
+            self._scan_message = ""
+            self._follow_row = None
             self.controller.start()
             self.statusBar().showMessage(f"运行目录：{run}")
             self._tick()
         except Exception as exc:
-            self.scan_status.setText(f"启动失败：{exc}")
+            self._scan_message = f"启动失败：{exc}"
+            self.scan_status.setText(self._scan_message)
 
     def _stop(self):
         if self.controller is not None and self.controller.is_running:
@@ -425,6 +590,118 @@ class NewportWindow(BaseDeviceWindow):
         if directory:
             self.directory.setText(directory)
 
+    def _reset_scan_preview(self):
+        if self._busy():
+            return
+        self._display_run = False
+        self._scan_message = ""
+        self._follow_row = None
+        if hasattr(self, "timer"):
+            self._tick()
+
+    @staticmethod
+    def _angle(value):
+        return "—" if value is None else f"{value:.6f}°"
+
+    def _render_scan(self, connected):
+        # Display cached observations only. Serial I/O stays in workers/the scan controller.
+        if not connected:
+            self._last_position = self._last_velocity = None
+            self._run_position_valid = False
+            self.position_label.setText("当前位置：未知 · 未连接")
+        run = self.controller if self._display_run else None
+        s = run.snapshot() if run is not None else None
+        if connected and self._run_position_valid and s is not None and s.actual_deg is not None:
+            self._last_position = s.actual_deg
+            self.position_label.setText(f"当前位置：{s.actual_deg:.6f}° · {PHASE_LABELS[s.phase]}")
+        actual = self._last_position if connected else None
+        if s is not None and s.phase == "preparing" and s.actual_deg is None:
+            actual = None
+        self.scan_actual_value.setText(self._angle(actual))
+        if not connected:
+            actual_hint = "未连接 · 位置未知"
+        elif self._manual_busy:
+            actual_hint = "正在操作 · 等待位置回读"
+        elif s is not None and s.phase == "preparing" and self._run_position_valid:
+            actual_hint = "准备中 · 正在核对初始位置"
+        elif s is not None and run.is_running and self._run_position_valid:
+            actual_hint = "扫描中 · 持续回读位置"
+        elif actual is None:
+            actual_hint = "点击“读取位置”获取角度"
+        else:
+            actual_hint = "最近一次回读 · 可点击更新"
+        self.scan_actual_hint.setText(actual_hint)
+
+        count = run.config.point_count if run is not None else self.count.value()
+        step = run.config.step_deg if run is not None else self.step.value()
+        specified = run.config.initial_position_deg if run is not None else self._specified_initial()
+        preview_initial = specified if specified is not None else actual
+        if run is not None:
+            points = run.points
+            signature = (id(run), points)
+            mode = "本次运行" if run.is_running else "上次运行"
+            if not points:
+                mode += " · 起点预览"
+        else:
+            signature = ("preview", preview_initial, step, count)
+            points = ()
+            mode = "扫描预览"
+        if signature != self._plan_signature:
+            if not points:
+                initial = preview_initial if run is None else specified
+                points = tuple(None if initial is None else initial + i * step for i in range(count))
+            self.scan_table_model.set_plan(points, step)
+            self._plan_signature = signature
+        self.scan_table_model.set_progress(s)
+        active = self.scan_table_model.active_row
+        if active is not None and active != self._follow_row:
+            self.scan_table.scrollTo(self.scan_table_model.index(active, 0),
+                                     QAbstractItemView.ScrollHint.EnsureVisible)
+        self._follow_row = active
+
+        initial = run.points[0] if run is not None and run.points else (preview_initial if run is None else specified)
+        end = None if initial is None else initial + (count - 1) * step
+        self.table_summary.setText(f"{mode} · {count} 个位置 · 步长 {step:+g}°\n"
+                                   f"P0 {self._angle(initial)}  →  P{count - 1} {self._angle(end)}")
+        target = s.target_deg if s is not None and s.target_deg is not None else initial
+        self.scan_target_value.setText(self._angle(target))
+        self.scan_target_hint.setText(
+            (("本次目标 · " if s.target_deg is not None else "初始位置预览 · ") + PHASE_LABELS[s.phase]) if s is not None
+            else "指定首点 P0 · 启动前须到位" if specified is not None
+            else "预览首点 P0 · 启动时重新读取"
+        )
+        self.scan_point_value.setText(f"P{s.point_index}" if s is not None and s.target_deg is not None else "—")
+        self.scan_point_hint.setText(
+            f"第 {s.point_index + 1} / {count} 个位置 · 下一点 P{(s.point_index + 1) % count}"
+            if s is not None and s.target_deg is not None else f"共 {count} 个位置 · 首触发前保持 P0"
+        )
+        received, completed = (s.received, s.completed) if s is not None else (0, 0)
+        self.scan_counts.setText(f"收到触发 {received}   ·   完成步进 {completed}   ·   完成回跳 {completed // count}")
+        self.scan_progress.setRange(0, count)
+        self.scan_progress.setValue(completed % count)
+        self.scan_progress.setToolTip(f"当前循环已完成 {completed % count} / {count} 步；回到 P0 后开始下一循环")
+        if s is not None:
+            status = f"{PHASE_LABELS[s.phase]} · 本步 {s.elapsed_ms:.1f} ms"
+        elif specified is None:
+            status = "未启动 · 以启动时当前位置为 P0；也可在上方指定初始位置"
+        elif actual is None:
+            status = "指定起点预览 · 连接后读取位置，或点击“移动到 P0”准备起点"
+        elif abs(actual - specified) > self.tolerance.value():
+            status = "指定起点预览 · 当前未到 P0，请先点击“移动到 P0”"
+        else:
+            status = "指定起点预览 · 最近回读已在 P0 容差内，启动时将复核稳定状态"
+        error = self._scan_message or (s.error if s is not None else "")
+        if not connected and run is not None and run.is_running and not error:
+            error = "设备连接中断 · 正在结束扫描"
+        self.scan_status.setText(f"{status}\n{error}" if error else status)
+        self.scan_status.setStyleSheet("color:#ff9397;" if error else "color:#55d9cc;" if run is not None and run.is_running else "")
+        span = abs(step) * (count - 1)
+        estimate = (f"匀速时间下限 {span / self._last_velocity:.3f} s"
+                    if self._last_velocity else "读取位置后估算回跳时间")
+        self.preview.setText(f"回跳幅度 {span:g}°\n{estimate}")
+        self.preview.setToolTip(f"每 {count} 次触发一轮，末点下一触发回跳 P0。"
+                                "估算仅为匀速时间下限，不含加减速、稳定等待与通信。")
+
     def _tick(self):
         if not hasattr(self, "ai_controls"):
             return
@@ -440,10 +717,15 @@ class NewportWindow(BaseDeviceWindow):
         self.connect_button.setEnabled(not connected and not busy and not external_busy)
         self.disconnect_button.setEnabled(connected and not busy and not external_busy)
         self.refresh_button.setEnabled(connected and not busy and not external_busy)
+        self.scan_refresh_button.setEnabled(connected and not busy and not external_busy)
+        self.use_current_button.setEnabled(connected and not busy and not external_busy)
+        self.move_initial_button.setEnabled(connected and not busy and not external_busy
+                                            and self._specified_initial() is not None)
         for button in self.motion_buttons:
             button.setEnabled(connected and not busy and not external_busy)
         for widget in [*self.scan_controls, *self.ai_controls]:
             widget.setEnabled(not busy)
+        self.initial_angle.setEnabled(not busy and self._specified_initial() is not None)
         self.start_button.setEnabled(connected and not busy and not external_busy)
         self.stop_button.setEnabled(self.controller is not None and self.controller.is_running)
         self.manual_stop.setEnabled(connected and not external_busy)
@@ -451,21 +733,7 @@ class NewportWindow(BaseDeviceWindow):
         ni = next((d for d in self.ni_devices if d.id == self.ni_combo.currentData()), None)
         self.inject_button.setEnabled(ni is not None and is_virtual_resource(ni.resource)
                                       and self.controller is not None and self.controller.is_running)
-        span = abs(self.step.value()) * (self.count.value() - 1)
-        estimate = (f"回跳匀速时间下限 {span / self._last_velocity:.3f} s（不含加减速、稳定与通信）"
-                    if self._last_velocity else "读取状态后显示回跳时间下限")
-        self.preview.setText(f"P0 = 启动时当前位置；P末 = P0 + {(self.count.value()-1)*self.step.value():g}°；"
-                             f"每 {self.count.value()} 次触发回到 P0。3 Hz 间隔约 0.333 s；{estimate}。")
-        if self.controller is not None:
-            s = self.controller.snapshot()
-            target = "未知" if s.target_deg is None else f"{s.target_deg:.6f}"
-            actual = "未知" if s.actual_deg is None else f"{s.actual_deg:.6f}"
-            self.scan_status.setText(f"{PHASE_LABELS[s.phase]} · 收到 {s.received} / 完成 {s.completed} · "
-                                     f"P{s.point_index} · 已回跳 {s.completed // self.controller.config.point_count} 次 · "
-                                     f"目标 {target}° / 实际 {actual}° · 本步 {s.elapsed_ms:.1f} ms\n{s.error}")
-            if self.controller.is_running and s.actual_deg is not None:
-                self._last_position = s.actual_deg
-                self.position_label.setText(f"当前位置：{s.actual_deg:.6f}° · {PHASE_LABELS[s.phase]}")
+        self._render_scan(connected)
         if self.analog is not None:
             s = self.analog.snapshot()
             self.ai_status.setText(f"{s.state.value} · 已保存 {s.saved_samples} 样本/通道 · {s.error or ''}")

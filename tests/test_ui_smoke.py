@@ -509,7 +509,7 @@ class UiSmokeTests(unittest.TestCase):
         home.create_virtual_lab()
         self.assertTrue(
             self._wait_for(
-                lambda: len(repository.list()) == 5
+                lambda: len(repository.list()) == 6
                 and all(manager.is_connected(item) for item in repository.list())
             )
         )
@@ -659,7 +659,7 @@ class UiSmokeTests(unittest.TestCase):
         home.create_virtual_lab()
         self.assertTrue(
             self._wait_for(
-                lambda: len(repository.list()) == 5
+                lambda: len(repository.list()) == 6
                 and all(manager.is_connected(item) for item in repository.list())
             )
         )
@@ -898,7 +898,7 @@ class UiSmokeTests(unittest.TestCase):
         home.create_virtual_lab()
         self.assertTrue(
             self._wait_for(
-                lambda: len(repository.list()) == 5
+                lambda: len(repository.list()) == 6
                 and all(manager.is_connected(item) for item in repository.list())
             )
         )

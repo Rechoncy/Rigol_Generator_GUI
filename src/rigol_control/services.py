@@ -45,6 +45,13 @@ class DeviceDiscoveryService:
     """Enumerate selectable VISA, NI-DAQmx, and Vaunix LMS/BLX resources."""
 
     def discover(self, kind: DeviceKind) -> list[DiscoveredResource]:
+        if kind is DeviceKind.SIGLENT_SSG:
+            from .drivers.siglent_ssg import VIRTUAL_SSG_RESOURCE
+            virtual = DiscoveredResource(VIRTUAL_SSG_RESOURCE, "内置模拟器", "虚拟 SIGLENT SSG6082A-V")
+            try:
+                return [virtual, *self._discover_visa()]
+            except DiscoveryError:
+                return [virtual]
         if kind is DeviceKind.NEWPORT_SMC100:
             from .drivers.newport_smc100 import VIRTUAL_SMC100_RESOURCE
             resources = [DiscoveredResource(VIRTUAL_SMC100_RESOURCE, "内置模拟器", "虚拟 PR50CC / SMC100CC")]
@@ -165,6 +172,10 @@ class DeviceProbeService:
     """Best-effort discovery with optional instrument packages loaded lazily."""
 
     def probe(self, record: DeviceRecord) -> ProbeResult:
+        if record.kind is DeviceKind.SIGLENT_SSG:
+            if record.resource.startswith("SIM::"):
+                return ProbeResult(ProbeState.ONLINE, "虚拟鼎阳设备可用", "SIGLENT,SSG6082A-V,SIMSSG001,1.0")
+            return ProbeResult(ProbeState.UNCHECKED, "点击连接读取身份；后台不另开仪器会话")
         if record.kind is DeviceKind.NEWPORT_SMC100:
             if record.resource.startswith("SIM::"):
                 return ProbeResult(ProbeState.ONLINE, "虚拟旋转台可用", "SMC100CC VIRTUAL / PR50CC")

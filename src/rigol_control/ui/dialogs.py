@@ -122,6 +122,11 @@ class DeviceDialog(QDialog):
             self.hint.setText("自动读取 NI-DAQmx 中已注册的设备；也可手动输入 NI MAX 中的设备名。")
             if not current_name:
                 self.name.setPlaceholderText("例如 NI USB-6363")
+        elif selected is DeviceKind.SIGLENT_SSG:
+            self.connection.addItems(["USB VISA", "TCP/IP VISA", "内置模拟器"])
+            self.resource.lineEdit().setPlaceholderText("TCPIP0::192.168.1.100::5025::SOCKET 或 USB0::...::INSTR")
+            self.hint.setText("SSG3000X / SSG6080A / SSG6082A-V；LAN 地址可手动输入，内置扫描不依赖 NI。")
+            self.name.setPlaceholderText("例如 鼎阳 SSG6082A-V")
         elif selected is DeviceKind.NEWPORT_SMC100:
             self.connection.addItems(["Newport RS-232", "内置模拟器"])
             self.resource.lineEdit().setPlaceholderText("COM3::1")

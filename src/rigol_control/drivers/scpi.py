@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from threading import RLock
 from typing import Protocol
 
@@ -109,6 +110,12 @@ class ScpiSession:
         normalized = self._normalize(command)
         with self._lock:
             self._write_locked(normalized, recover=recover)
+
+    @contextmanager
+    def transaction(self):
+        """Serialize a related write/readback sequence on the shared session."""
+        with self._lock:
+            yield self
 
     def write_many(self, commands: Iterable[str], *, recover: bool = False) -> None:
         normalized = [self._normalize(command) for command in commands]

@@ -418,6 +418,13 @@ class DeviceConnectionManager:
         if existing is not None and existing_resource != record.resource:
             existing = None
         if existing is None:
+            if record.kind is DeviceKind.SIGLENT_SSG and is_virtual_resource(record.resource):
+                from .drivers.siglent_ssg import VirtualSsgBackend
+                backend = VirtualSsgBackend()
+                existing = ScpiSession(record.resource, backend_factory=lambda *_: backend)
+                self._sessions[record.id] = existing
+                self._resources[record.id] = record.resource
+                return existing
             existing = (
                 self.virtual_lab.scpi_session_for(record.resource)
                 if is_virtual_resource(record.resource)

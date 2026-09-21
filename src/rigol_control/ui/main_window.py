@@ -24,6 +24,7 @@ from ..connections import ConnectionInfo, DeviceConnectionManager
 from ..config_archive import ConfigArchiveService, JOURNAL
 from ..drivers.vaunix_lms import VIRTUAL_VAUNIX_RESOURCE
 from ..drivers.newport_smc100 import VIRTUAL_SMC100_RESOURCE
+from ..drivers.siglent_ssg import VIRTUAL_SSG_RESOURCE
 from ..models import DeviceKind, DeviceRecord
 from ..repository import (
     DeviceParameterRepository,
@@ -77,7 +78,7 @@ class DeviceCenterWindow(QMainWindow):
         titles = QVBoxLayout()
         title = QLabel("设备中心")
         title.setObjectName("Title")
-        subtitle = QLabel("统一保存和打开 DG4000、Vaunix、Newport 旋转台与 NI 采集卡")
+        subtitle = QLabel("统一保存和打开 DG4000、鼎阳 SSG、Vaunix、Newport 与 NI 采集卡")
         subtitle.setObjectName("Muted")
         titles.addWidget(title)
         titles.addWidget(subtitle)
@@ -88,7 +89,7 @@ class DeviceCenterWindow(QMainWindow):
         refresh = QPushButton("刷新状态")
         refresh.clicked.connect(self.probe_all)
         virtual = QPushButton("虚拟实验室")
-        virtual.setToolTip("创建并连接两台虚拟 DG4000、NI、Vaunix 和 Newport PR50CC")
+        virtual.setToolTip("创建并连接两台虚拟 DG4000、鼎阳 SSG、NI、Vaunix 和 Newport PR50CC")
         virtual.clicked.connect(self.create_virtual_lab)
         linkage = QPushButton("跨设备联动")
         linkage.setToolTip("使用一个 NI 触发源统一驱动多台 DG4000 的联合扫描")
@@ -345,6 +346,7 @@ class DeviceCenterWindow(QMainWindow):
     def create_virtual_lab(self) -> None:
         records = self.repository.list()
         specifications = (
+            (DeviceKind.SIGLENT_SSG, "虚拟 SIGLENT SSG6082A-V", VIRTUAL_SSG_RESOURCE),
             (DeviceKind.NEWPORT_SMC100, "虚拟 Newport PR50CC", VIRTUAL_SMC100_RESOURCE),
             (
                 DeviceKind.DG4000,

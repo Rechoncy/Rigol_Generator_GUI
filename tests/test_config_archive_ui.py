@@ -63,6 +63,8 @@ class ConfigArchiveUiTests(unittest.TestCase):
         stage_window = self.home.open_windows[self.stage.id]
         stage_window.step.setValue(0.37)
         stage_window.count.setValue(17)
+        stage_window.initial_mode.setCurrentIndex(stage_window.initial_mode.findData("specified"))
+        stage_window.initial_angle.setValue(-5.2)
         target = self.root / "portable.json"
         # Click before the autosave timer fires; export must flush current controls.
         with patch("rigol_control.ui.main_window.QFileDialog.getSaveFileName", return_value=(str(target), "")):
@@ -99,6 +101,8 @@ class ConfigArchiveUiTests(unittest.TestCase):
         restored = home.open_windows[self.stage.id]
         self.assertEqual(restored.step.value(), 0.37)
         self.assertEqual(restored.count.value(), 17)
+        self.assertEqual(restored.initial_mode.currentData(), "specified")
+        self.assertEqual(restored.initial_angle.value(), -5.2)
         self.assertEqual(restored.ni_combo.currentData(), self.ni.id)
         self.assertIsNone(restored.controller)
         backups = list((destination.data_dir / "config_backups").glob("*/configuration.json"))
@@ -119,6 +123,8 @@ class ConfigArchiveUiTests(unittest.TestCase):
     def test_import_running_scan_is_rejected_without_stop(self):
         target, w = self.export_from_live_window()
         w.directory.setText(str(self.root / "runs"))
+        w.move_initial_button.click()
+        self.assertTrue(self.wait(lambda: not w._manual_busy))
         w._start_scan()
         self.assertTrue(self.wait(lambda: w.controller is not None and w.controller.snapshot().phase == "holding"))
         with patch.object(QMessageBox, "warning") as warning:

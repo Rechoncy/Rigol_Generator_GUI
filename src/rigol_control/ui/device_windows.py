@@ -3516,6 +3516,9 @@ def create_device_window(
     device_provider: Callable[[], list[DeviceRecord]] | None = None,
     parameter_repository: DeviceParameterRepository | None = None,
 ) -> BaseDeviceWindow:
+    if record.kind is DeviceKind.SIGLENT_SSG:
+        from .siglent_window import SiglentWindow
+        return SiglentWindow(record, connection_manager, parameter_repository)
     if record.kind is DeviceKind.NEWPORT_SMC100:
         from .newport_window import NewportWindow
         return NewportWindow(record, all_devices, connection_manager,

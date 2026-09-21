@@ -1,6 +1,6 @@
-# DG4000 + Vaunix + Newport + NI 多设备联动控制
+# DG4000 + SIGLENT SSG + Vaunix + Newport + NI 多设备控制
 
-这是一个面向 RIGOL DG4000、Vaunix Lab Brick LMS/BLX 信号源、Newport SMC100CC / PR50CC 旋转台与 NI DAQ 的多设备桌面控制程序。首页用于保存和管理多台设备；点击设备卡片后，会打开独立的设备设置窗口，多台设备窗口可同时存在。
+这是一个面向 RIGOL DG4000、鼎阳 SIGLENT SSG、Vaunix Lab Brick LMS/BLX 信号源、Newport SMC100CC / PR50CC 旋转台与 NI DAQ 的多设备桌面控制程序。首页用于保存和管理多台设备；点击设备卡片后，会打开独立的设备设置窗口，多台设备窗口可同时存在。
 
 软件图标以波形、采样点和旋转箭头表示信号源、采集与循环扫描。Windows 下直接双击项目中的 `Lab Control Center.exe` 启动。旧版快捷方式需先双击 `create_shortcut.cmd` 更新一次；新版 `Lab Control Center.lnk` 指向同目录启动器，支持随整个项目文件夹迁移。不要只复制快捷方式或 EXE。启动器自动寻找当前电脑可用的 64 位 Python 3.10+ / PyQt6，不再记录开发机的 Python 地址；它不是包含 Python 和厂商驱动的完整安装包。
 
@@ -11,9 +11,11 @@
 - 多设备首页：添加、编辑、删除、保存和打开设备。
 - 首页设备卡片支持连接和断开；VISA 会话在首页与设置窗口之间共享，关闭设置窗口不会自动断开。
 - 添加/编辑设备时自动搜索 VISA 资源或 NI-DAQmx 设备，并通过可编辑下拉框选择；未安装驱动时仍可手动输入。
-- 支持 DG4000、Vaunix LMS/BLX、Newport SMC100CC、NI DAQ 和通用 SCPI 五类设备记录。
-- Newport PR50CC 循环旋转步进：启动保持当前位置 P0，首个 NI 触发移动到 P1，末点的下一触发回跳 P0。运动或稳定期间触发、计数跳增时明确停止，不补跑积压；DG/Vaunix 原有步进语义不变。
+- 支持 DG4000、鼎阳 SSG、Vaunix LMS/BLX、Newport SMC100CC、NI DAQ 和通用 SCPI 六类设备记录。
+- 鼎阳 SSG 基础控制：USB/LAN、频率/功率/RF、仪器原生 STEP/LIST 扫描、独立扫描/点触发、AM/FM/PM/单脉冲、矢量机型命令分支与 IQ 状态回读。使用仪器自己的触发步进，不使用 NI 逐点下发。详见 [鼎阳 SSG 详细使用说明](docs/SIGLENT_SSG_CN.md)和[开发说明与变更记录](docs/SIGLENT_SSG_DEVELOPMENT_CN.md)。SSG3021X / SSG3032X 已加入脉冲 BUS、实际回读及全局触发按钮。当前未发布，尚未实机验收。
+- Newport PR50CC 循环旋转步进：支持指定初始位置或以启动时当前位置为 P0，提供“使用当前位置 / 移动到 P0”操作。启动保持首点，首个 NI 触发移动到 P1，末点下一触发回跳 P0；运动或稳定期间触发、计数跳增时明确停止，不补跑积压。
 - Newport 窗口支持定位、微动、归零、速度和停止，参数按稳定设备 ID 保存；可由同一旋转任务同时管理 NI 连续模拟采集和计数，保存原始数据与主机观测阶段日志。详见 [Newport 操作说明](docs/NEWPORT_ROTATION_CN.md)。当前为未发布功能，尚未实机验证。
+- Newport 扫描页显示实际角度、扫描目标和当前点，提供含绝对角度、相对偏移与执行状态的只读点表；运行中跟随高亮，停止后保留记录，也可读取位置重新预览。
 - Vaunix 自动发现：直接加载本项目 `lms-sdk` 中的 Windows x64 `vnx_fmsynth.dll`，枚举真实型号和序列号，并用 `VAUNIX::LMS::<序列号>` 作为稳定资源地址。
 - Vaunix 完整控制窗口：当前频率、绝对输出功率、RF、内/外参考、LMS/BLX 扫频、内/外触发、快速脉冲、Chirp、BLX 50 项频率/功率序列、状态位、能力读取和设备非易失设置保存。
 - Vaunix 与 NI 联动：频率和功率轴可单独启用，也可同步或笛卡尔组合；首个 NI 边沿下发 P0，随后逐点循环，不设置软件最小触发间隔。
@@ -38,17 +40,17 @@
 - 完整 SCPI 通道：系统没有屏蔽命令，编程手册中的其他命令可从 SCPI 控制台直接执行。
 - NI-DAQmx 累计边沿计数器和双线程联动控制器已实现，频率、幅度、相位、PSK 相位、FSK 频率均可作为步进目标。
 - 步进任务具备独立的版本化持久化模型，便于后续在界面中复用任务模板。
-- 内置虚拟实验室：自动创建两台虚拟 DG4000、NI、Vaunix BLX-403 和 Newport PR50CC，共五台；无需厂商驱动或实体设备即可体验控制、联动和模拟采集。
+- 内置虚拟实验室：自动创建两台虚拟 DG4000、鼎阳 SSG6082A-V、NI、Vaunix BLX-403 和 Newport PR50CC，共六台；无需厂商驱动或实体设备即可体验控制、联动和模拟采集。
 - 虚拟 NI 支持单次、批量、连续触发，以及可调正弦、偏置和噪声的多通道模拟输入；虚拟 DG 支持可调 SCPI 延迟、实时状态和积压调试。
 
-没有安装驱动时，硬件操作会给出明确错误，不会假装已经下发命令。当前自动测试使用虚拟设备和协议替身，未验证实体 DG4000、Vaunix、Newport 或 NI 联动；Vaunix SDK DLL 已在本机完成空设备枚举及隔离 Test Mode 测试。现场仍需验证连接、型号能力、机械稳定时间、PFI 和计数器资源。
+没有安装驱动时，硬件操作会给出明确错误，不会假装已经下发命令。当前自动测试使用虚拟设备和协议替身，未验证实体 DG4000、鼎阳 SSG、Vaunix、Newport 或 NI 联动；Vaunix SDK DLL 已在本机完成空设备枚举及隔离 Test Mode 测试。现场仍需验证连接、型号能力、机械稳定时间、PFI 和计数器资源。
 
 ## 运行环境
 
 - Windows 10/11
 - Python 3.10 或更高版本
 - PyQt6
-- DG4000/NI 实机控制时需要 NI-VISA 或其他 VISA Backend、NI-DAQmx 驱动，以及可选 Python 包 `PyVISA`、`nidaqmx`。
+- DG4000/鼎阳 SSG 实机通信需要 NI-VISA 或其他可用 VISA Backend，以及 Python 包 `PyVISA`；NI 实机控制另需 NI-DAQmx 驱动和 `nidaqmx`。
 - Newport 实机控制需要串口驱动和 `pyserial`；安装下述 `.[instrument]` 可同时安装所需 Python 包。
 - Vaunix 实机控制需要与 Python 位数一致的 Windows x64 `vnx_fmsynth.dll`；程序会自动搜索仓库内 `lms-sdk-*`，也可通过 `VAUNIX_LMS_DLL` 指定绝对路径。
 
@@ -166,7 +168,7 @@ python -m rigol_control --smoke-test --data-dir .\runtime-data\smoke
 
 ## 联动时序原则
 
-以下首触发与积压规则适用于 DG/Vaunix；SCPI 批次和跨设备细节适用于 DG4000。Newport 启动保持当前位置 P0，首触发移动到 P1，末点下一触发回跳 P0；忙时触发或累计跳增时停止，详见 Newport 操作说明。
+以下首触发与积压规则适用于 DG/Vaunix；SCPI 批次和跨设备细节适用于 DG4000。Newport 支持指定 P0 或使用启动时当前位置，开始扫描保持首点，首触发移动到 P1，末点下一触发回跳 P0；忙时触发或累计跳增时停止，详见 Newport 操作说明。
 
 假设联合点表为 `P0, P1, ... Pn`，每个 `P` 可以包含频率、幅度、相位等多条命令：
 
