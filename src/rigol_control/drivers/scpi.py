@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
-from threading import RLock
+from threading import Lock, RLock
 from typing import Protocol
 
 
@@ -78,25 +78,35 @@ class ScpiSession:
         self._backend: ScpiBackend | None = None
         self._identity = ""
         self._lock = RLock()
+        # UI status checks must never wait for VISA I/O or a transaction. Only
+        # publish cached state under this short lock; never call I/O inside it.
+        self._status_lock = Lock()
+        self._status = (False, "")
 
     @property
     def is_connected(self) -> bool:
-        with self._lock:
-            return self._backend is not None
+        with self._status_lock:
+            return self._status[0]
 
     @property
     def identity(self) -> str:
-        with self._lock:
-            return self._identity
+        with self._status_lock:
+            return self._status[1]
+
+    def _publish_status(self, connected: bool) -> None:
+        with self._status_lock:
+            self._status = (connected, self._identity if connected else "")
 
     def connect(self) -> str:
         with self._lock:
             if self._backend is not None:
                 self._identity = self._query_locked("*IDN?")
+                self._publish_status(True)
                 return self._identity
             self._backend = self._backend_factory(self.resource, self.timeout_ms)
             try:
                 self._identity = self._query_locked("*IDN?")
+                self._publish_status(True)
                 return self._identity
             except Exception:
                 self._close_locked()
@@ -140,6 +150,7 @@ class ScpiSession:
                     ) from retry_error
             if normalized.upper() == "*IDN?":
                 self._identity = result
+                self._publish_status(True)
             return result
 
     def _write_locked(
@@ -168,6 +179,9 @@ class ScpiSession:
             ) from retry_exc
 
     def _recover_locked(self, command: str, first_error: Exception) -> None:
+        # Keep the last published state during serialized recovery. Publishing
+        # a transient disconnect would make the manager discard its connection
+        # while a successful recovery is still in flight. Failure clears it.
         old_backend, self._backend = self._backend, None
         if old_backend is not None:
             try:
@@ -181,6 +195,7 @@ class ScpiSession:
             if not identity:
                 raise ScpiConnectionError("自动重连后 *IDN? 返回为空")
             self._identity = identity
+            self._publish_status(True)
         except Exception as recovery_exc:
             self._close_locked_safely()
             raise ScpiConnectionError(
@@ -201,6 +216,7 @@ class ScpiSession:
         return self._backend
 
     def _close_locked(self) -> None:
+        self._publish_status(False)
         backend, self._backend = self._backend, None
         self._identity = ""
         if backend is not None:
@@ -210,6 +226,7 @@ class ScpiSession:
                 raise ScpiError(f"关闭 VISA 会话失败：{exc}") from exc
 
     def _close_locked_safely(self) -> None:
+        self._publish_status(False)
         backend, self._backend = self._backend, None
         self._identity = ""
         if backend is not None:

@@ -1,6 +1,6 @@
 import unittest
 
-from rigol_control.connections import DeviceConnectionManager
+from rigol_control.connections import DeviceBusyError, DeviceConnectionManager
 from rigol_control.drivers.vaunix_lms import VIRTUAL_VAUNIX_RESOURCE
 from rigol_control.models import DeviceKind, DeviceRecord
 from rigol_control.services import ProbeResult, ProbeState
@@ -115,7 +115,6 @@ class DeviceConnectionManagerTests(unittest.TestCase):
         driver = self.manager.vaunix_device_for(record)
         self.assertIs(driver, self.manager.vaunix_device_for(record))
         self.assertFalse(self.manager.is_connected(record))
-
         result = self.manager.connect(record)
         self.assertTrue(result.connected)
         self.assertIn("BLX-403", result.identity)
@@ -125,6 +124,14 @@ class DeviceConnectionManagerTests(unittest.TestCase):
         self.manager.disconnect(record)
         self.assertFalse(driver.is_connected)
         self.assertFalse(self.manager.is_connected(record))
+
+    def test_siglent_native_lease_is_not_labelled_as_linkage(self) -> None:
+        record = DeviceRecord.create(kind=DeviceKind.SIGLENT_SSG, name="SSG", resource="USB0::SSG::INSTR")
+        owner = f"siglent-native:{record.id}"
+        self.manager.acquire_devices(owner, [record.id])
+        with self.assertRaisesRegex(DeviceBusyError, "SSG 通信或原生扫描"):
+            self.manager.disconnect(record)
+        self.manager.release_devices(owner)
 
 
 if __name__ == "__main__":

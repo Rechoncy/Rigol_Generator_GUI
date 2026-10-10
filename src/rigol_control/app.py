@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ from PyQt6.QtWidgets import QApplication
 from .repository import DeviceRepository
 from .runtime import package_resource, prepare_data_dir, prepare_qt_environment
 from .ui.main_window import DeviceCenterWindow
+from .ui.input_behavior import InputWheelGuard
 from .ui.theme import APP_STYLE
 
 
@@ -53,6 +55,11 @@ def create_application(argv: list[str] | None = None) -> QApplication:
     palette.setColor(QPalette.ColorRole.ButtonText, QColor("#e7ebf4"))
     app.setPalette(palette)
     app.setStyleSheet(APP_STYLE)
+    app._input_wheel_guard = InputWheelGuard(app)
+    app.installEventFilter(app._input_wheel_guard)
+    # Remove Python callbacks before Qt tears down during interpreter exit.
+    # Retaining these bound arguments also keeps the filter alive for the app.
+    atexit.register(app.removeEventFilter, app._input_wheel_guard)
     return app
 
 

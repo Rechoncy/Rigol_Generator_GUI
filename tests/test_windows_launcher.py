@@ -75,7 +75,9 @@ class WindowsLauncherTests(unittest.TestCase):
             encoding="utf-8-sig",
         )
         resolved = self.powershell(script, moved)
-        self.assertEqual(Path(resolved), moved / "Lab Control Center.exe")
+        # Windows Shell expands an 8.3 TEMP path on hosted runners. Compare
+        # file identity so aliases cannot make a correctly relocated link fail.
+        self.assertTrue(Path(resolved).samefile(moved / "Lab Control Center.exe"))
 
     def test_application_failure_returns_failure_and_writes_diagnostic_log(self):
         (self.project / "tools/launch_app.py").write_text(

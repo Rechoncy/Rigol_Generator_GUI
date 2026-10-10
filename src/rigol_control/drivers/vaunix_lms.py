@@ -185,20 +185,26 @@ class VaunixLmsApi:
 
     def __init__(self, dll_path: Path | str | None = None) -> None:
         self.dll_path = Path(dll_path) if dll_path else locate_vaunix_dll()
-        try:
-            self.dll = ctypes.CDLL(str(self.dll_path))
-        except OSError as exc:
-            raise VaunixLmsError(f"无法加载 Vaunix DLL：{exc}") from exc
         # vnx_fmsynth.dll owns process-global USB state. Discovery, probing and
         # connected devices must therefore share one lock even when represented
         # by different Python API objects.
         self._lock = _VAUNIX_DLL_LOCK
         with self._lock:
-            self._configure_prototypes()
+            self.dll = self.load_library(self.dll_path)
             self.dll.fnLMS_SetTestMode(False)
 
-    def _configure_prototypes(self) -> None:
-        d = self.dll
+    @classmethod
+    def load_library(cls, dll_path: Path | str) -> ctypes.CDLL:
+        """Load and bind the SDK without enumerating or opening USB devices."""
+        try:
+            dll = ctypes.CDLL(str(dll_path))
+            cls._configure_prototypes(dll)
+        except (OSError, AttributeError) as exc:
+            raise VaunixLmsError(f"无法加载 Vaunix DLL：{exc}") from exc
+        return dll
+
+    @staticmethod
+    def _configure_prototypes(d) -> None:
         c_uint = ctypes.c_uint
         c_int = ctypes.c_int
         c_bool = ctypes.c_bool

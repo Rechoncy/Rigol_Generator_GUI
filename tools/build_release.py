@@ -28,6 +28,28 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def resolve_vaunix_dll(requested: Path | None, root: Path = ROOT) -> Path | None:
+    """Prefer an explicit SDK path, otherwise include the DLL in the project root."""
+    path = (requested if requested is not None else root / "vnx_fmsynth.dll").resolve()
+    if not path.is_file():
+        if requested is not None:
+            raise FileNotFoundError(path)
+        return None
+    data = path.read_bytes()
+    try:
+        offset = struct.unpack_from("<I", data, 0x3c)[0]
+        if data[:2] != b"MZ" or data[offset:offset + 4] != b"PE\0\0":
+            raise ValueError("missing PE header")
+        machine = struct.unpack_from("<H", data, offset + 4)[0]
+        characteristics = struct.unpack_from("<H", data, offset + 22)[0]
+        magic = struct.unpack_from("<H", data, offset + 24)[0]
+        if machine != 0x8664 or magic != 0x20b or not characteristics & 0x2000:
+            raise ValueError("not an AMD64 PE32+ DLL")
+    except (struct.error, ValueError) as exc:
+        raise RuntimeError(f"Vaunix library must be a Windows x64 DLL: {path}") from exc
+    return path
+
+
 def source_revision() -> tuple[str | None, bool | None]:
     try:
         revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
@@ -121,7 +143,8 @@ def bundle_zip(folder: Path, destination: Path):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--vaunix-dll", type=Path, help="Explicitly include a licensed Windows x64 vendor DLL")
+    parser.add_argument("--vaunix-dll", type=Path,
+                        help="Override the Windows x64 vendor DLL (default: project-root vnx_fmsynth.dll if present)")
     args = parser.parse_args()
     if sys.platform != "win32" or struct.calcsize("P") != 8:
         raise RuntimeError("Build on 64-bit Windows using 64-bit Python")
@@ -131,9 +154,7 @@ def main() -> int:
     from rigol_control import __version__
     version = __version__
     slug = f"Lab-Control-Center-{version}-windows-x64"
-    dll = args.vaunix_dll.resolve() if args.vaunix_dll else None
-    if dll and not dll.is_file():
-        raise FileNotFoundError(dll)
+    dll = resolve_vaunix_dll(args.vaunix_dll)
     (ROOT / "build").mkdir(exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix="release-", dir=ROOT / "build"))
     support = stage / "support"
@@ -148,6 +169,9 @@ def main() -> int:
             "source_commit": revision, "source_dirty": dirty, "source_archive_sha256": sha256(support / "source.zip"),
             "dependencies": dependencies, "vaunix_dll_bundled": bool(dll),
             "built_at_utc": datetime.now(timezone.utc).isoformat()}
+    if dll:
+        info["vaunix_dll"] = {"file": "vnx_fmsynth.dll", "bundle_path": "vendor/vaunix/vnx_fmsynth.dll",
+                              "architecture": "windows-x64", "bytes": dll.stat().st_size, "sha256": sha256(dll)}
     (support / "build-info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     env = dict(os.environ, LAB_RELEASE_SUPPORT=str(support), LAB_RELEASE_SLUG=slug)
     # PyInstaller also searches PATH for dependent DLLs. Do not collect a foreign

@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..connections import ConnectionInfo, DeviceConnectionManager
 from ..config_archive import ConfigArchiveService, JOURNAL
 from ..drivers.vaunix_lms import VIRTUAL_VAUNIX_RESOURCE
@@ -61,7 +62,7 @@ class DeviceCenterWindow(QMainWindow):
         self._transfer_task = None
         self._configuration_recovery_failed = False
 
-        self.setWindowTitle("实验室设备中心")
+        self.setWindowTitle(f"实验室设备中心 · v{__version__}")
         self.resize(1240, 790)
         self.setMinimumSize(760, 560)
 
@@ -140,7 +141,7 @@ class DeviceCenterWindow(QMainWindow):
         )
         footer.addWidget(path)
         footer.addStretch()
-        version = QLabel("DG4000 + Vaunix + NI 联动控制 · v0.6.0")
+        version = QLabel(f"实验室设备中心 · v{__version__}")
         version.setObjectName("Muted")
         footer.addWidget(version)
         outer.addLayout(footer)

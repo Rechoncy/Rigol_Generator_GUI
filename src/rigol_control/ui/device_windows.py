@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..analog import (
     AnalogAcquisitionController,
     AnalogAcquisitionState,
@@ -332,7 +333,7 @@ class BaseDeviceWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self._call_tasks: set[CallTask] = set()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setWindowTitle(f"{record.name} · 设备设置")
+        self.setWindowTitle(f"{record.name} · 设备设置 · v{__version__}")
         self.resize(1180, 760)
         self.setMinimumSize(940, 620)
 

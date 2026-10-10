@@ -131,6 +131,9 @@ class DeviceConnectionManager:
         with self._lock:
             owner = self._leases.get(record.id)
         if owner is not None:
+            if owner.startswith("siglent-native:"):
+                raise DeviceBusyError(f"设备“{record.name}”正在执行 SSG 通信或原生扫描，"
+                                      "请等待通信结束；扫描曾启用时请停止并回读确认后断开")
             raise DeviceBusyError(f"设备“{record.name}”正被联动任务占用，停止任务后才能断开")
         if record.kind is DeviceKind.NEWPORT_SMC100:
             with self._lock:

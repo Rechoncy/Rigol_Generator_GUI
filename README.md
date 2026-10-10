@@ -2,7 +2,7 @@
 
 这是一个面向 RIGOL DG4000、鼎阳 SIGLENT SSG、Vaunix Lab Brick LMS/BLX 信号源、Newport SMC100CC / PR50CC 旋转台与 NI DAQ 的多设备桌面控制程序。首页用于保存和管理多台设备；点击设备卡片后，会打开独立的设备设置窗口，多台设备窗口可同时存在。
 
-**Windows 便携版：** 0.7.0 提供内置 Python/Qt 与 Python 仪器接口的目录 ZIP 和单文件 EXE；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。具体下载文件、数据迁移、实机驱动及编译方法见 [发行版使用与构建说明](release/README.md)和[0.7.0 发行说明](release/NOTES-0.7.0.md)。
+**Windows 便携版：** 0.7.11 提供内置 Python/Qt 与 Python 仪器接口的目录 ZIP 和单文件 EXE；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。具体下载文件、数据迁移、实机驱动及编译方法见 [发行版使用与构建说明](release/README.md)和[0.7.11 发行说明](release/NOTES-0.7.11.md)。
 
 软件图标以波形、采样点和旋转箭头表示信号源、采集与循环扫描。仓库根目录原有的 `Lab Control Center.exe` 是供源码运行的小型启动器，依赖目标电脑的 64 位 Python 3.10+ / PyQt6；它不是上述发行附件。开发者可继续使用它或 `run_app.cmd`。
 
@@ -18,7 +18,7 @@
 - Newport PR50CC 循环旋转步进：支持指定初始位置或以启动时当前位置为 P0，提供“使用当前位置 / 移动到 P0”操作。启动保持首点，首个 NI 触发移动到 P1，末点下一触发回跳 P0；运动或稳定期间触发、计数跳增时明确停止，不补跑积压。
 - Newport 窗口支持定位、微动、归零、速度和停止，参数按稳定设备 ID 保存；可由同一旋转任务同时管理 NI 连续模拟采集和计数，保存原始数据与主机观测阶段日志。详见 [Newport 操作说明](docs/NEWPORT_ROTATION_CN.md)。已纳入 0.7.0，尚未实机验证。
 - Newport 扫描页显示实际角度、扫描目标和当前点，提供含绝对角度、相对偏移与执行状态的只读点表；运行中跟随高亮，停止后保留记录，也可读取位置重新预览。
-- Vaunix 自动发现：直接加载本项目 `lms-sdk` 中的 Windows x64 `vnx_fmsynth.dll`，枚举真实型号和序列号，并用 `VAUNIX::LMS::<序列号>` 作为稳定资源地址。
+- Vaunix 自动发现：便携 ZIP 和单文件 EXE 内置 Windows x64 `vnx_fmsynth.dll`；源码版也支持主目录或 `lms-sdk` 中的 DLL。枚举真实型号和序列号，并用 `VAUNIX::LMS::<序列号>` 作为稳定资源地址。
 - Vaunix 完整控制窗口：当前频率、绝对输出功率、RF、内/外参考、LMS/BLX 扫频、内/外触发、快速脉冲、Chirp、BLX 50 项频率/功率序列、状态位、能力读取和设备非易失设置保存。
 - Vaunix 与 NI 联动：频率和功率轴可单独启用，也可同步或笛卡尔组合；首个 NI 边沿下发 P0，随后逐点循环，不设置软件最小触发间隔。
 - 本地版本化 JSON 配置和原子写入，防止重复保存同一资源；每台设备的全部可编辑参数自动保存并在重新打开或重启软件后恢复。
@@ -58,7 +58,7 @@
 - PyQt6
 - DG4000/鼎阳 SSG 实机通信需要 NI-VISA 或其他可用 VISA Backend，以及 Python 包 `PyVISA`；NI 实机控制另需 NI-DAQmx 驱动和 `nidaqmx`。
 - Newport 实机控制需要串口驱动和 `pyserial`；安装下述 `.[instrument]` 可同时安装所需 Python 包。
-- Vaunix 实机控制需要与 Python 位数一致的 Windows x64 `vnx_fmsynth.dll`；程序会自动搜索仓库内 `lms-sdk-*`，也可通过 `VAUNIX_LMS_DLL` 指定绝对路径。
+- Vaunix 源码运行需要 Windows x64 `vnx_fmsynth.dll`，可放在项目主目录或仓库内 `lms-sdk-*`，也可通过 `VAUNIX_LMS_DLL` 指定绝对路径。0.7.11 本地便携 ZIP 和单文件 EXE 已内置此 DLL，无需另外配置。
 
 > NI 设备资源名以 NI MAX 中显示的名称为准，例如 `Dev1`。软件不依赖用户口述的具体 USB 型号来猜测设备能力，连接后将读取驱动报告的真实产品类型。
 
@@ -68,8 +68,8 @@
 
 从 [GitHub Releases](https://github.com/Rechoncy/Rigol_Generator_GUI/releases) 获取该版本附件；本地构建的文件位于 `dist/release/`：
 
-- `Lab-Control-Center-0.7.0-windows-x64-portable.zip`：完整解压后运行 `Lab Control Center.exe`，保留 `_internal/`。
-- `Lab-Control-Center-0.7.0-windows-x64.exe`：单文件启动，内置运行时临时解压，持久化配置保存在 EXE 旁 `data/`。
+- `Lab-Control-Center-0.7.11-windows-x64-portable.zip`：完整解压后运行 `Lab Control Center.exe`，保留 `_internal/`。
+- `Lab-Control-Center-0.7.11-windows-x64.exe`：单文件启动，内置运行时临时解压，持久化配置保存在 EXE 旁 `data/`。
 
 两种格式默认使用 EXE 旁的 `data/`；`--data-dir` 和 `RIGOL_GUI_DATA_DIR` 可以覆盖。迁移时复制程序与 `data/`，用户另选位置的采集文件需一并迁移。旧源码版 AppData 配置不会自动迁移，可用首页“导出配置 / 导入配置”。详见[便携迁移与升级](release/README.md#3-保存迁移与升级)。
 
@@ -139,7 +139,7 @@ python -m rigol_control --data-dir .\runtime-data
 
 ## Vaunix LMS/BLX 实机配置
 
-1. 保留仓库内的 Windows SDK 目录，或设置 `$env:VAUNIX_LMS_DLL = "C:\\path\\to\\vnx_fmsynth.dll"`。使用 64 位 Python 时必须选择 SDK 的 `x64\Release` DLL。
+1. 使用 0.7.11 本地便携 ZIP 或单文件 EXE 时，直接使用内置 SDK 1.15 DLL。源码运行可将 Windows x64 `vnx_fmsynth.dll` 放在项目主目录，或保留仓库 SDK 目录；也可通过 `VAUNIX_LMS_DLL` 指定 DLL。
 2. 插入 Vaunix Lab Brick 后，在首页添加 `Vaunix LMS/BLX`；资源下拉框会显示型号、序列号和 `VAUNIX::LMS::<序列号>`。资源身份使用序列号，不依赖 DLL 每次枚举得到的临时设备句柄。首页后台探测只枚举设备，不调用 `fnLMS_InitDevice` 或 `fnLMS_CloseDevice`，不会抢占或关闭正式控制会话。
 3. 连接后先在“总览”核对型号、序列号、SDK 版本、频率/功率范围以及 BLX 序列、快速脉冲、Chirp 能力；不支持的功能按钮会被禁用。
 4. “射频输出”使用 Hz/GHz 与绝对 dBm；DLL 功率参数以 0.25 dB 为编码单位，但仪器实际功率分辨率为 0.5 dB，软件会拒绝不在 0.5 dB 网格上的输出、序列和扫描值。先保持 RF 关闭，应用低风险参数后再开 RF。
@@ -184,7 +184,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1
 
 脚本自动创建 `build/release-venv/` 并打包目录 ZIP、单文件 EXE、SHA-256 校验和及发行清单，输出到 `dist/release/`。这些产物内置应用运行环境，不依赖目标电脑 Python；系统硬件驱动不会被自动安装。发行构建会拒绝 Conda 环境，以免其 DLL 与 Qt 混用；源码运行仍可使用原 Conda 环境。完整步骤见[构建说明](release/README.md#7-开发者构建)。
 
-0.7.0 已完成 215 项自动测试，以及目录包、单文件 EXE、ZIP 二次解压的实际运行检查；依赖均由包内加载，六台虚拟设备及窗口验证通过。具体环境、产物大小及实机边界见[本版验证记录](release/NOTES-0.7.0.md#验证与边界)。
+0.7.11 已完成 273 项自动测试，并进行目录包、单文件 EXE、ZIP 二次解压的运行检查。构建自动包含项目主目录的 Vaunix Windows x64 DLL，清单记录原文件 SHA-256，冻结自检验证包内 DLL 加载、全部驱动接口绑定及 SDK 1.15 版本读取。保留输入框滚轮保护、SSG 独立 STEP/LIST 页、底部状态卡片和通信恢复。详见[本版说明](release/NOTES-0.7.11.md)和[专项核对报告](docs/SIGLENT_SSG3021X_AUDIT_20260926_CN.md)；尚未实机验收。
 
 ## 测试
 

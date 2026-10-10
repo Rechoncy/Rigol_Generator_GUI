@@ -51,4 +51,9 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           python -c 'import json,os; m=json.load(open("release-assets/release-manifest.json")); assert "v"+m["version"] == os.environ["RELEASE_TAG"], "Tag must match application version"'
-          gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "Lab Control Center $RELEASE_TAG" --notes-file release-assets/RELEASE-NOTES.md
+          if gh release view "$RELEASE_TAG" --json assets > existing-release.json; then
+            python -c 'import json,pathlib; existing={a["name"] for a in json.load(open("existing-release.json"))["assets"]}; expected={p.name for p in pathlib.Path("release-assets").iterdir() if p.is_file()}; missing=expected-existing; assert not missing, f"Existing release is missing assets: {sorted(missing)}"'
+            echo "::notice::Release already contains all assets; preserving the uploaded build."
+          else
+            gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "Lab Control Center $RELEASE_TAG" --notes-file release-assets/RELEASE-NOTES.md
+          fi

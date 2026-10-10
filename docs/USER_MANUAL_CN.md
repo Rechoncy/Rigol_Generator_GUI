@@ -83,7 +83,7 @@
 - Python 3.10 或更高版本。
 - PyQt6。
 - 仅使用虚拟实验室时，不需要 PyVISA、NI-VISA 或 NI-DAQmx。
-- Vaunix 实机需要与 Python 位数一致的 Windows x64 `vnx_fmsynth.dll`；虚拟 Vaunix 不需要 DLL。
+- Vaunix 实机需要 Windows x64 `vnx_fmsynth.dll`；0.7.11 本地便携 ZIP 和单文件 EXE 已内置 SDK 1.15，无需另配路径。源码版可将 DLL 放在项目主目录；虚拟 Vaunix 不需要 DLL。
 
 ### 3.2 安装图形界面
 
@@ -114,7 +114,9 @@ python -m pip install -e ".[instrument]"
 3. 计划使用的计数器、PFI 和模拟输入通道没有被其他任务占用。
 4. 设备确实报告所需 `ai` 通道和采样率；软件不会仅凭型号名称猜测能力。
 
-Vaunix SDK 不通过 NI MAX 管理。程序按以下顺序寻找 DLL：环境变量 `VAUNIX_LMS_DLL`、项目根目录、程序驱动目录，以及项目内 `lms-sdk-*\LMS_Windows_SDK_*\x64\Release\vnx_fmsynth.dll`。使用 64 位 Python 时必须加载 x64 DLL。连接前可在 PowerShell 中显式指定：
+Vaunix SDK 不通过 NI MAX 管理。0.7.11 本地编译包直接加载内置 Windows x64 DLL：目录包在 `_internal/vendor/vaunix/vnx_fmsynth.dll`，单文件 EXE 启动时释放到临时运行目录，搬到其他电脑无需再放置此文件或设置变量。便携包必须完整解压并保留 `_internal/`。
+
+运行时仍优先使用环境变量 `VAUNIX_LMS_DLL`，然后检查 EXE 旁 `vendor/vaunix/`，再检查包内 DLL；源码版也搜索主目录与 `lms-sdk-*\LMS_Windows_SDK_*\x64\Release\vnx_fmsynth.dll`。只有需要显式换用其他 Windows x64 SDK 时，才在 PowerShell 中指定：
 
 ```powershell
 $env:VAUNIX_LMS_DLL = "C:\path\to\vnx_fmsynth.dll"
@@ -462,6 +464,8 @@ Vaunix 的专用联动页选择一个已经连接的 NI 设备、`ctr`、PFI、�
 | 电压偏置 | V、mV | V |
 | 角度 | 度、rad | 度 |
 | 时间 | s、ms、us | s |
+
+0.7.10 起，数值输入框和收起状态的单位/参数下拉框不会随鼠标滚轮改变内容，已有焦点时也不改值。鼠标位于输入框上时，滚轮用于滚动所在页面或表格；展开下拉列表后可用滚轮浏览选项。修改数值请直接键盘输入、使用键盘方向键或点击数值框增减按钮。
 
 数值编辑器保留最多 9 位小数，表格用 12 位有效数字显示。实际可用范围仍由具体 DG4000 型号、波形、负载和固件决定。
 

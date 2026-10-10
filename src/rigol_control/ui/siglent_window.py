@@ -1,18 +1,61 @@
 from __future__ import annotations
 
 import json
+import math
+import sys
+import traceback
+from datetime import datetime
+from pathlib import Path
 
-from PyQt6.QtCore import QTimer
-from PyQt6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QLabel,
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QVBoxLayout, QLabel,
                              QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
                              QSpinBox, QTableWidget, QTableWidgetItem, QWidget,
                              QHeaderView)
 
 from ..connections import DeviceConnectionManager
+from .. import __version__
+from ..units import from_base, to_base, unit_specs
 from ..drivers.scpi import ScpiError
 from ..drivers.siglent_ssg import (SiglentSsgDriver, SsgModulation, SsgPoint, SsgSweep,
-                                  VIRTUAL_SSG_RESOURCE)
+                                  SsgCommandError, VIRTUAL_SSG_RESOURCE, capabilities)
 from .device_windows import BaseDeviceWindow, UnitValueWidget, page_shell, value_spin
+from .widgets import metric_card
+
+
+class RfPowerWidget(UnitValueWidget):
+    """Keep the canonical dBm value exact when formatting a different unit."""
+
+    def __init__(self, value, minimum, maximum):
+        self._dbm = value
+        self._updating_display = False
+        super().__init__(value, minimum, maximum, "rf_power", "dBm")
+        self.spin.valueChanged.connect(self._edited)
+
+    def _edited(self, value):
+        if not self._updating_display:
+            self._dbm = to_base(value, "rf_power", self._active_unit)
+
+    def value(self):
+        return self._dbm
+
+    def setValue(self, value):
+        dbm = to_base(value, "rf_power", "dBm")
+        self._dbm = min(max(dbm, self.minimum_base), self.maximum_base)
+        self._updating_display = True
+        try:
+            super().setValue(self._dbm)
+        finally:
+            self._updating_display = False
+
+    def _unit_changed(self, _index):
+        self._updating_display = True
+        try:
+            self._active_unit = self.unit_combo.currentData()
+            self._apply_display_range()
+            self.spin.setValue(from_base(self._dbm, "rf_power", self._active_unit))
+        finally:
+            self._updating_display = False
 
 
 class SiglentWindow(BaseDeviceWindow):
@@ -23,11 +66,18 @@ class SiglentWindow(BaseDeviceWindow):
         self.owner = f"siglent-native:{record.id}"
         self._busy = False
         self._pending_safety = []
+        self._current_scan_preview = None
+        self._selected_sweep_kind = "STEP"
+        self._scan_layouts = {}
         self.controls = {}
         self.write_buttons = []
         super().__init__(record, [
-            ("连接与射频", self._rf_page), ("原生扫描与触发", self._sweep_page),
+            ("连接与射频", self._rf_page),
+            ("触发步进扫描", lambda: self._sweep_page("STEP")),
+            ("列表扫描", lambda: self._sweep_page("LIST")),
             ("模拟调制", self._mod_page), ("状态与诊断", self._diagnostics_page)], parameter_repository)
+        self.pages.currentChanged.connect(self._scan_page_selected)
+        self.log.appendPlainText(self.runtime_info.text())
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(1500)
         self.poll_timer.timeout.connect(self._poll)
@@ -63,6 +113,11 @@ class SiglentWindow(BaseDeviceWindow):
     def _frequency(self, key, value):
         return self._bind(key, UnitValueWidget(value, 9e3, 40e9, "frequency", "GHz"))
 
+    def _power(self, key, value):
+        control = self._bind(key, RfPowerWidget(value, -140, 30))
+        control.setToolTip("50 Ω 正弦载波：mV 为有效值，mVpp 为峰峰值；下发及功率限值校验使用等效 dBm。")
+        return control
+
     def _check(self, key, text):
         return self._bind(key, QCheckBox(text))
 
@@ -96,13 +151,14 @@ class SiglentWindow(BaseDeviceWindow):
         layout.addWidget(self.capability_label)
         form = QFormLayout()
         self.frequency = self._frequency("rf.frequency", 1e9)
-        self.power = self._number("rf.power", -20, -140, 30, "dBm", 2)
+        self.power = self._power("rf.power", -20)
         form.addRow("载波频率", self.frequency)
-        form.addRow("功率", self.power)
+        form.addRow("输出幅度", self.power)
+        form.addRow(QLabel("电压按 50 Ω 正弦载波换算：mV 为有效值，mVpp 为峰峰值。"))
         layout.addLayout(form)
         row = QHBoxLayout()
         self._button(row, "应用频率", self.apply_frequency, write=True)
-        self._button(row, "应用功率", self.apply_power, write=True)
+        self._button(row, "应用幅度", self.apply_power, write=True)
         self._button(row, "RF 开启", lambda: self._run(lambda: self.driver.set_output(True)), write=True)
         self._button(row, "RF 关闭", lambda: self._safety(lambda: self.driver.set_output(False)))
         layout.addLayout(row)
@@ -112,59 +168,139 @@ class SiglentWindow(BaseDeviceWindow):
         layout.addStretch()
         return page
 
-    def _sweep_page(self):
-        page, layout = page_shell("仪器原生扫描", "外部触发线直接连接仪器。扫描触发控制一轮，点触发控制步进；驻留期间的触发行为需实机验证。")
+    def _sweep_page(self, kind):
+        is_step = kind == "STEP"
+        prefix = "sweep" if is_step else "list_sweep"
+        title = "触发步进扫描" if is_step else "列表扫描"
+        subtitle = "设置起止值、点数与驻留，由仪器按触发逐点推进。" if is_step else "逐行编辑频率、幅度和驻留，由仪器执行 LIST 序列。"
+        page, layout = page_shell(title, subtitle)
+        self._scan_layouts[kind] = layout
+        config = QWidget()
+        config_layout = QVBoxLayout(config)
+        config_layout.setContentsMargins(0, 0, 8, 0)
+        config_layout.setSpacing(10)
         form = QFormLayout()
-        form.addRow("类型", self._combo("sweep.kind", [("等间隔步进", "STEP"), ("自定义列表", "LIST")]))
-        form.addRow("扫描量", self._combo("sweep.target", [("频率", "FREQUENCY"), ("功率", "LEVEL"), ("频率 + 功率", "LEV_FREQ")]))
-        form.addRow("起始 / 终止频率", self._pair(self._frequency("sweep.start_hz", 1e9), self._frequency("sweep.stop_hz", 1.1e9)))
-        form.addRow("起始 / 终止功率", self._pair(self._number("sweep.start_dbm", -20, -140, 30, "dBm", 2), self._number("sweep.stop_dbm", -20, -140, 30, "dBm", 2)))
-        points = self._bind("sweep.points", QSpinBox())
-        points.setRange(2, 65535)
-        points.setValue(11)
-        form.addRow("步进点数 / 驻留", self._pair(points, self._number("sweep.dwell_s", .03, .01, 100, "s", 4)))
-        form.addRow("形状 / 间隔", self._pair(
-            self._combo("sweep.shape", [("锯齿", "SAWTOOTH"), ("三角", "TRIANGLE")]),
-            self._combo("sweep.spacing", [("线性", "LINEAR"), ("对数", "LOGARITHMIC")])))
+        form.setVerticalSpacing(10)
+        form.addRow("扫描量", self._combo(prefix + ".target", [("频率", "FREQUENCY"), ("功率", "LEVEL"), ("频率 + 功率", "LEV_FREQ")]))
+        if is_step:
+            form.addRow("起始 / 终止频率", self._pair(self._frequency("sweep.start_hz", 1e9), self._frequency("sweep.stop_hz", 1.1e9)))
+            form.addRow("起始 / 终止幅度", self._pair(self._power("sweep.start_dbm", -20), self._power("sweep.stop_dbm", -20)))
+            points = self._bind("sweep.points", QSpinBox())
+            points.setRange(2, 65535)
+            points.setValue(11)
+            form.addRow("步进点数 / 驻留", self._pair(points, self._number("sweep.dwell_s", .03, .01, 100, "s", 4)))
+            form.addRow("形状 / 间隔", self._pair(
+                self._combo("sweep.shape", [("锯齿", "SAWTOOTH"), ("三角", "TRIANGLE")]),
+                self._combo("sweep.spacing", [("线性", "LINEAR"), ("对数", "LOGARITHMIC")])))
         form.addRow("方向 / 模式", self._pair(
-            self._combo("sweep.direction", [("正向", "FWD"), ("反向", "REV")]),
-            self._combo("sweep.mode", [("连续", "CONTINUE"), ("单次", "SINGLE")])))
+            self._combo(prefix + ".direction", [("正向", "FWD"), ("反向", "REV")]),
+            self._combo(prefix + ".mode", [("连续", "CONTINUE"), ("单次", "SINGLE")])))
         triggers = [("自动", "AUTO"), ("仪器面板按键", "KEY"), ("总线 *TRG", "BUS"), ("外部输入", "EXT")]
-        form.addRow("扫描触发 / 点触发", self._pair(self._combo("sweep.sweep_trigger", triggers), self._combo("sweep.point_trigger", triggers)))
-        self.controls["sweep.point_trigger"].setCurrentIndex(3)
-        form.addRow("扫描外部触发沿", self._combo("sweep.slope", [("上升沿", "POSITIVE"), ("下降沿", "NEGATIVE")]))
-        layout.addLayout(form)
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["频率 / Hz", "功率 / dBm", "驻留 / s"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.setMinimumHeight(150)
-        layout.addWidget(self.table)
+        form.addRow("扫描触发 / 点触发", self._pair(self._combo(prefix + ".sweep_trigger", triggers), self._combo(prefix + ".point_trigger", triggers)))
+        self.controls[prefix + ".point_trigger"].setCurrentIndex(3)
+        form.addRow("扫描外部触发沿", self._combo(prefix + ".slope", [("上升沿", "POSITIVE"), ("下降沿", "NEGATIVE")]))
+        config_layout.addLayout(form)
+        if not is_step:
+            self.list_power_unit = self._combo("list.power_unit", [(s.symbol, s.key) for s in unit_specs("rf_power")])
+            self._list_power_unit_active = "dBm"
+            list_actions = QHBoxLayout()
+            list_actions.addWidget(QLabel("列表幅度单位"))
+            list_actions.addWidget(self.list_power_unit)
+            self._button(list_actions, "添加列表行", self.add_row)
+            self._button(list_actions, "删除选中行", self.remove_rows)
+            self._button(list_actions, "从仪器读取列表", self.read_list)
+            config_layout.addLayout(list_actions)
+            self.table = QTableWidget(0, 3)
+            self.table.setHorizontalHeaderLabels(["频率 / Hz", "幅度 / dBm", "驻留 / s"])
+            self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            self.table.setMinimumHeight(170)
+            self.table.setAlternatingRowColors(True)
+            config_layout.addWidget(self.table, 1)
+            self.add_row(SsgPoint(1e9, -20))
+            self.add_row(SsgPoint(1.1e9, -20))
+            self.list_power_unit.currentIndexChanged.connect(self._change_list_power_unit)
+        else:
+            config_layout.addStretch()
+        layout.addWidget(self._scroll(config), 1)
         row = QHBoxLayout()
-        self._button(row, "添加列表行", self.add_row)
-        self._button(row, "删除选中行", self.remove_rows)
-        self._button(row, "从仪器读取列表", self.read_list)
-        layout.addLayout(row)
-        self.add_row(SsgPoint(1e9, -20))
-        self.add_row(SsgPoint(1.1e9, -20))
-        row = QHBoxLayout()
-        self._button(row, "应用配置（保持停止）", self.apply_sweep, write=True)
-        self._button(row, "启用 / 布防", self.start_sweep, write=True)
-        self._button(row, "执行单次", lambda: self._run(self.driver.execute_single), write=True)
+        apply = self._button(row, "应用配置（保持停止）", lambda: self.apply_sweep(kind), write=True)
+        apply.setObjectName("PrimaryButton")
+        self._button(row, "启用 / 布防", lambda: self.start_sweep(kind), write=True)
+        self._button(row, "执行单次", lambda: self.start_sweep(kind, single=True), write=True)
         self._button(row, "停止扫描", lambda: self._safety(self.driver.stop))
-        layout.addLayout(row)
-        row = QHBoxLayout()
         self._button(row, "发送全局 *TRG", lambda: self._run(self.driver.bus_trigger), write=True)
+        layout.addLayout(row)
         if self.record.resource == VIRTUAL_SSG_RESOURCE:
+            row = QHBoxLayout()
             for label, value in (("模拟外部沿", "EXT"), ("模拟面板按键", "KEY")):
                 self._button(row, label, lambda v=value: self._run(lambda: self.session.write(":SIM:TRIGger " + v)), write=True)
-        layout.addLayout(row)
-        note = QLabel("*TRG 为全局触发：也可能触发设为 BUS 的脉冲或低频功能。KEY 由仪器面板操作。停止扫描不关闭 RF。")
+            layout.addLayout(row)
+        note = QLabel("外部触发线直接接仪器；*TRG 会同时触发其他 BUS 功能。停止扫描不关闭 RF。")
+        note.setObjectName("Muted")
         note.setWordWrap(True)
         layout.addWidget(note)
-        self.sweep_status = QLabel("扫描状态：尚未回读")
+        if is_step:
+            self.scan_monitor_widget = self._scan_monitor()
+            layout.addWidget(self.scan_monitor_widget)
+        return page
+
+    def _scan_monitor(self):
+        panel = QWidget()
+        panel.setProperty("skipDeviceParameterPersistence", True)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.scan_metrics = {}
+        for key, title, initial, color in (
+                ("received", "已收到触发", "未知", "#8f7cff"),
+                ("backlog", "待处理积压", "未知", "#f0b95d"),
+                ("current", "当前扫描频率", "未读取", "#e7ebf4"),
+                ("power", "当前扫描幅度", "未读取", "#55d9cc")):
+            card, value = metric_card(title, initial, color)
+            card.layout().setSpacing(6)
+            value.setWordWrap(True)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.scan_metrics[key] = value
+            row.addWidget(card, 1)
+            if key in ("received", "backlog"):
+                card.setToolTip("仪器手册未提供外部触发接收/积压计数查询；未知不表示零，不从扫描值推算。")
+            if key == "power":
+                self.scan_voltage = QLabel("50 Ω 正弦载波")
+                self.scan_voltage.setObjectName("Muted")
+                self.scan_voltage.setWordWrap(True)
+                card.layout().addWidget(self.scan_voltage)
+            card.layout().addStretch(1)
+        layout.addLayout(row)
+        self.sweep_status = QLabel("仪器扫描状态：尚未回读")
+        self.sweep_status.setObjectName("Muted")
         self.sweep_status.setWordWrap(True)
         layout.addWidget(self.sweep_status)
-        return self._scroll(page)
+        row = QHBoxLayout()
+        self._button(row, "刷新当前值预览", self.refresh_scan_preview)
+        self.scan_preview_auto = QCheckBox("自动刷新（约 1.5 秒）")
+        self.scan_preview_auto.setProperty("skipDeviceParameterPersistence", True)
+        row.addWidget(self.scan_preview_auto)
+        row.addStretch()
+        layout.addLayout(row)
+        self.scan_preview_status = QLabel("仪器共用预览 · 当前值未读取；触发接收与积压不可查询，显示未知。")
+        self.scan_preview_status.setObjectName("Muted")
+        self.scan_preview_status.setWordWrap(True)
+        layout.addWidget(self.scan_preview_status)
+        return panel
+
+    def _scan_page_selected(self, index):
+        if index not in (1, 2):
+            return
+        kind = "STEP" if index == 1 else "LIST"
+        self._selected_sweep_kind = kind
+        # A single hardware monitor follows the selected editor. Page changes
+        # neither issue commands nor duplicate timers or hardware state.
+        for layout in self._scan_layouts.values():
+            layout.removeWidget(self.scan_monitor_widget)
+        self._scan_layouts[kind].addWidget(self.scan_monitor_widget)
+        self.scan_monitor_widget.show()
 
     @staticmethod
     def _pair(first, second):
@@ -196,6 +332,7 @@ class SiglentWindow(BaseDeviceWindow):
         form.addRow("脉冲触发沿 / 门极性", self._pair(self._combo("mod.pulse_slope", [("上升沿", "POSITIVE"), ("下降沿", "NEGATIVE")]), self._combo("mod.gate_polarity", [("正逻辑", "NORMAL"), ("反逻辑", "INVERTED")])))
         layout.addLayout(form)
         self._button(layout, "应用调制配置", self.apply_modulation, write=True)
+        self._button(layout, "读取调制状态", self.refresh_modulation)
         self._button(layout, "触发脉冲（全局 *TRG）", lambda: self._run(self.driver.pulse_bus_trigger), write=True)
         bus_note = QLabel("BUS：先应用配置，再按触发按钮；每次只发送一个 *TRG。该命令也可能触发设为 BUS 的扫描或低频功能，不自动打开 RF。")
         bus_note.setWordWrap(True)
@@ -203,19 +340,26 @@ class SiglentWindow(BaseDeviceWindow):
         note = QLabel("本版提供单脉冲和已核对的双调制组合，FM/PM 偏移采用保守范围。IQ/ARB 仅回读。选件是否可用以仪器回读为准；多路组合不自动推断兼容。")
         note.setWordWrap(True)
         layout.addWidget(note)
-        self.mod_status = QLabel("调制状态：尚未回读")
+        self.mod_status = QLabel("调制状态：尚未读取；点击“读取调制状态”获取。")
         self.mod_status.setWordWrap(True)
         layout.addWidget(self.mod_status)
         return self._scroll(page)
 
     def _diagnostics_page(self):
         page, layout = page_shell("状态与诊断", "原始写命令可能改变输出；仅在扫描停止时允许。命令失败不会自动重放。选件查询未在共同手册中确认。")
+        self.runtime_info = QLabel(
+            f"软件版本：v{__version__}\n运行程序：{Path(sys.executable).resolve()}\n"
+            f"程序模块：{Path(__file__).resolve()}")
+        self.runtime_info.setWordWrap(True)
+        self.runtime_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.runtime_info)
         self.readback = QPlainTextEdit()
         self.readback.setReadOnly(True)
         layout.addWidget(self.readback)
         self._button(layout, "读取扫描 / 调制详细参数", lambda: self._run(
             self.driver.configuration_snapshot,
-            callback=lambda result: self.readback.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))))
+            callback=lambda result: self.readback.setPlainText(json.dumps(result, ensure_ascii=False, indent=2)),
+            read_modulation=True))
         self.command = self._bind("diagnostics.command", QLineEdit("*IDN?"))
         layout.addWidget(self.command)
         self._button(layout, "执行单条 SCPI", self.send_raw)
@@ -223,6 +367,7 @@ class SiglentWindow(BaseDeviceWindow):
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(300)
         layout.addWidget(self.log)
+        self._button(layout, "保存诊断报告", self.save_diagnostics)
         return page
 
     def _values(self, prefix):
@@ -246,36 +391,76 @@ class SiglentWindow(BaseDeviceWindow):
         point = point or SsgPoint(1e9, -20)
         row = self.table.rowCount()
         self.table.insertRow(row)
-        for column, value in enumerate((point.frequency_hz, point.power_dbm, point.dwell_s)):
-            self.table.setItem(row, column, QTableWidgetItem(f"{value:.12g}"))
+        power = from_base(point.power_dbm, "rf_power", self._list_power_unit_active)
+        for column, value in enumerate((point.frequency_hz, power, point.dwell_s)):
+            item = QTableWidgetItem(f"{value:.12g}")
+            if column == 1:
+                item.setData(Qt.ItemDataRole.UserRole, (item.text(), self._list_power_unit_active, point.power_dbm))
+            self.table.setItem(row, column, item)
+
+    def _list_power_dbm(self, item):
+        cached = item.data(Qt.ItemDataRole.UserRole)
+        # Formatting a new unit must not change a prepared scan's canonical dBm.
+        if cached and tuple(cached[:2]) == (item.text(), self._list_power_unit_active):
+            return cached[2]
+        return to_base(float(item.text()), "rf_power", self._list_power_unit_active)
+
+    def _change_list_power_unit(self, _index):
+        unit = self.list_power_unit.currentData()
+        old_unit = self._list_power_unit_active
+        if unit == old_unit:
+            return
+        converted = []
+        try:
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, 1)
+                dbm = self._list_power_dbm(item)
+                converted.append((item, f"{from_base(dbm, 'rf_power', unit):.12g}", dbm))
+        except (ValueError, AttributeError) as exc:
+            self.list_power_unit.blockSignals(True)
+            self.list_power_unit.setCurrentIndex(self.list_power_unit.findData(old_unit))
+            self.list_power_unit.blockSignals(False)
+            self._error(f"列表第 {row + 1} 行幅度无效，单位未切换：{exc}")
+            return
+        blocked = self.table.blockSignals(True)
+        for item, value, dbm in converted:
+            item.setText(value)
+            item.setData(Qt.ItemDataRole.UserRole, (value, unit, dbm))
+        self.table.blockSignals(blocked)
+        self._list_power_unit_active = unit
+        self.table.setHorizontalHeaderItem(1, QTableWidgetItem(f"幅度 / {unit}"))
 
     def remove_rows(self):
         for row in sorted({item.row() for item in self.table.selectedIndexes()}, reverse=True):
             self.table.removeRow(row)
 
     def _table_points(self):
-        return tuple(SsgPoint(*(float(self.table.item(row, col).text()) for col in range(3))) for row in range(self.table.rowCount()))
+        return tuple(SsgPoint(float(self.table.item(row, 0).text()),
+                              self._list_power_dbm(self.table.item(row, 1)),
+                              float(self.table.item(row, 2).text())) for row in range(self.table.rowCount()))
 
-    def apply_sweep(self):
+    def apply_sweep(self, kind=None):
         try:
-            config = self._sweep_config()
+            config = self._sweep_config(kind)
         except (ValueError, AttributeError) as exc:
             self._error(f"列表存在无效数字：{exc}")
             return
         self._run(lambda: self.driver.prepare_sweep(config))
 
-    def _sweep_config(self):
-        values = self._values("sweep")
-        return SsgSweep(**values, table=self._table_points() if values["kind"] == "LIST" else ())
+    def _sweep_config(self, kind=None):
+        kind = kind or self._selected_sweep_kind
+        values = self._values("sweep" if kind == "STEP" else "list_sweep")
+        return SsgSweep(kind=kind, **values, table=self._table_points() if kind == "LIST" else ())
 
-    def start_sweep(self):
+    def start_sweep(self, kind=None, *, single=False):
         try:
-            if self._sweep_config() != self.driver.prepared:
+            if self._sweep_config(kind) != self.driver.prepared:
                 raise ValueError("扫描参数尚未应用或已有编辑，请先应用配置")
         except (ValueError, AttributeError) as exc:
             self._error(str(exc))
             return
-        self._run(self.driver.start)
+        self._clear_scan_preview("重新布防，等待读取当前扫描值。")
+        self._run(self.driver.execute_single if single else self.driver.start)
 
     def apply_frequency(self):
         value = self.frequency.value()
@@ -287,7 +472,10 @@ class SiglentWindow(BaseDeviceWindow):
 
     def apply_modulation(self):
         config = SsgModulation(**self._values("mod"))
-        self._run(lambda: self.driver.apply_modulation(config))
+        self._run(lambda: self.driver.apply_modulation(config), read_modulation=True)
+
+    def refresh_modulation(self):
+        self._run(lambda: None, read_modulation=True)
 
     def read_list(self):
         def success(points):
@@ -301,6 +489,8 @@ class SiglentWindow(BaseDeviceWindow):
         self._run(lambda: self.driver.raw(command), callback=lambda result: self.log.appendPlainText(f"> {command}\n{result}"))
 
     def connect_device(self):
+        self.scan_preview_auto.setChecked(False)
+        self._clear_scan_preview("重新连接后需重新读取当前扫描值。")
         def operation():
             if not self.session.is_connected:
                 self.connection_manager.info(self.record)
@@ -313,6 +503,8 @@ class SiglentWindow(BaseDeviceWindow):
             self._error("请先停止扫描并确认状态，再断开连接")
             return
         self.connection_manager.disconnect(self.record)
+        self.scan_preview_auto.setChecked(False)
+        self._clear_scan_preview("已断开，当前扫描值未知。")
         self.driver.prepared = None
         self.driver.state = "unknown"
         self.driver_status.setText("● 已断开；硬件输出状态未确认")
@@ -323,16 +515,63 @@ class SiglentWindow(BaseDeviceWindow):
 
     def _poll(self):
         if self.session.is_connected and not self._busy and self.driver.state == "enabled":
-            self.refresh()
+            self._run(lambda: None, read_current_point=self.scan_preview_auto.isChecked())
+
+    def refresh_scan_preview(self):
+        if not self._busy:
+            self.scan_preview_status.setText("正在读取当前扫描频率和幅度…")
+            self._run(lambda: None, read_current_point=True)
+
+    def _clear_scan_preview(self, message):
+        self._current_scan_preview = None
+        self.scan_metrics["current"].setText("未知")
+        self.scan_metrics["current"].setToolTip("")
+        self.scan_metrics["power"].setText("未知")
+        self.scan_voltage.setText("50 Ω 正弦载波")
+        self.scan_preview_status.setText(message)
 
     def _safety(self, operation):
+        self.scan_preview_auto.setChecked(False)
+        self._clear_scan_preview("正在处理停止 / RF 关闭，之前的预览已失效。")
+        is_stop = operation == self.driver.stop
+        def work():
+            if not self.session.is_connected:
+                previous = self.driver.caps
+                self.connection_manager.info(self.record)  # Drop stale manager connection flags.
+                info = self.connection_manager.connect(self.record)
+                current = capabilities(info.identity)
+                if (not current.known or
+                        (previous.model and previous.model != current.model) or
+                        (previous.serial and previous.serial != current.serial)):
+                    self.session.disconnect()
+                    raise ValueError("重连身份不一致或型号未知，未发送停止 / RF 关闭命令；请核对仪器。")
+                self.driver.caps = current
+                self.driver.prepared = None
+            operation()  # One write attempt; never replay a trigger, arm, or configuration.
+        def finished(_result):
+            message = "扫描已停止（已回读 OFF）；RF 未改变。" if is_stop else "RF 已关闭（已回读 OFF）；扫描状态需单独确认。"
+            self.readback.setPlainText(json.dumps(
+                {":SWEep:STATe" if is_stop else ":OUTPut": "OFF"}, ensure_ascii=False, indent=2))
+            if is_stop:
+                self._clear_scan_preview("扫描已停止；重新布防后可读取当前值。")
+                self.sweep_status.setText(message)
+                self.live_status.setText("扫描：已关闭")
+                self.driver_status.setText("● 已连接 · 扫描已关闭")
+                self.rf_status.setText("扫描已停止；频率、幅度及 RF 状态请手动刷新回读。")
+            else:
+                self.rf_status.setText(message)
+                self.driver_status.setText("● 已连接 · RF 已关闭")
+            self.log.appendPlainText(message)
+            self.statusBar().showMessage(message, 20000)
+        def dispatch():
+            self._run(work, callback=finished, read_snapshot=False)
         if self._busy:
-            self._pending_safety.append(operation)
+            self._pending_safety.append(dispatch)
             self.statusBar().showMessage("停止 / RF 关闭已排队，当前通信结束后优先执行")
         else:
-            self._run(operation)
+            dispatch()
 
-    def _run(self, operation, callback=None):
+    def _run(self, operation, callback=None, *, read_modulation=False, read_current_point=False, read_snapshot=True):
         if self._busy:
             return
         try:
@@ -343,11 +582,16 @@ class SiglentWindow(BaseDeviceWindow):
         self._busy = True
         self._update_buttons()
         def work():
+            phase = "操作"
             try:
                 result = operation()
-                return result, self.driver.snapshot(), None
-            except ValueError as exc:
-                return None, None, str(exc)
+                phase = "状态读取"
+                snapshot = self.driver.snapshot(include_modulation=read_modulation,
+                                                include_current_point=read_current_point) if read_snapshot else None
+                return result, snapshot, None
+            except (ValueError, SsgCommandError) as exc:
+                # A valid instrument response does not require disconnecting USB.
+                return None, None, f"{phase}未完成：{exc}"
             except Exception as exc:
                 self.driver.state = "unknown"
                 # A timed-out response must not contaminate the next query.
@@ -355,28 +599,47 @@ class SiglentWindow(BaseDeviceWindow):
                     self.session.disconnect()
                 except Exception:
                     pass
-                raise ScpiError(str(exc)) from exc
+                raise ScpiError(f"{phase}失败：{exc}") from exc
         def finish(payload):
-            result, snapshot, validation_error = payload
-            if snapshot is not None:
-                self._show_snapshot(snapshot)
-            if validation_error:
-                self._error(validation_error)
-            elif callback:
-                callback(result)
-            elif result:
-                message = "；".join(result) if isinstance(result, tuple) else str(result)
-                self.log.appendPlainText(message)
-                self.statusBar().showMessage(message, 20000)
-            if self.driver.state == "off" or not self.driver.caps.known:
-                self.connection_manager.release_devices(self.owner)
-            self._finished()
+            try:
+                result, snapshot, validation_error = payload
+                self._show_identity()
+                if snapshot is not None:
+                    self._show_snapshot(snapshot)
+                if validation_error:
+                    if read_current_point:
+                        self.scan_preview_auto.setChecked(False)
+                        self._clear_scan_preview("当前值读取未完成，自动刷新已停止；详见状态与诊断。")
+                    self._error(validation_error)
+                elif callback:
+                    callback(result)
+                elif result:
+                    message = "；".join(result) if isinstance(result, tuple) else str(result)
+                    self.log.appendPlainText(message)
+                    self.statusBar().showMessage(message, 20000)
+            except Exception as exc:
+                # Qt callback exceptions escape the worker's try/except and the
+                # frozen entry point exits on them. Contain this operation here.
+                self.scan_preview_auto.setChecked(False)
+                self._clear_scan_preview("结果处理失败，当前值未知；自动刷新已停止。")
+                self.driver_status.setText("● 已连接 · 本次结果显示失败" if self.session.is_connected else "● 未连接 · 本次结果显示失败")
+                self.rf_status.setText("本次结果未能完整显示，RF / 幅度以仪器回读或面板为准。")
+                self._error(f"结果处理失败：{exc}\n{traceback.format_exc()}")
+            finally:
+                if not self.driver.scan_may_be_active:
+                    self.connection_manager.release_devices(self.owner)
+                self._finished()
         def failure(message):
+            self.scan_preview_auto.setChecked(False)
+            self._clear_scan_preview("通信失败，当前值未知；自动刷新已停止。")
+            self._show_identity()
             self.rf_status.setText("通信失败：RF / 扫描状态未知，请重连回读，必要时在仪器面板停止输出。")
-            self.sweep_status.setText("扫描状态未知；没有自动重试触发或启动命令。")
+            self.sweep_status.setText("扫描状态未知；没有自动重试触发或启动命令。" +
+                                      ("曾启用或尝试启用扫描，点击停止扫描会尝试重连并确认停止。" if self.driver.scan_may_be_active else
+                                       "本窗口没有扫描运行证据，可以关闭窗口或断开连接。"))
             self.live_status.setText("扫描：状态未知")
             self._error(message)
-            if not self.driver.caps.known:
+            if not self.driver.scan_may_be_active:
                 self.connection_manager.release_devices(self.owner)
             self._finished()
         self.submit(work, on_success=finish, on_error=failure)
@@ -385,34 +648,109 @@ class SiglentWindow(BaseDeviceWindow):
         self._busy = False
         self._update_buttons()
         if self._pending_safety:
-            operation = self._pending_safety.pop(0)
-            QTimer.singleShot(0, lambda: self._run(operation))
+            QTimer.singleShot(0, self._run_pending_safety)
+
+    def _run_pending_safety(self):
+        if not self._busy and self._pending_safety:
+            # Keep the queue visible to closeEvent until this callback starts.
+            self._pending_safety.pop(0)()
 
     def _error(self, message):
         self.statusBar().showMessage(message, 20000)
         self.log.appendPlainText("错误：" + message)
+        if self.parameter_repository is not None:
+            try:
+                self._write_diagnostics()
+            except OSError as exc:
+                self.log.appendPlainText(f"诊断报告保存失败：{exc}")
 
-    def _show_snapshot(self, snapshot):
+    def _write_diagnostics(self) -> Path:
+        from ..repository import default_data_dir
+        import hashlib
+
+        data_dir = self.parameter_repository.data_dir if self.parameter_repository is not None else default_data_dir()
+        folder = Path(data_dir) / "diagnostics"
+        folder.mkdir(parents=True, exist_ok=True)
+        device_key = hashlib.sha256(self.record.id.encode("utf-8")).hexdigest()[:16]
+        path = folder / f"siglent-{device_key}.json"
         c = self.driver.caps
-        self.identity_label.setText(f"{c.model}   序列号：{c.serial}   固件：{c.firmware}")
+        report = {"timestamp": datetime.now().astimezone().isoformat(), "software_version": __version__,
+                  "executable": str(Path(sys.executable).resolve()),
+                  "module_path": str(Path(__file__).resolve()),
+                  "frozen": bool(getattr(sys, "frozen", False)),
+                  "device_id": self.record.id, "resource": self.record.resource,
+                  "model": c.model, "serial": c.serial, "firmware": c.firmware,
+                  "connected": self.session.is_connected, "scan_state": self.driver.state,
+                  "scan_may_be_active": self.driver.scan_may_be_active,
+                  "modulation_command": self.driver.modulation_header,
+                  "scan_monitor": {"trigger_received": None, "trigger_backlog": None,
+                                   "current_values": self._current_scan_preview,
+                                   "auto_refresh": self.scan_preview_auto.isChecked(),
+                                   "status": self.scan_preview_status.text()},
+                  "readback": self.readback.toPlainText(), "log": self.log.toPlainText()}
+        path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def save_diagnostics(self):
+        try:
+            path = self._write_diagnostics()
+        except OSError as exc:
+            self.log.appendPlainText(f"诊断报告保存失败：{exc}")
+            self.statusBar().showMessage(f"诊断报告保存失败：{exc}", 20000)
+            return
+        self.statusBar().showMessage(f"诊断报告已保存：{path}", 20000)
+
+    def _show_identity(self):
+        c = self.driver.caps
+        if not c.model:
+            return
+        suffix = "（当前未连接，保留最近身份）" if not self.session.is_connected else ""
+        self.identity_label.setText(f"{c.model}   序列号：{c.serial}   固件：{c.firmware}{suffix}")
         self.capability_label.setText(
             f"频率范围 {c.minimum_hz:g}–{c.maximum_hz:g} Hz；FM/PM：{'已确认硬件支持' if c.fm_pm else '未确认，禁用'}；选件：未查询。功率范围随频率校验。"
             if c.known else "未知型号：仅允许查询")
+
+    def _show_snapshot(self, snapshot):
+        # Preserve raw responses before parsing, including values that cannot be
+        # rendered; the error report must contain the reply that caused failure.
+        self.readback.setPlainText(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        self._show_identity()
+        c = self.driver.caps
         if not c.known:
-            self.readback.setPlainText(json.dumps(snapshot, ensure_ascii=False, indent=2))
             return
         self.driver_status.setText("● 已连接 · " + ("扫描已启用" if self.driver.state == "enabled" else "扫描已关闭"))
         self.live_status.setText("扫描：" + ("已启用 / 等待触发或运行" if self.driver.state == "enabled" else "已关闭"))
-        self.rf_status.setText(f"实际频率：{snapshot[':FREQuency']} Hz　功率：{snapshot[':POWer']} dBm　RF：{snapshot[':OUTPut']}")
+        try:
+            dbm = float(snapshot[':POWer'])
+            millivolts = from_base(dbm, 'rf_power', 'mV')
+            millivolts_pp = from_base(dbm, 'rf_power', 'mVpp')
+        except (ValueError, OverflowError) as exc:
+            raise SsgCommandError(f"幅度回读无法显示 [:POWer?]：{snapshot[':POWer']!r}；{exc}") from exc
+        self.rf_status.setText(f"实际频率：{snapshot[':FREQuency']} Hz　幅度：{snapshot[':POWer']} dBm / "
+                               f"{millivolts:.6g} mV / {millivolts_pp:.6g} mVpp　RF：{snapshot[':OUTPut']}")
         self.sweep_status.setText(
-            f"回读扫描：{snapshot[':SWEep:STATe']}；模式：{snapshot[':SWEep:MODE']}\n"
-            f"扫描触发：{snapshot[':SWEep:SWEep:TRIGger:TYPE']}；点触发：{snapshot[':SWEep:POINt:TRIGger:TYPE']}\n"
-            f"当前点（仪器回读）：{snapshot.get(':SWEep:CURRent:DATA', '—')}\n"
-            "扫描启用时可能正在等待触发；当前点不足以判断单次完成。")
-        self.mod_status.setText("实际开关：" + "  ".join(f"{name}={snapshot.get(':'+name+':STATe', '未确认')}" for name in ("AM", "FM", "PM", "PULM")) +
-                               f"\n脉冲源={snapshot[':PULM:SOURce']}；脉冲触发={snapshot[':PULM:TRIGger:MODE']}" +
-                               f"\n调制总开关={snapshot[':OUTPut:MODulation']}；IQ={snapshot.get(':FUNCtion:DM:STATe', '不适用')}；RF Blanking={snapshot.get(':RADio:ARB:MDEStination:PULSe', '不适用')}")
-        self.readback.setPlainText(json.dumps(snapshot, ensure_ascii=False, indent=2))
+            f"仪器共用状态：{snapshot[':SWEep:STATe']} · {snapshot[':SWEep:MODE']}　"
+            f"扫描触发：{snapshot[':SWEep:SWEep:TRIGger:TYPE']}　点触发：{snapshot[':SWEep:POINt:TRIGger:TYPE']}")
+        if self.driver.state != "enabled":
+            self._clear_scan_preview("扫描未启用，当前扫描值不可用。")
+        elif ":SWEep:CURRent:FREQuency" in snapshot and ":SWEep:CURRent:LEVel" in snapshot:
+            frequency = float(snapshot[":SWEep:CURRent:FREQuency"])
+            power = float(snapshot[":SWEep:CURRent:LEVel"])
+            mv, mvpp = from_base(power, "rf_power", "mV"), from_base(power, "rf_power", "mVpp")
+            timestamp = datetime.now().astimezone()
+            scale, unit = (1e9, "GHz") if frequency >= 1e9 else (1e6, "MHz") if frequency >= 1e6 else (1e3, "kHz")
+            self.scan_metrics["current"].setText(f"{frequency / scale:.9g} {unit}")
+            self.scan_metrics["current"].setToolTip(f"{frequency:.12g} Hz")
+            self.scan_metrics["power"].setText(f"{power:.6g} dBm")
+            self.scan_voltage.setText(f"{mv:.6g} mV / {mvpp:.6g} mVpp")
+            self.scan_preview_status.setText(f"最近回读 {timestamp:%H:%M:%S}（本机时间）· 频率/幅度依次读取，可能跨点；触发计数未知。")
+            self._current_scan_preview = {"frequency_hz": frequency, "power_dbm": power,
+                                          "read_at": timestamp.isoformat()}
+        if ":OUTPut:MODulation" in snapshot:
+            stamp = datetime.now().strftime("%H:%M:%S")
+            self.mod_status.setText(f"最近调制回读（{stamp}，需手动刷新）：" + "  ".join(f"{name}={snapshot.get(':'+name+':STATe', '未确认')}" for name in ("AM", "FM", "PM", "PULM")) +
+                                   f"\n脉冲源={snapshot[':PULM:SOURce']}；脉冲触发={snapshot[':PULM:TRIGger:MODE']}" +
+                                   f"\n调制总开关={snapshot[':OUTPut:MODulation']}；IQ={snapshot.get(':FUNCtion:DM:STATe', '不适用')}；RF Blanking={snapshot.get(':RADio:ARB:MDEStination:PULSe', '不适用')}")
 
     def _update_buttons(self):
         enabled = self.session.is_connected and self.driver.caps.known and not self._busy
@@ -441,16 +779,64 @@ class SiglentWindow(BaseDeviceWindow):
         self._update_buttons()
 
     def _custom_device_parameters(self):
-        return {"list": [[self.table.item(row, col).text() if self.table.item(row, col) else "" for col in range(3)] for row in range(self.table.rowCount())]}
+        powers = []
+        for row in range(self.table.rowCount()):
+            try:
+                powers.append(self._list_power_dbm(self.table.item(row, 1)))
+            except (ValueError, AttributeError):
+                powers.append(None)  # Preserve an invalid draft without inventing a value.
+        return {"list": [[self.table.item(row, col).text() if self.table.item(row, col) else "" for col in range(3)] for row in range(self.table.rowCount())],
+                "list_power_unit": self._list_power_unit_active, "list_power_dbm": powers}
+
+    def _restore_device_parameters(self):
+        super()._restore_device_parameters()
+        if self.parameter_repository is None:
+            return
+        try:
+            saved = self.parameter_repository.load(self.record.id, kind=self.record.kind.value)
+        except Exception:
+            return  # Base restoration already reports malformed configuration.
+        controls = saved.get("controls", {})
+        if not isinstance(controls, dict) or any(k.startswith("named/ssg.list_sweep.") for k in controls):
+            return
+        # <= 0.7.8 used common trigger controls for STEP and LIST. Copy those
+        # saved values into both editors once; future edits stay independent.
+        for key, control in self.controls.items():
+            if key.startswith("list_sweep."):
+                state = controls.get("named/ssg.sweep." + key.split(".", 1)[1])
+                if isinstance(state, dict):
+                    self._restore_parameter_control(control, state)
+
+    def _restore_parameter_control(self, control, state):
+        # Versions <=0.7.1 stored RF/STEP dBm editors as plain double controls.
+        if isinstance(control, UnitValueWidget) and control.family == "rf_power" and state.get("type") == "double":
+            control.set_unit("dBm")
+            control.setValue(float(state.get("value", control.value())))
+            return
+        super()._restore_parameter_control(control, state)
 
     def _restore_custom_device_parameters(self, state):
         rows = state.get("list")
         if not isinstance(rows, list) or len(rows) > 500 or any(not isinstance(row, list) or len(row) != 3 for row in rows):
             return
+        unit = state.get("list_power_unit", "dBm")
+        if unit not in ("dBm", "mV", "mVpp"):
+            return
+        self.list_power_unit.setCurrentIndex(self.list_power_unit.findData(unit))
         self.table.setRowCount(len(rows))
+        powers = state.get("list_power_dbm", [])
         for row, values in enumerate(rows):
             for col, value in enumerate(values):
                 self.table.setItem(row, col, QTableWidgetItem(str(value)))
+            if isinstance(powers, list) and row < len(powers) and powers[row] is not None:
+                try:
+                    dbm = to_base(float(powers[row]), "rf_power", "dBm")
+                    actual = to_base(float(values[1]), "rf_power", unit)
+                    if math.isclose(dbm, actual, rel_tol=1e-10, abs_tol=1e-9):
+                        item = self.table.item(row, 1)
+                        item.setData(Qt.ItemDataRole.UserRole, (item.text(), unit, dbm))
+                except (ValueError, TypeError):
+                    pass  # A changed or invalid cell must be interpreted from its visible text.
 
     def closeEvent(self, event):
         if self._busy or self._call_tasks or self._pending_safety or self.connection_manager.lease_owner(self.record.id) == self.owner:

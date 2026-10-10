@@ -10,8 +10,13 @@ import re
 import time
 
 from .scpi import ScpiError, ScpiSession
+from ..units import to_base
 
 VIRTUAL_SSG_RESOURCE = "SIM::SIGLENT::SSG6082A-V"
+
+
+class SsgCommandError(ScpiError):
+    """The instrument answered, but rejected a command or its readback."""
 
 
 @dataclass(frozen=True)
@@ -146,9 +151,15 @@ def _enum_value(value: str) -> str:
                "LIN": "LINEAR", "LOG": "LOGARITHMIC", "POS": "POSITIVE",
                "NEG": "NEGATIVE", "INT": "INTERNAL", "EXT": "EXTERNAL",
                "SQU": "SQUARE", "SQUA": "SQUARE", "NORM": "NORMAL",
-               "INV": "INVERTED", "EGAT": "EGATE"}
+               "INV": "INVERTED", "EGAT": "EGATE", "DOUB": "DOUBLE"}
     return ",".join(aliases.get(part.strip().upper(), part.strip().upper())
                     for part in value.split(","))
+
+
+def _power_close(actual: float, expected: float) -> bool:
+    # SSG amplitude setting resolution is 0.01 dB. Voltage conversions commonly
+    # have more digits; accept one setting step, not the RF accuracy specification.
+    return math.isclose(actual, expected, rel_tol=0, abs_tol=0.01 + 1e-9)
 
 
 class SiglentSsgDriver:
@@ -157,6 +168,9 @@ class SiglentSsgDriver:
         self.caps = capabilities("")
         self.prepared: SsgSweep | None = None
         self.state = "unknown"
+        # A failed status query is not evidence that this window started a scan.
+        # Keep this evidence across disconnects until OFF is actually read back.
+        self.scan_may_be_active = False
 
     def identify(self) -> SsgCapabilities:
         self.caps = capabilities(self.session.query("*IDN?"))
@@ -167,23 +181,49 @@ class SiglentSsgDriver:
         if not self.caps.known:
             raise ValueError("未识别的型号仅允许查询；请先连接并读取身份")
 
+    @property
+    def modulation_header(self) -> str:
+        # C01A 3.4.7.1 uses MODulation in both the primary syntax and example.
+        # A user's SSG3021X timed out on the documented OUTPut alias.
+        return ":MODulation" if self.caps.model in ("SSG3021X", "SSG3032X") else ":OUTPut:MODulation"
+
     def _idle(self):
         self._known()
-        if self.session.query(":SWEep:STATe?").upper() != "OFF":
-            self.state = "enabled"
+        if self.read_sweep_state().upper() != "OFF":
             raise ValueError("扫描已启用，请先停止扫描再修改配置")
-        self.state = "off"
 
-    def _errors(self):
+    def read_sweep_state(self) -> str:
+        try:
+            actual = self.session.query(":SWEep:STATe?")
+            value = _enum_value(actual)
+            if value not in ("OFF", "FREQUENCY", "LEVEL", "LEV_FREQ"):
+                raise SsgCommandError(f"无法解析扫描状态 [:SWEep:STATe?]：{actual!r}")
+        except Exception:
+            self.state = "unknown"
+            raise
+        self.state = "off" if value == "OFF" else "enabled"
+        self.scan_may_be_active = value != "OFF"
+        return actual
+
+    def _errors(self, *, command: str | None = None):
         value = int(self.session.query("*ESR?"))
         if value & 0x3C:
-            raise ScpiError(f"仪器报告 SCPI 错误（ESR={value}）；配置可能部分生效，请回读检查。")
+            reasons = "、".join(label for bit, label in ((32, "命令错误"), (16, "执行错误"),
+                                                     (8, "设备错误"), (4, "查询错误")) if value & bit)
+            if command is None:
+                raise SsgCommandError(f"下发前检测到历史 SCPI 错误（ESR={value}：{reasons}）；"
+                                      "本批命令尚未发送。*ESR? 已读取并清除事件值，请核对后重新应用。")
+            raise SsgCommandError(f"下发命令 [{command}] 后仪器报告 SCPI 错误（ESR={value}：{reasons}）；"
+                                  "已停止后续下发，部分配置可能生效，请回读检查。")
 
     def _batch(self, commands: list[str]):
         # ESR is documented in all three guides; SYST:ERR? and *OPT? are not.
         self._errors()
-        self.session.write_many(commands, recover=False)
-        self._errors()
+        for command in commands:
+            if command.upper().startswith(":SWEEP:STATE ") and command.split()[-1].upper() != "OFF":
+                self.scan_may_be_active = True
+            self.session.write(command, recover=False)
+            self._errors(command=command)
 
     def validate_point(self, point: SsgPoint):
         self._known()
@@ -201,7 +241,8 @@ class SiglentSsgDriver:
             self._batch([f":FREQuency {frequency:.12g}"])
             self._verify(":FREQuency", frequency)
 
-    def set_power(self, power: float):
+    def set_power(self, power: float, unit: str = "dBm"):
+        power = to_base(power, "rf_power", unit)
         with self.session.transaction():
             self._idle()
             self.validate_point(SsgPoint(float(self.session.query(":FREQuency?")), power))
@@ -223,13 +264,16 @@ class SiglentSsgDriver:
         if isinstance(expected, (int, float)):
             try:
                 value = float(actual) if actual.upper() not in ("ON", "OFF") else int(_on(actual))
-                match = math.isclose(value, expected, rel_tol=1e-9, abs_tol=1e-9)
+                if command.upper() in (":POWER", ":SWEEP:STEP:START:LEVEL", ":SWEEP:STEP:STOP:LEVEL"):
+                    match = _power_close(value, expected)
+                else:
+                    match = math.isclose(value, expected, rel_tol=1e-9, abs_tol=1e-9)
             except ValueError as exc:
-                raise ScpiError(f"无法解析回读 {command}：{actual!r}") from exc
+                raise SsgCommandError(f"无法解析回读 {command}：{actual!r}") from exc
         else:
             match = _enum_value(actual) == _enum_value(expected)
         if not match:
-            raise ScpiError(f"回读不一致 {command}：请求 {expected}，实际 {actual}；请检查选件/参数限制")
+            raise SsgCommandError(f"回读不一致 {command}：请求 {expected}，实际 {actual}；请检查选件/参数限制")
 
     def validate_sweep(self, c: SsgSweep):
         self._known()
@@ -301,9 +345,10 @@ class SiglentSsgDriver:
                 self._verify(":SWEep:LIST:CPOint", len(c.table))
                 actual = self.read_list()
                 if len(actual) != len(c.table) or any(
-                    not math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
-                    for p, q in zip(actual, c.table)
-                    for a, b in zip((p.frequency_hz, p.power_dbm, p.dwell_s), (q.frequency_hz, q.power_dbm, q.dwell_s))):
+                    not (math.isclose(p.frequency_hz, q.frequency_hz, rel_tol=1e-9, abs_tol=1e-9)
+                         and _power_close(p.power_dbm, q.power_dbm)
+                         and math.isclose(p.dwell_s, q.dwell_s, rel_tol=1e-9, abs_tol=1e-9))
+                    for p, q in zip(actual, c.table)):
                     raise ScpiError("扫描列表回读与请求不一致")
             for command, value in settings:
                 self._verify(command, value)
@@ -342,7 +387,7 @@ class SiglentSsgDriver:
     def execute_single(self):
         with self.session.transaction():
             self._known()
-            if self.session.query(":SWEep:STATe?").upper() == "OFF":
+            if self.read_sweep_state().upper() == "OFF":
                 raise ValueError("请先启用扫描")
             if not self.session.query(":SWEep:MODE?").upper().startswith("SING"):
                 raise ValueError("仅单次扫描模式可执行单次")
@@ -353,8 +398,11 @@ class SiglentSsgDriver:
             self._known()
             self.state = "unknown"
             self.session.write(":SWEep:STATe OFF", recover=False)
-            self._verify(":SWEep:STATe", "OFF")
+            actual = self.read_sweep_state()
+            if _enum_value(actual) != "OFF":
+                raise SsgCommandError(f"停止未确认 [:SWEep:STATe?]：实际 {actual}；扫描仍启用")
             self.state = "off"
+            self.scan_may_be_active = False
 
     def bus_trigger(self):
         self._known()
@@ -374,7 +422,7 @@ class SiglentSsgDriver:
                 raise ValueError("脉冲 BUS 需要内部脉冲源")
             if self.session.query(":PULM:TRIGger:MODE?").upper() != "BUS":
                 raise ValueError("仪器脉冲触发尚未设为 BUS，请先应用配置并确认回读")
-            if not _on(self.session.query(":PULM:STATe?")) or not _on(self.session.query(":OUTPut:MODulation?")):
+            if not _on(self.session.query(":PULM:STATe?")) or not _on(self.session.query(self.modulation_header + "?")):
                 raise ValueError("请先启用脉冲调制及调制总开关")
             self.bus_trigger()
 
@@ -388,36 +436,55 @@ class SiglentSsgDriver:
                 ":SWEep:STEP:STARt:LEVel", ":SWEep:STEP:STOP:LEVel",
                 ":SWEep:STEP:DWELl", ":SWEep:STEP:POINts", ":SWEep:STEP:SHAPe", ":SWEep:STEP:SPACe",
                 ":PULM:SOURce", ":PULM:TRIGger:MODE", ":PULM:MODE",
-                ":PULM:PERiod", ":PULM:WIDTh", ":PULM:DELay",
-                ":PULM:TRIGger:EXTernal:SLOPe", ":PULM:TRIGger:EXTernal:GATE:POLarity",
+                ":PULM:OUT:STATe", ":PULM:TRIGger:STATe",
             ]
             for name in ("AM", "FM", "PM") if self.caps.fm_pm else ("AM",):
                 prefix = "FM1" if name == "FM" and self.caps.vector else name
                 keys += [f":{name}:SOURce", f":{prefix}:WAVEform", f":{prefix}:FREQuency",
                          f":{prefix}:DEPTh" if name == "AM" else f":{prefix}:DEViation"]
-            return {key: self.session.query(key + "?") for key in keys}
+            result = {key: self.session.query(key + "?") for key in keys}
+            if _enum_value(result[":PULM:SOURce"]) == "INTERNAL":
+                if _enum_value(result[":PULM:MODE"]) in ("SINGLE", "DOUBLE"):
+                    for key in (":PULM:PERiod", ":PULM:WIDTh"):
+                        result[key] = self.session.query(key + "?")
+                trigger = _enum_value(result[":PULM:TRIGger:MODE"])
+                extra = (":PULM:DELay", ":PULM:TRIGger:EXTernal:SLOPe") if trigger == "EXTERNAL" else (
+                    (":PULM:TRIGger:EXTernal:GATE:POLarity",) if trigger == "EGATE" else ())
+                for key in extra:
+                    result[key] = self.session.query(key + "?")
+            return result
 
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, include_modulation: bool = True, include_current_point: bool = False) -> dict[str, str]:
+        """Read RF/sweep state; modulation reads can be explicitly requested."""
         with self.session.transaction():
             if not self.caps.known:
                 return {"identity": self.session.query("*IDN?"), "state": "只读：未知型号"}
-            keys = [":FREQuency", ":POWer", ":OUTPut", ":OUTPut:MODulation", ":SWEep:STATe",
-                    ":SWEep:MODE", ":SWEep:SWEep:TRIGger:TYPE", ":SWEep:POINt:TRIGger:TYPE",
-                    ":AM:STATe", ":PULM:STATe", ":PULM:OUT:STATe", ":PULM:TRIGger:STATe",
-                    ":PULM:SOURce", ":PULM:TRIGger:MODE"]
-            if self.caps.fm_pm:
-                keys += [":FM:STATe", ":PM:STATe"]
-            if self.caps.vector:
-                keys += [":FUNCtion:DM:STATe", ":RADio:ARB:MDEStination:PULSe"]
-            try:
-                result = {key: self.session.query(key + "?") for key in keys}
-                self.state = "off" if result[":SWEep:STATe"].upper() == "OFF" else "enabled"
-                if self.state == "enabled":
-                    result[":SWEep:CURRent:DATA"] = self.session.query(":SWEep:CURRent:DATA?")
-                return result
-            except Exception:
-                self.state = "unknown"
-                raise
+            result = {":SWEep:STATe": self.read_sweep_state()}
+            keys = [":FREQuency", ":POWer", ":OUTPut",
+                    ":SWEep:MODE", ":SWEep:SWEep:TRIGger:TYPE", ":SWEep:POINt:TRIGger:TYPE"]
+            result.update({key: self.session.query(key + "?") for key in keys})
+            if self.state == "enabled" and include_current_point:
+                # C01A 3.4.5.29/30: independent numeric queries avoid the
+                # combined DATA? query that fails on the user's SSG3021X.
+                for key in (":SWEep:CURRent:FREQuency", ":SWEep:CURRent:LEVel"):
+                    reply = self.session.query(key + "?")
+                    try:
+                        value = float(reply)
+                        if not math.isfinite(value) or (key.endswith("FREQuency") and value <= 0):
+                            raise ValueError("非有限数值或无效频率")
+                    except ValueError as exc:
+                        raise SsgCommandError(f"当前扫描值无法解析 [{key}?]：{reply!r}") from exc
+                    result[key] = reply
+            if include_modulation:
+                # Retain the normalized result key for existing API consumers.
+                result[":OUTPut:MODulation"] = self.session.query(self.modulation_header + "?")
+                keys = [":AM:STATe", ":PULM:STATe", ":PULM:SOURce", ":PULM:TRIGger:MODE"]
+                if self.caps.fm_pm:
+                    keys += [":FM:STATe", ":PM:STATe"]
+                if self.caps.vector:
+                    keys += [":FUNCtion:DM:STATe", ":RADio:ARB:MDEStination:PULSe"]
+                result.update({key: self.session.query(key + "?") for key in keys})
+            return result
 
     def apply_modulation(self, c: SsgModulation) -> tuple[str, ...]:
         self._known()
@@ -483,30 +550,35 @@ class SiglentSsgDriver:
                              (f":{prefix}:WAVEform", getattr(c, name.lower() + "_wave")),
                              (f":{prefix}:FREQuency", getattr(c, name.lower() + "_rate")),
                              (f":{prefix}:DEPTh" if name == "AM" else f":{prefix}:DEViation",
-                              c.am_depth if name == "AM" else c.fm_deviation if name == "FM" else c.pm_deviation)]
+                              c.am_depth / 100 if name == "AM" else c.fm_deviation if name == "FM" else c.pm_deviation)]
             if c.pulse:
-                settings.append((":PULM:SOURce", c.pulse_source))
                 if c.pulse_source == "INTERNAL":
                     trigger = "SINGLE" if c.pulse_trigger == "KEY" and self.caps.vector else c.pulse_trigger
+                    # PERIOD? is defined only for single/double pulse, not PTRain.
+                    self._batch([":PULM:SOURce INTERNAL", ":PULM:MODE SINGLE"])
+                    self._verify(":PULM:SOURce", "INTERNAL")
+                    self._verify(":PULM:MODE", "SINGLE")
                     # Shrink width before shortening period; grow period before increasing width.
                     current_period = float(self.session.query(":PULM:PERiod?"))
                     timing = [(":PULM:PERiod", c.pulse_period), (":PULM:WIDTh", c.pulse_width)]
                     if c.pulse_period < current_period:
                         timing.reverse()
-                    settings += [(":PULM:MODE", "SINGLE"), *timing, (":PULM:TRIGger:MODE", trigger)]
+                    settings += [*timing, (":PULM:TRIGger:MODE", trigger)]
                     if c.pulse_trigger == "EXT":
                         settings += [(":PULM:DELay", c.pulse_delay),
                                      (":PULM:TRIGger:EXTernal:SLOPe", c.pulse_slope)]
                     elif c.pulse_trigger == "EGATE":
                         settings.append((":PULM:TRIGger:EXTernal:GATE:POLarity", c.gate_polarity))
+                else:
+                    settings.append((":PULM:SOURce", c.pulse_source))
             self._batch([f"{key} {value}" for key, value in settings])
             for key, value in settings:
                 self._verify(key, value)
             self._batch([f":{name}:STATe ON" for name, enabled in states.items() if enabled] +
-                        [f":OUTPut:MODulation {int(c.master)}"])
+                        [f"{self.modulation_header} {int(c.master)}"])
             for name, enabled in states.items():
                 self._verify(f":{name}:STATe", int(enabled))
-            self._verify(":OUTPut:MODulation", int(c.master))
+            self._verify(self.modulation_header, int(c.master))
         return tuple(warnings)
 
     def raw(self, command: str) -> str:
@@ -519,6 +591,8 @@ class SiglentSsgDriver:
             self._idle()
             self.prepared = None
             self.state = "unknown"
+            # A raw write can enable a scan; only a subsequent OFF query releases it.
+            self.scan_may_be_active = True
             self.session.write(command, recover=False)
             return "已发送；扫描配置需重新应用，状态以回读为准"
 
@@ -534,7 +608,8 @@ def sweep_points(c: SsgSweep) -> tuple[SsgPoint, ...]:
 
 
 def _key(command: str) -> str:
-    return ":".join(part[:4] for part in command.upper().lstrip(":").split(":"))
+    key = ":".join(part[:4] for part in command.upper().lstrip(":").split(":"))
+    return "OUTP:MODU" if key in ("MODU", "MODU:STAT", "OUTP:MODU:STAT") else key
 
 
 class VirtualSsgBackend:
@@ -569,7 +644,7 @@ class VirtualSsgBackend:
         for name in ("AM", "FM", "FM1", "PM"):
             defaults.update({name + ":SOURce": "INTERNAL", name + ":WAVEform": "SINE",
                              name + ":FREQuency": "1000", name + ":DEViation": "0.1" if name == "PM" else "1000"})
-        defaults["AM:DEPTh"] = "30"
+        defaults["AM:DEPTh"] = "0.3"
         self.values.update({_key(k): v for k, v in defaults.items()})
         self.table = [SsgPoint(1e9, -20)]
         self.phase = "off"
@@ -655,6 +730,10 @@ class VirtualSsgBackend:
         if key == _key("SWEep:CURRent:DATA"):
             dwell = self.path[self.index].dwell_s if self.path and self.index >= 0 else 0
             return f"{self.index + 1},{{{self.get('FREQuency')},{self.get('POWer')},{dwell}}}"
+        if key == _key("SWEep:CURRent:FREQuency"):
+            return self.get("FREQuency")
+        if key == _key("SWEep:CURRent:LEVel"):
+            return self.get("POWer")
         if key in self.values:
             return self.values[key]
         raise ValueError(f"虚拟仪器不支持查询 {command}")

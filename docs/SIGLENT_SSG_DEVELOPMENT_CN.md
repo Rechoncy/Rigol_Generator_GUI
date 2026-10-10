@@ -1,8 +1,8 @@
 # 鼎阳 SIGLENT SSG 开发说明与变更记录
 
-更新日期：2026-09-21
+更新日期：2026-09-28
 
-对应源码：0.7.0（包含此前开发的 SSG 扩展及便携发行支持）
+对应源码：0.7.10（全局输入滚轮保护；保留 STEP/LIST 页面与查询等待修复）
 
 用户操作见[详细使用说明](SIGLENT_SSG_CN.md)，全项目历史见[开发日志](DEVELOPMENT_LOG_CN.md)。
 
@@ -23,7 +23,7 @@
 | [connections.py](../src/rigol_control/connections.py) | 共享连接、虚拟后端缓存和设备租约 |
 | [scpi.py](../src/rigol_control/drivers/scpi.py) | VISA 会话、可重入锁、`transaction()` |
 | [siglent_ssg.py](../src/rigol_control/drivers/siglent_ssg.py) | 能力、参数模型、命令、校验、状态与虚拟后端 |
-| [siglent_window.py](../src/rigol_control/ui/siglent_window.py) | 四页窗口、后台提交、实际状态、参数持久化 |
+| [siglent_window.py](../src/rigol_control/ui/siglent_window.py) | 五页窗口、后台提交、实际状态、参数持久化 |
 | [dialogs.py](../src/rigol_control/ui/dialogs.py) | 设备类型与 USB/LAN 输入 |
 | [device_windows.py](../src/rigol_control/ui/device_windows.py) | 窗口工厂与通用参数保存基类 |
 | [main_window.py](../src/rigol_control/ui/main_window.py) | 首页及六台虚拟设备入口 |
@@ -43,6 +43,12 @@
 | `SsgPoint` | frequency_hz、power_dbm、dwell_s | Hz、dBm、秒 |
 | `SsgSweep` | kind、target、起止值、points、dwell_s、shape、spacing、direction、mode、两级 trigger、slope、table | LIST 的 table 为点的 tuple |
 | `SsgModulation` | master；AM/FM/PM 开关、源、波形、速率、深度/偏移；脉冲源、触发、周期、宽度、延时、沿、门极性 | AM 深度为百分比；FM 偏移 Hz；PM 偏移 rad；脉冲时间秒 |
+
+`units.py` 新增 `rf_power` 非线性单位族，基准为 dBm，电压按 50 Ω 正弦载波换算。`RfPowerWidget` 缓存基准 dBm，单位切换只改变显示，避免 STEP 准备状态因舍入而失效。LIST 对未编辑单元格通过 UserRole 保留基准，单位切换先校验全部幅度再更新；任何非法行不部分换算。
+
+`set_power(value, unit="dBm")` 在通信前转换单位，随后复用原型号限值。`SsgPoint.power_dbm`、`SsgSweep.start_dbm/stop_dbm` 仍是 dBm，仪器列表也保持 dBm。新快照记录单位，旧 `double` 参数迁移为 dBm 编辑器，旧 custom 列表未记录单位时默认 dBm。
+
+`_power_close()` 按 0.01 dB 设置分辨率比较幅度回读，容差为一个步长加 1e-9 浮点余量；仅作用于固定幅度、STEP 幅度端点及 LIST 幅度列。100 mV 换算后有多位小数，量化为 −6.99 dBm 不应误报失败。频率/驻留仍使用原容差，RF 输出准确度不作为读回容差，超过一个步长仍失败。
 
 `SsgSweep` 默认 STEP、FREQUENCY、1.0–1.1 GHz、11 点、30 ms、连续、扫描 AUTO、点 EXT。`SsgModulation` 默认所有开关关闭；恢复的编辑值不代表实机状态。
 
@@ -69,7 +75,7 @@
 | --- | --- |
 | `identify()` | `*IDN?` |
 | `set_frequency(hz)` | `:FREQuency`，校验当前功率 |
-| `set_power(dbm)` | `:POWer`，校验当前频率 |
+| `set_power(value, unit="dBm")` | mV/mVpp 换算为 dBm 后发 `:POWer`，校验当前频率 |
 | `set_output(enabled)` | `:OUTPut`，独立于扫描与调制 |
 | `prepare_sweep(config)` | 下表参数、完整回读，扫描须为 OFF |
 | `start()` | 重新准备，再写 `:SWEep:STATe FREQUENCY/LEVEL/LEV_FREQ` |
@@ -78,7 +84,7 @@
 | `bus_trigger()` | 单次发送全局 `*TRG`，失败不自动重发 |
 | `pulse_bus_trigger()` | 验证实际脉冲条件后调用全局触发 |
 | `apply_modulation(config)` | 参数配置、回读，再启用所选调制与 MOD |
-| `snapshot()` | 快速实际状态；扫描启用时查询当前点 |
+| `snapshot(include_modulation=True, include_current_point=False)` | RF/扫描；显式当前值开关读取频率与幅度，UI 基础任务均使用 False |
 | `configuration_snapshot()` | 较完整的扫描/调制查询 |
 | `read_list()` | 点数与分批列表查询 |
 | `raw(command)` | 单条查询或写入，不接受分号和多行 |
@@ -99,9 +105,9 @@
 | LIST 清空 | `:SWEep:LIST:INITialize:PRESet` |
 | LIST 编辑 | `:SWEep:LIST:CHANGe 1,f,p,t` 或 `:SWEep:LIST:ADDList f,p,t` |
 | LIST 点数 / 内容 | `:SWEep:LIST:CPOint?`、`:SWEep:LIST:LIST? start,end` |
-| 当前点 | `:SWEep:CURRent:DATA?` |
+| 当前扫描值 | `:SWEep:CURRent:FREQuency?` / `:SWEep:CURRent:LEVel?`；不查询 DATA 或推断点号 |
 
-表中的斜杠表示可选枚举，不是实际发送的字符串。命令使用 SCPI 基准单位。
+表中的斜杠表示可选枚举，不是实际发送的字符串。命令使用 SCPI 基准单位。AM 编辑值为百分比，`:AM:DEPTh` 下发及回读比较值为 `am_depth / 100`（0～1）。
 
 清空列表后允许返回 0 或 1 行：若保留一行，先替换第一行，再追加；若为零行，直接追加。上传后先确认行数，再每 50 行分批回读并比较全部三列。数量、解析或值不一致都不能标为准备成功。
 
@@ -137,7 +143,7 @@
 | -V + KEY | 触发模式使用 SINGLE |
 | 3000X + KEY | 触发模式使用 KEY |
 
-缩短周期时先写宽度，其他情况先写周期，避免中间状态的宽度超过周期允许值。这里的“模式相关”指写入；详细参数查询仍会读取手册规定的脉冲参数，不能把它描述为只查询当前模式字段。
+缩短周期时先写宽度，其他情况先写周期，避免中间状态的宽度超过周期允许值。详细查询也按实际脉冲源、类型和触发模式选择内部周期/宽度、EXT 延时/沿、EGATE 极性；从 PTRain 改为单脉冲前先确认内部源和 SINGLE，再查周期。
 
 ### 6.3 为什么增加 SSG3021X 脉冲 BUS
 
@@ -148,10 +154,10 @@
 1. 关闭 PULM，并回读确认。
 2. 设置内部脉冲源、时序和 `:PULM:TRIGger:MODE BUS`。
 3. 检查 ESR，并逐项核对参数；BUS 未被接受时结束，不回退 AUTO。
-4. 全部参数验证后，才启用所选调制与 `:OUTPut:MODulation`。
+4. 全部参数验证后，才启用所选调制与 `modulation_header`（普通 3000X 为 `:MODulation`，其他已接入型号保留 `:OUTPut:MODulation`）。
 5. 应用过程不发送 `*TRG`，不打开 RF。
 
-触发按钮在同一会话事务内重新查询 `:PULM:SOURce?`、`:PULM:TRIGger:MODE?`、`:PULM:STATe?`、`:OUTPut:MODulation?`，确认内部源、BUS、PULM=1、MOD=1 后，只发送一次 `*TRG`。这样可检测应用后在面板上更改的模式。
+触发按钮在同一会话事务内重新查询 `:PULM:SOURce?`、`:PULM:TRIGger:MODE?`、`:PULM:STATe?`、`modulation_header + "?"`，确认内部源、BUS、PULM=1、MOD=1 后，只发送一次 `*TRG`。普通 3000X 使用 `:MODulation?`；这样可检测应用后在面板上更改的模式。
 
 `*TRG` 是全局事件，可能同时作用于 BUS 扫描或 BUS 点触发；按钮名称和使用说明明确标注这一点。驱动不要求扫描停止，也不替用户开启 RF。
 
@@ -161,7 +167,7 @@
 
 `ScpiSession.transaction()` 使用现有可重入锁，使“查询前提 → 写入 → 验证”不会被本程序其他线程的命令插入。它不能阻止仪器面板或另一个外部程序修改仪器。
 
-`_batch()` 在写入前后查询 `*ESR?`，用 `0x3C` 掩码检测相关错误，批量写入使用 `recover=False`。ESR 查询会清除已读事件；不能把之后的零值当作完整无错误历史。
+`_batch()` 在本批写入前和每条写入后查询 `*ESR?`，用 `0x3C` 掩码检测相关错误，每条写入使用 `recover=False`，首次发现错误即停止。写入前的历史错误与写入后的具体命令错误使用不同提示，明确本批是否已经发送。ESR 查询会清除已读事件；不能把之后的零值当作完整无错误历史。
 
 数值比较采用 `math.isclose(rel_tol=1e-9, abs_tol=1e-9)`；枚举先作明确缩写归一化再比较，避免前缀匹配把 LEVEL 误当成 LEV_FREQ。真实固件若量化数值导致不一致，应记录实际分辨率并据官方规格调整，不能盲目放宽容差。
 
@@ -171,13 +177,31 @@
 
 驱动状态为 `off`、`enabled`、`unknown`。`enabled` 包含等待和运行，不代表本轮仍在推进；不通过点号推断可靠的完成事件。
 
-窗口每次后台操作获取所有者 `siglent-native:<device-id>` 的租约。成功回读扫描 OFF 后释放；已知型号失联或状态未知时保留占用，避免别的任务假定设备空闲。未知型号只读分支不长期保留扫描租约。
+窗口每次后台操作获取所有者 `siglent-native:<device-id>` 的临时租约。是否保留由 `scan_may_be_active` 决定：读到扫描启用，或发送可能启动扫描的命令前设为 true；只有确认 OFF 后才清除。首次状态读取失败而未发现扫描运行证据时释放临时租约，不再因型号已识别就永久锁住窗口。源码状态 unknown 本身不等于存在运行任务。
 
-UI 的 `_run()` 串行提交工作。一般通信/回读异常将状态设为 unknown 并关闭会话，防止超时旧回复污染下一次查询；本地 ValueError 作为可解释的参数错误返回。重新连接先识别和回读，不重放上次启动/触发。
+UI 的 `_run()` 串行提交工作。`SsgCommandError` 表示收到明确的错误/不一致回复，与本地 ValueError 一起保留连接并反馈；传输异常将状态设为 unknown 并关闭会话，防止超时旧回复污染下一次查询。日志区分操作阶段与后续状态读取。重新连接先识别和回读，不重放上次启动/触发。
+
+0.7.4 在基础连接、刷新、RF 操作和扫描轮询中调用 `snapshot(include_modulation=False)`，这些路径不读取 AM/FM/PM/PULM、MOD 或 IQ/ARB。`_run(read_modulation=True)` 只用于独立调制读取、应用调制及显式详细读取。普通型号总开关的实际命令通过 `modulation_header` 选择主命令；快照仍使用规范化键 `:OUTPut:MODulation` 兼容旧 API，此键不代表线上的实际命令。诊断记录实际命令头。调制显示注明读取时间，基础刷新不会冒充再次读取调制。
+
+`_show_identity()` 在成功和失败回调中单独更新型号/序列号/固件。身份已经识别但后续查询失败时保留最近身份，并注明当前未连接。显式查询真实超时仍关闭会话；不能为了“保持连接”直接继续使用可能遗留回复的会话，也不自动尝试所有命令别名。
+
+0.7.3 的完成回调捕获显示/结果处理异常并在 `finally` 中结束忙状态和处理租约。工作线程的异常捕获不能保护 Qt 主线程回调，不能仅因后台成功就假定 UI 转换无错误。`_show_snapshot()` 先保存原始 JSON，再格式化数值；非法幅度保存命令名、原始回复及 traceback，不退出程序。真实扫描启用时仍保留租约，确认 OFF 后释放。
+
+`_run_pending_safety()` 在定时回调真正执行时才出队，避免队列已空但动作尚未开始的间隙允许窗口关闭。回调失败仍推进排队动作。冻结自检须实际点击连接按钮并模拟异常回复；仅打开窗口不能覆盖结果转换路径。交互式冻结入口同时启用 faulthandler 原生崩溃日志，保持文件句柄直到 Qt 退出。
 
 约 1500 ms 的轮询仅在扫描启用、已连接、窗口不忙时进行。扫描关闭时需手动刷新才能看见面板修改。停止/RF 关闭在忙时排队，不能中断当前 VISA 调用；窗口关闭会检查后台工作、待执行停止和租约。
 
+0.7.6 的 `_safety()` 将重连、身份校验、单次关断和对应 OFF 回读打包为排队任务；调用 `_run(read_snapshot=False)` 避免其他状态查询掩盖成功。只有用户点击关断按钮才能走此路径，不自动重试已失败的写命令。重连前 `info()` 清理连接管理器中的失效标志，随后以实际 `*IDN?` 身份比较型号/序列号；新身份验证通过后才更新能力并清空 `prepared`，保留扫描风险证据直至 OFF。未知/不匹配身份拒绝写入。
+
+`stop()` 使用 `read_sweep_state()` 确认停止，若回读仍启用则保留状态与占用并报告失败。RF OFF 不释放尚未确认结束的扫描占用。基础快照传 `include_current_point=False`；v0.7.7 的“刷新当前值预览”及用户勾选的自动刷新传 True。该兼容参数名现表示两个独立数值查询，不再返回点号。不在超时后继续同一会话读取其他回复。
+
+0.7.7 的预览状态保存于 `_current_scan_preview`，含 `frequency_hz`、`power_dbm` 和带时区的本机 `read_at`。两条查询不是原子快照。`scan_preview_auto` 默认关闭并设置 `skipDeviceParameterPersistence=True`；基础刷新不更新时间戳。失败时关闭自动刷新并清空缓存；停止、重连、断开及重新布防使缓存失效。频率必须为正有限数，幅度必须为有限数；异常保留命令和原始回复。
+
+`scan_monitor` 诊断字段中的 `trigger_received`、`trigger_backlog` 均为 null，界面为“未知”。C01A 未提供对应查询，不从采样次数、设定点表或值变化推算。`current_values` 为上述缓存或 null，另保存 `auto_refresh`、`status`；这不是硬件触发时间戳或逐点记录。
+
 ## 8. 持久化与日志边界
+
+0.7.5 在主窗口与所有基础设备窗口标题使用 `rigol_control.__version__`，移除主窗口写死的 v0.6.0 文案。SSG 诊断页、初始日志及错误 JSON 记录实际版本；JSON 增加 `executable`、`module_path`、`frozen`，从当前进程获取，不从目录名猜测版本。冻结自检校验 7 个窗口标题和错误报告的运行身份。
 
 沿用 `DeviceParameterRepository` 和设备稳定 ID，不新增独立的 SSG 配置数据库。控件以 `named/ssg.*` 语义键保存，列表通过窗口 custom 数据保存原始单元格文本。
 
@@ -205,7 +229,7 @@ UI 的 `_run()` 串行提交工作。一般通信/回读异常将状态设为 un
 
 配置归档复用原设备/参数导入导出链路。源码数据目录默认为 `%APPDATA%\RigolGeneratorControl`，便携编译版默认为 EXE 旁 `data/`，可用 `RIGOL_GUI_DATA_DIR` 隔离。
 
-诊断页只保留约 300 个文本块，没有持久化 SSG 逐点数据、完整命令审计或硬件触发时间戳。当前点的界面显示时间不能作为真实触发时间。
+诊断页保留约 300 个文本块，错误自动保存到 `data/diagnostics/siglent-*.json`，也可手动保存；包含身份、版本、资源和最近错误快照。没有持久化 SSG 逐点数据、完整命令审计或硬件触发时间戳。当前值的界面读取时间不能作为真实触发时间。
 
 ## 9. 虚拟后端及其局限
 
@@ -250,7 +274,9 @@ git diff --check
 
 ## 11. 本次开发过程
 
-以下阶段均发生于 2026-09-21，现随 0.7.0 一并发行。便携版本新增的运行/构建测试使全项目回归达到 215 项，原阶段计数仍保留。
+2026-09-26 的 0.7.1 修复 AM 比例、读取失败后的占用、模式相关查询和错误诊断，全量 226 项回归通过，依据及未确认事项见[专项核对报告](SIGLENT_SSG3021X_AUDIT_20260926_CN.md)。
+
+以下阶段均发生于 2026-09-21，随 0.7.0 一并发行。便携版本新增的运行/构建测试使当时全项目回归达到 215 项，原阶段计数仍保留。
 
 | 阶段 | 问题 / 决定 | 实现与验证 |
 | --- | --- | --- |
@@ -274,3 +300,17 @@ git diff --check
 5. 新版 PDF 若用于分发，应另行重建并逐页检查；当前 Markdown 是新增功能的完整说明。
 
 官方手册入口与型号差异统一维护在[使用说明第 14、15 节](SIGLENT_SSG_CN.md#14-其他型号差异)。
+
+
+## 查询等待与界面响应（0.7.8）
+
+`ScpiSession.is_connected` / `identity` 改读 `_status_lock` 保护的缓存，不获取通信 `_lock`。状态锁仅用于短暂发布/读取，不包含 I/O，也不反向获取通信锁。首次 IDN 成功后发布已连接，close 前发布未连接；串行自动重连保留最近发布状态，成功后更新，失败清空，避免管理器把短暂重连当作最终断开。读写及 transaction 继续串行化。
+
+过去的立即抛异常替身不能覆盖主线程等待同一通信锁的故障。新增测试在真实 session 锁内阻塞后端，检查首页同步状态、Qt 事件循环和实际停止按钮；停止排队至读取退出，再走既有恢复路径。不强杀线程或并发 close/write，底层 DLL 不返回仍是限制。
+
+
+## STEP/LIST 页面与参数迁移（0.7.9）
+
+源码 `_sweep_page(kind)` 分别创建 STEP 和 LIST 页，STEP 使用原 `sweep.*` 稳定键，LIST 使用 `list_sweep.*`，列表行/幅度单位沿用已有 custom 数据。旧配置没有任何 list_sweep 键时，将旧共用字段复制给 LIST 一次，之后独立持久化；旧 sweep.kind 不再驱动界面。切页只更新编辑模式并移动同一个底部监视 widget，不触发 SCPI、重置预览或创建额外计时器。
+
+底部使用公共 metric_card；频率和幅度分卡显示，仪器接收/积压仍未知。整个预览 widget 标记跳过持久化。apply_sweep(kind)、start_sweep(kind, single=...) 绑定各页，启动/单次必须匹配 driver.prepared，防止当前编辑页误用另一页配置。驱动与硬件状态仍共用，同一仪器只能执行一个扫描。源码、测试、开发日志先修改，再由相同内容生成 EXE 与源码包。

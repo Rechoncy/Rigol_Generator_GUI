@@ -5,3 +5,4 @@
 *.cmd text eol=crlf
 *.pdf binary
 *.chm binary
+*.dll binary

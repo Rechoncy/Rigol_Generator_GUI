@@ -18,6 +18,30 @@ class UnitConversionTests(unittest.TestCase):
         self.assertAlmostEqual(to_base(math.pi, "angle", "rad"), 180)
         self.assertAlmostEqual(convert(1500, "frequency", "Hz", "kHz"), 1.5)
 
+    def test_rf_voltage_matches_reference_values_for_50_ohm_sine(self):
+        self.assertAlmostEqual(from_base(0, "rf_power", "mV"), 223.606797749979)
+        self.assertAlmostEqual(from_base(-10, "rf_power", "mVpp"), 200)
+        self.assertAlmostEqual(to_base(20, "rf_power", "mVpp"), -30)
+        self.assertAlmostEqual(to_base(100, "rf_power", "mV"), -6.98970004336)
+
+    def test_rf_units_round_trip_at_model_power_boundaries(self):
+        for dbm in (-140, -110, -20, 0, 9, 15, 20, 30):
+            for unit in ("dBm", "mV", "mVpp"):
+                with self.subTest(dbm=dbm, unit=unit):
+                    self.assertAlmostEqual(to_base(from_base(dbm, "rf_power", unit), "rf_power", unit), dbm)
+
+    def test_invalid_rf_voltages_are_rejected(self):
+        for unit in ("mV", "mVpp"):
+            for value in (0, -1, math.nan, math.inf):
+                with self.subTest(unit=unit, value=value), self.assertRaises(ValueError):
+                    to_base(value, "rf_power", unit)
+        with self.assertRaises(ValueError):
+            from_base(math.nan, "rf_power", "mV")
+        with self.assertRaises(ValueError):
+            from_base(10000, "rf_power", "mVpp")
+        with self.assertRaises(ValueError):
+            to_base(1, "rf_power", "Vpp")
+
 
 class MultiAxisScanTests(unittest.TestCase):
     def setUp(self) -> None:

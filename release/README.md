@@ -1,6 +1,6 @@
 # Windows 便携发行版使用与构建说明
 
-适用版本：0.7.0；目标平台：Windows 10/11 x64。
+适用版本：0.7.11；目标平台：Windows 10/11 x64。
 
 发行版包含运行程序所需的 Python、Qt、PyVISA、pyserial 和 nidaqmx。目标电脑无需安装 Python、pip 或创建虚拟环境，首次启动也无需联网下载 Python 组件。内置运行时只供本软件使用，不修改系统 Python。
 
@@ -8,16 +8,18 @@
 
 | 文件 | 用法 | 适合场景 |
 |---|---|---|
-| `Lab-Control-Center-0.7.0-windows-x64-portable.zip` | 完整解压后运行目录内的 `Lab Control Center.exe` | 日常使用、实验室迁移、与文档一起保存 |
-| `Lab-Control-Center-0.7.0-windows-x64.exe` | 放在可写目录，直接双击 | 只希望分发一个程序文件 |
+| `Lab-Control-Center-0.7.11-windows-x64-portable.zip` | 完整解压后运行目录内的 `Lab Control Center.exe` | 日常使用、实验室迁移、与文档一起保存 |
+| `Lab-Control-Center-0.7.11-windows-x64.exe` | 放在可写目录，直接双击 | 只希望分发一个程序文件 |
 | `SHA256SUMS.txt` | 对照下载文件的 SHA-256 | 核对下载是否完整 |
 | `release-manifest.json` | 查看版本、构建、依赖与验证信息 | 维护、问题报告和版本追踪 |
-| `Lab-Control-Center-0.7.0-windows-x64-source.zip` | 本次构建使用的源码与文档快照 | 维护、依赖许可要求及问题复现 |
+| `Lab-Control-Center-0.7.11-windows-x64-source.zip` | 本次构建使用的源码与文档快照 | 维护、依赖许可要求及问题复现 |
 | `RELEASE-NOTES.md` | 查看本版改动和验证范围 | 升级前阅读 |
 
 项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。已上传的发行文件以 [GitHub Releases](https://github.com/Rechoncy/Rigol_Generator_GUI/releases) 中该版本的附件为准；仓库中的 `release/` 保存说明与版本记录，本地编译产物位于 `dist/release/`。
 
 仓库根目录原有的小型 `Lab Control Center.exe` 是源码启动器，仍需外部 Python/PyQt6；它与上述编译产物不同。使用免 Python 版本时，应下载发行附件或按第 7 节构建。
+
+从 0.7.5 起，主窗口和每个设备窗口标题均显示真实运行版本（例如 `v0.7.11`）。SSG 的“状态与诊断”页显示可复制的运行程序、模块路径，诊断 JSON 也保存这些信息。压缩包或文件夹的名称不能代替运行版本；升级后请核对标题。
 
 ## 2. 解压与首次启动
 
@@ -30,7 +32,7 @@
 目录包主要结构：
 
 ```text
-Lab-Control-Center-0.7.0-windows-x64-portable/
+Lab-Control-Center-0.7.11-windows-x64-portable/
 ├─ Lab Control Center.exe
 ├─ _internal/              内置 Python、Qt、Python 依赖与资源，须完整保留
 ├─ docs/                   操作和开发说明
@@ -63,7 +65,7 @@ Lab-Control-Center-0.7.0-windows-x64-portable/
 单文件版本同样支持：
 
 ```powershell
-& ".\Lab-Control-Center-0.7.0-windows-x64.exe" --data-dir "D:\LabData\ControlCenter"
+& ".\Lab-Control-Center-0.7.11-windows-x64.exe" --data-dir "D:\LabData\ControlCenter"
 ```
 
 也可为当前 PowerShell 会话设置环境变量后启动：
@@ -91,9 +93,13 @@ $env:RIGOL_GUI_DATA_DIR = "D:\LabData\ControlCenter"
 | DG4000、SIGLENT SSG、通用 SCPI | PyVISA | 支持设备的 x64 VISA 实现，例如 NI-VISA；按 USB/LAN 配置通信 |
 | NI 计数与模拟输入 | nidaqmx Python 接口 | NI-DAQmx 系统驱动及正确识别的 NI 设备 |
 | Newport SMC100CC / PR50CC | pyserial | 设备所用 USB 转串口驱动、可用 COM 端口 |
-| Vaunix LMS/BLX | Python SDK 绑定 | 兼容 Windows x64 的 `vnx_fmsynth.dll` 与设备要求的系统驱动 |
+| Vaunix LMS/BLX | Python SDK 绑定；0.7.11 本地包内置 SDK 1.15 的 Windows x64 `vnx_fmsynth.dll` | 设备要求的 Windows USB/系统驱动 |
 
-Vaunix SDK DLL 是可选材料，0.7.0 默认发行包不包含该 DLL（清单中 `vaunix_dll_bundled=false`）。自定义构建的实际携带情况以发行清单和随包文件为准。可在构建时显式指定 `--vaunix-dll`，或在运行时通过 `VAUNIX_LMS_DLL` 指向已准备好的 DLL；也可将其放在程序旁 `vendor/vaunix/vnx_fmsynth.dll` 作为外置附件携带。DLL 必须为 Windows x64，不能将 x86 DLL 混入 x64 程序。
+0.7.11 本地便携 ZIP 和单文件 EXE 已直接内置主目录提供的 Vaunix SDK DLL（清单中 `vaunix_dll_bundled=true`）。目录包的位置为 `_internal/vendor/vaunix/vnx_fmsynth.dll`；单文件 EXE 启动时将它随内置运行时解压到临时目录的 `vendor/vaunix/`。无需安装 SDK、复制外置 DLL 或设置环境变量，迁移时保留完整目录包或单文件 EXE 即可携带。
+
+构建脚本自动包含项目主目录的 `vnx_fmsynth.dll`，没有该文件的构建仍可使用虚拟 Vaunix。可用 `--vaunix-dll` 显式覆盖来源；打包前拒绝 x86、ARM64 或损坏文件。实际携带情况及 SHA-256 以 `build-info.json`、`release-manifest.json` 为准。源码快照不包含厂商二进制，重新构建时将 DLL 放回主目录或显式提供路径。
+
+运行时仍支持 `VAUNIX_LMS_DLL` 和 EXE 旁 `vendor/vaunix/vnx_fmsynth.dll` 覆盖内置版本；普通使用无需覆盖。DLL 必须为 Windows x64，不能将 x86 DLL 混入 x64 程序。
 
 设置外置 DLL 路径示例：
 
@@ -131,7 +137,9 @@ $env:VAUNIX_LMS_DLL = "D:\LabTools\Lab-Control-Center\vendor\vaunix\vnx_fmsynth.
 
 启动异常会尝试写入 EXE 旁 `logs/startup-error.log`；无法写入时尝试 `%LOCALAPPDATA%\RigolGeneratorControl\logs/startup-error.log`。反馈问题时附具体弹窗、日志和 `release-manifest.json`，无需反复安装外部 Python。
 
-可运行不接触实体设备的随包自检，报告中会记录依赖加载位置、Qt 插件、图标和六台虚拟设备窗口：
+0.7.11 交互式 EXE 同时将可捕获的原生崩溃线程栈写入 `logs/runtime-fault.log`，不可写时使用相同本机目录。SSG 回读/显示异常保存在 `data/diagnostics/siglent-*.json`。若点击连接后退出，请保留存在的这些日志；单独的启动时间不证明底层驱动已经崩溃。
+
+可运行不接触实体设备的随包自检，报告中会记录依赖加载位置、Qt 插件、图标、六台虚拟设备窗口，以及内置 Vaunix DLL 的路径、SHA-256、接口绑定和版本读取结果：
 
 ```powershell
 Start-Process -FilePath ".\Lab Control Center.exe" -ArgumentList '--bundle-self-test ".\bundle-report.json"' -Wait -WindowStyle Hidden
@@ -143,8 +151,8 @@ Get-Content ".\bundle-report.json"
 校验示例：
 
 ```powershell
-Get-FileHash ".\Lab-Control-Center-0.7.0-windows-x64-portable.zip" -Algorithm SHA256
-Get-FileHash ".\Lab-Control-Center-0.7.0-windows-x64.exe" -Algorithm SHA256
+Get-FileHash ".\Lab-Control-Center-0.7.11-windows-x64-portable.zip" -Algorithm SHA256
+Get-FileHash ".\Lab-Control-Center-0.7.11-windows-x64.exe" -Algorithm SHA256
 ```
 
 ## 7. 开发者构建
@@ -157,7 +165,7 @@ Get-FileHash ".\Lab-Control-Center-0.7.0-windows-x64.exe" -Algorithm SHA256
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1
 ```
 
-指定构建解释器或可选 Vaunix DLL：
+主目录的 `vnx_fmsynth.dll` 会自动打包到两种格式中。指定构建解释器或覆盖 Vaunix DLL 来源：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1 -Python "C:\Python313\python.exe"
@@ -172,9 +180,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1 -V
 
 ```text
 dist/release/
-├─ Lab-Control-Center-0.7.0-windows-x64-portable.zip
-├─ Lab-Control-Center-0.7.0-windows-x64.exe
-├─ Lab-Control-Center-0.7.0-windows-x64-source.zip
+├─ Lab-Control-Center-0.7.11-windows-x64-portable.zip
+├─ Lab-Control-Center-0.7.11-windows-x64.exe
+├─ Lab-Control-Center-0.7.11-windows-x64-source.zip
 ├─ RELEASE-NOTES.md
 ├─ SHA256SUMS.txt
 └─ release-manifest.json
@@ -184,10 +192,12 @@ dist/release/
 
 `.github/workflows/release.yml` 提供同一构建流程：手动运行会生成可下载的 Actions artifact；推送 `v*` 标签时，在构建和测试成功、标签与应用版本一致后发布 GitHub Release 附件。源码提交和本地构建本身不会自动创建公开发行版。发版前核对版本与变更说明，避免把未验证的构建直接上传。
 
+同一标签已经发布且所需附件齐全时，自动发布保留已上传的构建，不重复创建 Release 或覆盖已验证文件；附件不完整会报错。本仓库主目录的 Vaunix DLL 一并版本管理，远端构建也会自动包含它。
+
 打包原理参考 PyInstaller 官方的[目录与单文件运行模式](https://pyinstaller.org/en/stable/operating-mode.html)和[运行时路径说明](https://pyinstaller.org/en/stable/runtime-information.html)。
 
 当前只提供 Windows x64；没有提供 Windows x86、Linux 或 macOS 发行包。新版本需重新构建两种产物，不应以更新根目录小启动器替代发行打包。
 
 ## 8. 本版记录
 
-变更范围和已完成验证见 [0.7.0 发行说明](NOTES-0.7.0.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
+变更范围和已完成验证见 [0.7.11 发行说明](NOTES-0.7.11.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
