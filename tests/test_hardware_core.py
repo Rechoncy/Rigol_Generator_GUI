@@ -30,6 +30,8 @@ class FakeScpiBackend:
         self.queries.append(command)
         if command == "*IDN?":
             return "RIGOL TECHNOLOGIES,DG4162,TEST,00.00\n"
+        if command in {":SOUR1:FUNC?", ":SOUR2:FUNC?"}:
+            return "SIN"
         return "0"
 
     def close(self) -> None:
@@ -168,7 +170,7 @@ class ScpiDriverTests(unittest.TestCase):
         driver.configure_basic(1, BasicWaveform("SIN", 1000, 1.0))
         self.assertEqual(len(backends), 2)
         self.assertTrue(backends[0].closed)
-        self.assertEqual(backends[1].queries, ["*IDN?"])
+        self.assertEqual(backends[1].queries, ["*IDN?", ":COUP:STAT?"])
         self.assertEqual(backends[1].writes[0], ":SOUR1:FUNC SIN")
 
         raw_backends = []
@@ -199,7 +201,7 @@ class ScpiDriverTests(unittest.TestCase):
             [
                 ":SOUR1:FUNC SIN",
                 ":SOUR1:FREQ 1000",
-                ":SOUR1:VOLT 2.5",
+                ":SOUR1:VOLT 2.5VPP",
                 ":SOUR1:VOLT:OFFS 0.1",
                 ":SOUR1:PHAS 45",
             ],
@@ -212,8 +214,8 @@ class ScpiDriverTests(unittest.TestCase):
             )
         )
         driver.write(":DISP:BRIG 80")  # Any manual command remains reachable.
-        self.assertEqual(backend.writes[6:8], [":SOUR1:FREQ 2000", ":SOUR1:VOLT 1.5"])
-        self.assertEqual(backend.writes[8], ":DISP:BRIG 80")
+        self.assertEqual(backend.writes[6], ":SOUR1:FREQ 2000;:SOUR1:VOLT 1.5VPP")
+        self.assertEqual(backend.writes[7], ":DISP:BRIG 80")
         driver.disconnect()
         self.assertTrue(backend.closed)
 

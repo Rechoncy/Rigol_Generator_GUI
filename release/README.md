@@ -1,6 +1,6 @@
 # Windows 便携发行版使用与构建说明
 
-适用版本：0.7.11；目标平台：Windows 10/11 x64。
+适用版本：0.7.15；目标平台：Windows 10/11 x64。
 
 发行版包含运行程序所需的 Python、Qt、PyVISA、pyserial 和 nidaqmx。目标电脑无需安装 Python、pip 或创建虚拟环境，首次启动也无需联网下载 Python 组件。内置运行时只供本软件使用，不修改系统 Python。
 
@@ -8,18 +8,18 @@
 
 | 文件 | 用法 | 适合场景 |
 |---|---|---|
-| `Lab-Control-Center-0.7.11-windows-x64-portable.zip` | 完整解压后运行目录内的 `Lab Control Center.exe` | 日常使用、实验室迁移、与文档一起保存 |
-| `Lab-Control-Center-0.7.11-windows-x64.exe` | 放在可写目录，直接双击 | 只希望分发一个程序文件 |
+| `Lab-Control-Center-0.7.15-windows-x64-portable.zip` | 完整解压后运行目录内的 `Lab Control Center.exe` | 日常使用、实验室迁移、与文档一起保存 |
+| `Lab-Control-Center-0.7.15-windows-x64.exe` | 放在可写目录，直接双击 | 只希望分发一个程序文件 |
 | `SHA256SUMS.txt` | 对照下载文件的 SHA-256 | 核对下载是否完整 |
 | `release-manifest.json` | 查看版本、构建、依赖与验证信息 | 维护、问题报告和版本追踪 |
-| `Lab-Control-Center-0.7.11-windows-x64-source.zip` | 本次构建使用的源码与文档快照 | 维护、依赖许可要求及问题复现 |
+| `Lab-Control-Center-0.7.15-windows-x64-source.zip` | 本次构建使用的源码与文档快照 | 维护、依赖许可要求及问题复现 |
 | `RELEASE-NOTES.md` | 查看本版改动和验证范围 | 升级前阅读 |
 
-项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。已上传的发行文件以 [GitHub Releases](https://github.com/Rechoncy/Rigol_Generator_GUI/releases) 中该版本的附件为准；仓库中的 `release/` 保存说明与版本记录，本地编译产物位于 `dist/release/`。
+项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。0.7.15 本轮仅在本地构建，尚未上传 GitHub Release，目标目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以本版 `release-manifest.json` 为准。此前已发布版本可从 [GitHub Releases](https://github.com/Rechoncy/Rigol_Generator_GUI/releases) 下载。
 
 仓库根目录原有的小型 `Lab Control Center.exe` 是源码启动器，仍需外部 Python/PyQt6；它与上述编译产物不同。使用免 Python 版本时，应下载发行附件或按第 7 节构建。
 
-从 0.7.5 起，主窗口和每个设备窗口标题均显示真实运行版本（例如 `v0.7.11`）。SSG 的“状态与诊断”页显示可复制的运行程序、模块路径，诊断 JSON 也保存这些信息。压缩包或文件夹的名称不能代替运行版本；升级后请核对标题。
+从 0.7.5 起，主窗口和每个设备窗口标题均显示真实运行版本（例如 `v0.7.15`）。SSG 的“状态与诊断”页显示可复制的运行程序、模块路径，诊断 JSON 也保存这些信息。压缩包或文件夹的名称不能代替运行版本；升级后请核对标题。
 
 ## 2. 解压与首次启动
 
@@ -32,7 +32,7 @@
 目录包主要结构：
 
 ```text
-Lab-Control-Center-0.7.11-windows-x64-portable/
+Lab-Control-Center-0.7.15-windows-x64-portable/
 ├─ Lab Control Center.exe
 ├─ _internal/              内置 Python、Qt、Python 依赖与资源，须完整保留
 ├─ docs/                   操作和开发说明
@@ -65,7 +65,7 @@ Lab-Control-Center-0.7.11-windows-x64-portable/
 单文件版本同样支持：
 
 ```powershell
-& ".\Lab-Control-Center-0.7.11-windows-x64.exe" --data-dir "D:\LabData\ControlCenter"
+& ".\Lab-Control-Center-0.7.15-windows-x64.exe" --data-dir "D:\LabData\ControlCenter"
 ```
 
 也可为当前 PowerShell 会话设置环境变量后启动：
@@ -83,6 +83,12 @@ $env:RIGOL_GUI_DATA_DIR = "D:\LabData\ControlCenter"
 
 **升级：** 将新版解压到新目录，保留旧版和原数据备份；退出旧版后复制 `data/` 或导入配置，再核对设备地址。不要用空目录覆盖旧数据，也不要让两个程序实例同时写同一个数据目录。数据格式与稳定设备 ID 沿用原有版本，软件版本升级不要求删除配置。
 
+0.7.15 的 DG/Vaunix NI 步进与跨设备任务会等待后台启动、监视、写入及 NI 清理结束，才解除设备占用。出现“等待停止”或“重试停止”时保留当前窗口，等正在执行的通信返回后重试；不能在这种状态下换程序、重启任务或把关闭窗口视为停止成功。已经送入 VISA 的操作无法强制撤回，停止任务也不会自动关闭信号输出。
+
+旧设备列表如果以 DG4000、SSG 或通用 SCPI 不同类型保存了同一个 VISA 地址，0.7.15 仍可读取，但这些记录只能选一个连接，新保存也会拒绝跨类型的重复地址。先停止任务并断开，再保留合适的一条记录；不要通过另一条记录绕过“正在占用”。正在连接/断开时同资源也暂不可启动任务。设备设置窗口因任务尚未结束而拒绝关闭时，首页编辑或删除会停止操作并保留记录；通用 SCPI 原始命令仍在后台执行时也适用。SSG 窗口自身的首次连接/必要停止恢复仍可用，该权限不能由首页或别名记录借用来重连运行扫描。
+
+0.7.15 保留原配置与任务格式。更新后，可编辑点表显示的小数位数可能比旧版多，这是为了保留原始浮点数值；JSON 中原有点值不因这次更新而改写成近似值。DG 手动操作自动恢复连接时若报告型号/序列号变化，请核对资源和仪器身份，通过重新读取身份或断开后重连确认当前设备，再重新应用配置或布防；软件不会继续向变化后的设备发送旧设置。
+
 ## 4. 实机驱动与 Python 依赖的区别
 
 内置 Python 包负责调用接口；Windows 的硬件驱动仍由对应厂商提供。便携包不会自动下载或安装系统驱动。
@@ -93,9 +99,9 @@ $env:RIGOL_GUI_DATA_DIR = "D:\LabData\ControlCenter"
 | DG4000、SIGLENT SSG、通用 SCPI | PyVISA | 支持设备的 x64 VISA 实现，例如 NI-VISA；按 USB/LAN 配置通信 |
 | NI 计数与模拟输入 | nidaqmx Python 接口 | NI-DAQmx 系统驱动及正确识别的 NI 设备 |
 | Newport SMC100CC / PR50CC | pyserial | 设备所用 USB 转串口驱动、可用 COM 端口 |
-| Vaunix LMS/BLX | Python SDK 绑定；0.7.11 本地包内置 SDK 1.15 的 Windows x64 `vnx_fmsynth.dll` | 设备要求的 Windows USB/系统驱动 |
+| Vaunix LMS/BLX | Python SDK 绑定；0.7.15 本地包内置 SDK 1.15 的 Windows x64 `vnx_fmsynth.dll` | 设备要求的 Windows USB/系统驱动 |
 
-0.7.11 本地便携 ZIP 和单文件 EXE 已直接内置主目录提供的 Vaunix SDK DLL（清单中 `vaunix_dll_bundled=true`）。目录包的位置为 `_internal/vendor/vaunix/vnx_fmsynth.dll`；单文件 EXE 启动时将它随内置运行时解压到临时目录的 `vendor/vaunix/`。无需安装 SDK、复制外置 DLL 或设置环境变量，迁移时保留完整目录包或单文件 EXE 即可携带。
+0.7.15 构建脚本将主目录提供的 Vaunix SDK DLL 内置到便携 ZIP 和单文件 EXE，构建后须在清单中确认 `vaunix_dll_bundled=true`。目录包的位置为 `_internal/vendor/vaunix/vnx_fmsynth.dll`；单文件 EXE 启动时将它随内置运行时解压到临时目录的 `vendor/vaunix/`。清单确认携带后，无需安装 SDK、复制外置 DLL 或设置环境变量，迁移时保留完整目录包或单文件 EXE 即可携带。
 
 构建脚本自动包含项目主目录的 `vnx_fmsynth.dll`，没有该文件的构建仍可使用虚拟 Vaunix。可用 `--vaunix-dll` 显式覆盖来源；打包前拒绝 x86、ARM64 或损坏文件。实际携带情况及 SHA-256 以 `build-info.json`、`release-manifest.json` 为准。源码快照不包含厂商二进制，重新构建时将 DLL 放回主目录或显式提供路径。
 
@@ -137,7 +143,7 @@ $env:VAUNIX_LMS_DLL = "D:\LabTools\Lab-Control-Center\vendor\vaunix\vnx_fmsynth.
 
 启动异常会尝试写入 EXE 旁 `logs/startup-error.log`；无法写入时尝试 `%LOCALAPPDATA%\RigolGeneratorControl\logs/startup-error.log`。反馈问题时附具体弹窗、日志和 `release-manifest.json`，无需反复安装外部 Python。
 
-0.7.11 交互式 EXE 同时将可捕获的原生崩溃线程栈写入 `logs/runtime-fault.log`，不可写时使用相同本机目录。SSG 回读/显示异常保存在 `data/diagnostics/siglent-*.json`。若点击连接后退出，请保留存在的这些日志；单独的启动时间不证明底层驱动已经崩溃。
+0.7.15 交互式 EXE 同时将可捕获的原生崩溃线程栈写入 `logs/runtime-fault.log`，不可写时使用相同本机目录。SSG 回读/显示异常保存在 `data/diagnostics/siglent-*.json`。若点击连接后退出，请保留存在的这些日志；单独的启动时间不证明底层驱动已经崩溃。
 
 可运行不接触实体设备的随包自检，报告中会记录依赖加载位置、Qt 插件、图标、六台虚拟设备窗口，以及内置 Vaunix DLL 的路径、SHA-256、接口绑定和版本读取结果：
 
@@ -151,8 +157,8 @@ Get-Content ".\bundle-report.json"
 校验示例：
 
 ```powershell
-Get-FileHash ".\Lab-Control-Center-0.7.11-windows-x64-portable.zip" -Algorithm SHA256
-Get-FileHash ".\Lab-Control-Center-0.7.11-windows-x64.exe" -Algorithm SHA256
+Get-FileHash ".\Lab-Control-Center-0.7.15-windows-x64-portable.zip" -Algorithm SHA256
+Get-FileHash ".\Lab-Control-Center-0.7.15-windows-x64.exe" -Algorithm SHA256
 ```
 
 ## 7. 开发者构建
@@ -180,9 +186,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1 -V
 
 ```text
 dist/release/
-├─ Lab-Control-Center-0.7.11-windows-x64-portable.zip
-├─ Lab-Control-Center-0.7.11-windows-x64.exe
-├─ Lab-Control-Center-0.7.11-windows-x64-source.zip
+├─ Lab-Control-Center-0.7.15-windows-x64-portable.zip
+├─ Lab-Control-Center-0.7.15-windows-x64.exe
+├─ Lab-Control-Center-0.7.15-windows-x64-source.zip
 ├─ RELEASE-NOTES.md
 ├─ SHA256SUMS.txt
 └─ release-manifest.json
@@ -200,4 +206,6 @@ dist/release/
 
 ## 8. 本版记录
 
-变更范围和已完成验证见 [0.7.11 发行说明](NOTES-0.7.11.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
+变更范围和已完成验证见 [0.7.15 发行说明](NOTES-0.7.15.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
+
+本版已完成源码完整自动回归 404 项（55.931 秒）及源码自检。冻结包构建与运行检查尚待完成，后续实际结果由本版 `release-manifest.json` 记录；未实机验收。

@@ -4,6 +4,15 @@ from dataclasses import dataclass
 import math
 
 
+def roundtrip_number(value: float) -> str:
+    """Keep distinct float values distinct in editable tables and commands."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("数值必须是有限数值")
+    result = repr(number)
+    return result[:-2] if result.endswith(".0") else result
+
+
 @dataclass(frozen=True, slots=True)
 class UnitSpec:
     key: str

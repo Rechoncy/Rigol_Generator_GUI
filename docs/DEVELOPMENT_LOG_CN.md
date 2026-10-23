@@ -2,9 +2,9 @@
 
 文档版本：1.3
 
-对应软件版本：0.7.11（便携 ZIP 和单文件 EXE 内置 Vaunix DLL；阶段记录见第 12 节）
+对应软件版本：0.7.15（DG 单位/波形范围、数值精度、身份恢复与 Vaunix 整批校验；阶段记录见第 12 节）
 
-最后更新：2026-10-10
+最后更新：2026-10-23
 适用仓库：`Rigol_Generator_GUI`
 
 ## 1. 文档目的
@@ -74,9 +74,9 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 |---|---|---|
 | `src/rigol_control/app.py` | CLI、Qt 应用创建、字体和主题启动 | 新增命令行参数时补 smoke test |
 | `src/rigol_control/models.py` | 设备类型和不可变设备记录 | 字段变化需考虑旧 JSON 兼容 |
-| `src/rigol_control/repository.py` | `devices.json` 与 `device_parameters.json` 读写、唯一性和原子替换 | 格式不兼容时提升 schema version 并提供迁移 |
+| `src/rigol_control/repository.py` | `devices.json` 与 `device_parameters.json` 读写、唯一性和原子替换 | 新保存跨 SCPI 类型同资源拒绝；旧列表仍可读，保留 schema |
 | `src/rigol_control/config_archive.py` | 完整配置包校验、备份、恢复日志与原子替换 | 不迁移采集数据；保留稳定 ID，导入不得启动输出或运动 |
-| `src/rigol_control/connections.py` | VISA 会话共享、NI 逻辑连接、设备租约、虚拟/实机工厂 | 新任务先获取租约；SSG 扫描确认 OFF 后释放，已知型号失联/状态未知保留占用 |
+| `src/rigol_control/connections.py` | 共享连接、同资源别名租约、连接/断开保留、虚拟/实机工厂 | 活动占用阻止断开/close_all；连接过渡阻止新任务；SSG 继续遵循其状态证据 |
 | `src/rigol_control/services.py` | VISA/NI 资源发现与设备探测 | 未安装厂商驱动时必须返回可解释状态 |
 | `src/rigol_control/drivers/scpi.py` | 单 VISA 会话串行化、查询和批量写入 | 不允许多个线程绕过会话锁直接访问同一资源 |
 | `src/rigol_control/drivers/dg4000.py` | DG4000 类型化命令、负载、步进参数命令映射 | 新命令需同时覆盖格式校验和 fake backend 测试 |
@@ -85,16 +85,17 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 | `src/rigol_control/drivers/newport_smc100.py` | SMC100 串口协议、控制器/旋转台身份、状态与运动 | 型号与完整 ID 分离；运动命令不重试，连接不归零或移动 |
 | `src/rigol_control/drivers/ni_counter.py` | NI-DAQmx 累计边沿计数 | PFI、计数器和边沿必须来自真实设备能力 |
 | `src/rigol_control/drivers/ni_analog.py` | NI 多通道连续采样和数据块模型 | 保持一个任务内通道同步和样本形状一致 |
-| `src/rigol_control/units.py` | UI 显示单位与 SCPI 基准单位换算 | 内部值始终使用 Hz、V、度、秒等基准单位 |
+| `src/rigol_control/units.py` | 单位换算、可编辑点表及 DG 命令的浮点往返格式 | 内部使用 Hz、V、度、秒等基准单位；不以固定有效位数合并不同浮点值 |
 | `src/rigol_control/sequence.py` | 首触发 P0 和永久循环索引 | 首点语义属于核心契约，不可改成启动即下发 |
 | `src/rigol_control/scan.py` | 扫描轴、同步/笛卡尔联合点生成与校验 | 控制最大联合点数，避免 UI/内存失控 |
-| `src/rigol_control/trigger.py` | 单 DG 累计触发监视与有序写入 | 不添加人为最小触发间隔或静默丢弃 |
-| `src/rigol_control/linkage.py` | 跨设备点分组、严格顺序屏障、CSV 运行日志 | 完成计数必须在本点全部设备成功后增加 |
+| `src/rigol_control/trigger.py` | DG/Vaunix 累计触发监视与有序写入 | 不添加人为最小触发间隔或静默丢弃；快照具有创建次序 |
+| `src/rigol_control/controller_lifecycle.py` | 启动取消、线程退出、NI 清理与停止重试 | is_quiescent 同时检查启动/工作线程/计数器；停止超时不得释放租约 |
+| `src/rigol_control/linkage.py` | 跨设备点分组、严格顺序屏障、CSV 运行日志 | 先保留设备结果再写日志；日志失败不抹去已完成下发；partial_stopped 不增完成数 |
 | `src/rigol_control/rotation_scan.py` | Newport 循环点表、运动/稳定屏障、触发异常停止与可选 AI | 启动保持 P0，首触发 P1；忙时触发和跳增不得补跑 |
 | `src/rigol_control/step_tasks.py` | 单机步进任务持久化 | 结构变化需做 schema 兼容 |
 | `src/rigol_control/linkage_tasks.py` | 跨设备任务持久化 | 设备引用使用稳定 device ID，不用显示名 |
 | `src/rigol_control/analog.py` | 连续文本写入、有限内存缓存、采集控制器 | 磁盘完整流和绘图缓存必须保持解耦 |
-| `src/rigol_control/virtual_lab.py` | 两台虚拟 DG、Vaunix、Newport、NI 触发与四路模拟输入 | 新硬件功能优先增加虚拟等价路径和状态快照 |
+| `src/rigol_control/virtual_lab.py` | 两台虚拟 DG、Vaunix、Newport、NI 触发与四路模拟输入 | 缓存连接/身份使用短锁，避免与管理器锁反向等待；新硬件功能增加虚拟等价路径 |
 | `src/rigol_control/ui/main_window.py` | 多设备首页、连接/断开、窗口管理 | 不在卡片组件内创建第二份连接会话 |
 | `src/rigol_control/ui/dialogs.py` | 添加/编辑设备和资源下拉发现 | 保留手工输入作为驱动缺失时的后备路径 |
 | `src/rigol_control/ui/device_windows.py` | DG/NI 单设备页面和任务入口 | 文件较大，新增逻辑优先抽到模型/控制器后再接 UI |
@@ -122,7 +123,9 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 2. `DeviceConnectionManager.connect()` 按设备类型选择 PyVISA、Vaunix DLL、Newport 串口、NI 探测或虚拟实验室。
 3. SCPI 会话以 device ID 缓存，首页和设置窗口通过同一 manager 获取同一会话。
 4. 关闭设置窗口不自动断开设备；显式断开或应用退出才释放会话。
-5. 设备被任务租约占用时禁止断开或被另一个任务复用。
+5. 设备被任务租约占用时禁止断开或被另一个任务复用；DG/SSG/通用 SCPI 同一规范化地址共用占用身份，别名不能绕过。
+6. connect/disconnect 通过资源过渡保留覆盖慢 I/O，期间禁止同资源新连接、手动访问或任务获取。close_all 先拒绝活动占用/过渡，再整体清理，防止检查后资源被复用。
+7. 首页编辑/删除只有在原设置窗口同意 close 后才继续；拒绝关闭时保留窗口、记录和任务跟踪。
 
 ### 5.2 DG4000 / Vaunix 单设备触发步进
 
@@ -140,7 +143,7 @@ writer thread 在 applied_count < received_count 时逐个补发
 
 ### 5.3 跨设备联动
 
-每个扫描目标使用 `设备 ID + 通道 + 参数` 唯一标识。联合点先按设备分组，再按设备首次出现在扫描轴中的顺序串行下发。每台设备内部使用一个受锁 SCPI 批次；只有本联合点的所有设备成功后才增加 `applied_count`。部分失败会写入日志并停止任务，不把该点误记为完成。
+每个扫描目标使用 `设备 ID + 通道 + 参数` 唯一标识。联合点先按设备分组，再按设备首次出现在扫描轴中的顺序串行下发。每台设备内部使用一个受锁 SCPI 批次；只有本联合点的所有设备成功后才增加 `applied_count`。先提交实际 device_results/完成数，再写 CSV；日志失败停止后续点，保留本点真实结果及原设备错误，不能让磁盘失败把已经执行的点变成未执行。
 
 当前 `STRICT_SERIAL` 模式重视确定性和可追踪性，不宣称电气同步。运行日志记录触发号、点号、开始/结束 UTC、总耗时、跨设备完成偏差、每设备结果和错误。
 
@@ -160,7 +163,7 @@ writer thread 在 applied_count < received_count 时逐个补发
 3. 连接时重新枚举并按序列号匹配，初始化后读取频率/功率范围、快速脉冲、Chirp、BLX 能力和 SDK 版本。
 4. 普通控制经类型化方法下发；频率从 Hz 编码为 10 Hz 无符号单位。绝对功率先校验为 0.5 dB 网格，再按 DLL 的 0.25 dB 编码转换为有符号整数。
 5. NI 联动复用 `TriggerStepController` 的累计计数、首触发 P0 和有序积压契约；在 Vaunix 驱动内把频率轴映射为 `SetFrequencyEx`，功率轴映射为绝对 `SetPowerLevel`。
-6. 启动时原子租用 Vaunix 与 NI；停止、错误和关闭窗口释放。设备端 BLX 序列与软件 NI 逐点联动不得同时运行。
+6. 启动时原子租用 Vaunix 与 NI；启动、工作线程和 NI 清理确认结束后才释放。停止超时/清理失败保留原控制器及租约，重试停止完成清理。设备端 BLX 序列与软件 NI 逐点联动不得同时运行。
 
 ### 5.6 Newport 旋转扫描与可选采集
 
@@ -214,7 +217,7 @@ writer thread 在 applied_count < received_count 时逐个补发
 
 ### ADR-007：设备资源使用显式租约
 
-状态：已采纳。单设备触发、跨设备任务、NI 独立计数和 NI 模拟采集不能静默争抢同一资源。启动应原子获取所需设备，任何停止/异常路径都要释放。
+状态：已采纳。单设备触发、跨设备任务、NI 独立计数和 NI 模拟采集不能静默争抢同一资源。启动应原子获取所需设备，停止/异常路径只有在后台操作和资源清理确认结束后才释放。DG/Vaunix 步进与跨设备任务使用 is_quiescent 检查启动、监视、写入及 NI 清理；超时或关闭失败保留控制器与租约，允许重试，不能只按 ERROR/STOPPED 文字释放。
 
 ### ADR-008：模拟输入端口采用复选下拉框
 
@@ -240,9 +243,11 @@ writer thread 在 applied_count < received_count 时逐个补发
 
 状态：已采纳。连接后读取频率/功率范围、快速脉冲和 Chirp 能力；BLX 序列能力只由 BLX 系列身份启用。UI 首次显示宽范围编辑器，连接后收紧量程并禁用不支持按钮，驱动层继续做最终校验。虚拟设备选择全功能 BLX-403，用于覆盖所有页面，而非冒充任意实机型号。
 
-### ADR-014：DG4000 频率总上限由 `*IDN?` 型号决定
+### ADR-014：DG4000 频率上限由型号与已知波形决定
 
 状态：已采纳，自 2026-08-15 起生效。未连接状态使用全系列最高 200 MHz，确保 DG4202 保存值和预配置不会被原先固定的 160 MHz 截断；连接后从身份字符串提取型号并套用 DG4062=60 MHz、DG4102=100 MHz、DG4162=160 MHz、DG4202=200 MHz。同一能力对象同时约束 CH1/CH2 基本频率、FSK 跳跃频率、原生扫频起止值、单机触发点和跨设备联合点。UI 范围用于即时反馈，驱动层校验是最终类型化命令边界；原始 SCPI 控制台仍不解析命令，以保留型号/固件特有功能。未知型号暂用家族最高值并在界面说明，不能冒充已经识别。
+
+0.7.15 在上述型号总上限基础上，按官方表增加 SIN/SQU/RAMP/PULS/USER 各波形上限，周期频率下限为 1 μHz；不将 NOIS 带宽当作 FREQ 设置范围。基本波检查明确选择的波形；触发任务每次布防在一次耦合查询后读取两个通道的 FUNC?，写入器按快照校验输出频率，无逐点查询。外部修改波形或耦合后必须停止并重新核对/布防。完整表格与来源见[专项说明](DG4000_TRIGGER_AUDIT_CN.md#82-型号波形与布防快照)。
 
 ### ADR-015：Newport 保持首点，机械忙时触发明确停止
 
@@ -272,6 +277,14 @@ Windows 发布使用 PyInstaller，提供目录 ZIP 与单文件 EXE，内置固
 
 编译版默认 `data/` 位于实际启动的 EXE 同目录，而不是 PyInstaller 临时资源目录或当前工作目录。优先级为 `--data-dir`、`RIGOL_GUI_DATA_DIR`、默认目录；源码默认继续使用 AppData。不会自动合并旧 AppData 数据，迁移通过现有配置导入导出或关闭程序后复制数据完成，避免意外覆盖实验配置。
 
+### ADR-022：占用按资源身份保护，连接过渡也占用资源
+
+DG、SSG、通用 SCPI 的同一规范化地址共享资源键，记录 ID/显示名称/类型不构成绕过租约的隔离。旧配置可读但相同资源记录不能同时连接；新保存直接拒绝跨类型重复。连接/断开保留覆盖 I/O 执行窗口，获取任务与手动操作检查此状态；close_all 不强制关闭仍有活动租约或过渡的资源。该身份规则不自动合并同一仪器不同物理接口的地址。
+
+### ADR-023：设备执行结果先于日志持久化
+
+主机设备调用已返回这一事实不会因 CSV 写入失败而撤销。Linkage 先提交 device_results；全成功才增加 applied_count，再尝试写日志。日志失败停止后续点、报告落盘失败并保留原设备错误，不能重放本点。CSV 在失败点可能缺行，界面执行状态与持久化成功是两个不同事实。
+
 ## 7. DG4000 命令约定
 
 ### 7.1 DG4000 SCPI
@@ -280,15 +293,15 @@ Windows 发布使用 PyInstaller，提供目录 ZIP 与单文件 EXE，内置固
 |---|---|---|
 | 函数 | `:SOUR<n>:FUNC <func>` | SIN/SQU/RAMP/PULS/NOIS/USER |
 | 频率 | `:SOUR<n>:FREQ <Hz>` | 内部基准单位为 Hz |
-| 幅度 | `:SOUR<n>:VOLT <Vpp>` | 内部基准单位为 Vpp |
+| 幅度 | `:SOUR<n>:VOLT <Vpp>VPP` | 明确携带单位，不依赖当前 VRMS/dBm 显示单位 |
 | 偏置 | `:SOUR<n>:VOLT:OFFS <V>` | 核对幅度与偏置组合限制 |
-| 相位 | `:SOUR<n>:PHAS <deg>` | 内部基准单位为度 |
+| 相位 | `:SOUR<n>:PHAS <deg>` | 0–360°，含端点 |
 | 输出 | `:OUTP<n> ON/OFF` | 上电前进行安全检查 |
 | 负载 | `:OUTP<n>:LOAD <1..10000\|INFINITY>` | 0.5.4 起独立显式下发，默认 50 Ω |
-| PSK 相位 | `:SOUR<n>:MOD:PSK:PHAS <deg>` | 开始步进前先正确配置 PSK |
+| PSK 相位 | `:SOUR<n>:MOD:PSK:PHAS <deg>` | 0–360°；开始步进前先正确配置 PSK |
 | FSK 跳频 | `:SOUR<n>:MOD:FSK:FREQ <Hz>` | 开始步进前先正确配置 FSK |
 
-所有数值先由 `units.py` 转为基准单位。类型化 API 只覆盖高频操作；原始 `write()` 和 `query()` 必须保持可用，以覆盖编程手册中型号/固件特有的全部命令。
+所有数值先由 `units.py` 转为基准单位。DG 类型化数值使用浮点往返格式；基本幅度、幅度步进和 ASK 均显式携带 VPP，原始 SCPI 仍按原文发送。类型化 API 只覆盖高频操作；原始 `write()` 和 `query()` 必须保持可用，以覆盖编程手册中型号/固件特有的全部命令。
 
 ### 7.2 Vaunix Windows SDK 约定
 
@@ -304,6 +317,10 @@ Windows 发布使用 PyInstaller，提供目录 ZIP 与单文件 EXE，内置固
 | 状态与保存 | `GetDeviceStatus` / `SaveSettings` | 保存写设备非易失存储，需用户确认 |
 
 SDK 返回状态必须统一经过 `_check_set_status()`；读取型函数不能把合法的负功率值误判为错误。功率换算保留 `dBm / 0.25 dB` 的 API 编码，但 `_power_units()` 必须先拒绝非 0.5 dB 网格，不能把可编码值误认为硬件可实现值。版本号按 `0xMMmm` 打包，SDK 1.15 表示为 `0x010F`，显示时必须解码为 `1.15`。
+
+Vaunix 任务 prepare_trigger 绑定连接代次；真实及虚拟路径采用相同整点校验，空点、CH2 或非法参数在任一设置前拒绝。触发点 setter 使用 retry_transient=False；StartSweep(True)、非 STOP 的 StartSequence 与 SaveSettings 也禁止自动重试，普通幂等 setter/读取和 STOP 保留原有短暂 USB 重试。SDK 串行锁继续覆盖设备操作，is_connected/身份等缓存由短 status 锁读取，避免主线程为缓存状态等待长期 SDK I/O。
+
+0.7.15 将射频输出、扫频和完整序列的输入校验扩展到首次 SDK 设置之前：所有频率/功率编码、时间、序列索引及量化后的方向/步长先通过检查。真实与虚拟实现一致，输入错误不得留下前半批设置；通信失败仍可能发生在部分设置已接受之后，不承诺回滚。
 
 ## 8. 持久化和输出文件
 
@@ -369,7 +386,7 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 | 便携发行 | 冻结路径、数据目录优先级、权限错误、厂商 DLL 定位、打包文件选择 | `test_runtime.py`、`test_release_build.py` |
 | 编译产物自检 | 依赖来自包内、Qt 插件/图标、六台虚拟设备和窗口、普通 GUI 启动 | `tools/frozen_entry.py`、`tools/build_release.py` |
 
-最近一轮功能回归：2026-09-21 在正式构建环境 CPython 3.13.15 中全项目 **215 项通过**（23.021 s），包括新增 12 项便携运行路径测试和 2 项构建测试。历史记录中的 180/194/201 为对应阶段的测试数；目录包、单文件 EXE 及 ZIP 二次解压的实际运行验收均通过，尚无 SSG 实机验收。
+当前回归重点为 0.7.15 的浮点往返精度、DG VPP/相位/波形范围和身份恢复、Vaunix 整批预检、虚拟会话锁次序及线程池拒绝派发。历史 .12/.13/.14 的结果保留在第 12 节，不作为本版全量或冻结产物检查结果。验证范围与实际结果见[本版发行说明](../release/NOTES-0.7.15.md)，未进行本版实机验收。
 
 关键回归契约：
 
@@ -382,8 +399,13 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 - DG/Vaunix 快速触发形成积压且最终按序追平。
 - Newport 启动保持 P0，首触发移至 P1，末点下一触发回跳；指定起点未就位时不能启动 NI/AI 或隐式移动，忙时触发、计数跳增和超时必须停止。
 - Newport 连接接受现场 SMC_CC 版本和带 PN/UD 的 PR50CC 标识；连接/状态刷新不发送运动命令，错误型号继续拒绝。
-- 跨设备部分失败不增加完成计数。
-- 同一资源不能被两个运行任务占用。
+- 跨设备部分失败或途中停止不增加完成计数；严格顺序停止不再下发后续设备，CSV 区分 partial_error / partial_stopped。
+- 停止超时或 NI 清理失败时保留控制器与租约；启动、监视、写入、NI 清理全部结束前禁止重启/关闭，重试停止可恢复。
+- DG 连接代次变化使旧任务写入器失效，重新布防后才允许下发；UI 迟到快照不能覆盖新错误或倒退累计计数。
+- 同一资源不能被两个运行任务占用，也不能通过 DG/SSG/通用 SCPI 不同记录绕过；连接/断开过渡期间拒绝获取。
+- 启动仍在排队时停止只登记取消，CallTask 完成后再清理；旧 controller/task 回调不能释放新任务占用。
+- Vaunix 触发点及非幂等 SDK 动作失败不重放，真实/虚拟 writer 在重连后均失效；普通设置/STOP 保留既有重试。
+- CSV 写入失败停止后续点，但保留已执行点、部分结果与原设备错误；首页编辑/删除尊重窗口拒绝关闭。
 - 多通道采集文件每行列数一致，样本序号无间断。
 - 绘图缓存丢弃旧点时连续文本仍完整增长。
 - CH1/CH2 负载控件默认 50 Ω；应用波形不得改变已经单独设置的负载。
@@ -421,6 +443,59 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 实体输出测试必须由实验负责人确认幅度、偏置、负载、端接方式、PFI 电平、接地和被测电路耐压。自动测试不能替代这些电气检查。
 
 ## 12. 版本开发日志
+
+### GitHub 同步与持续自动检查 — 2026-10-23
+
+- 同步 0.7.12 至 0.7.15 的源码、测试、使用说明和开发记录；本地 0.7.15 完整回归为 406 项通过，便携目录、单文件 EXE 与 ZIP 解压后验收通过，未实机验证。
+- 新增 `.github/workflows/ci.yml`，主分支推送、PR 和手动运行均在 Windows x64 / 官方 Python 3.13 下安装锁定依赖，执行完整回归和源码虚拟设备自检。测试失败仍执行自检并上传日志，取消已被新提交替代的旧检查。
+- 普通 CI 不运行完整 PyInstaller 构建；现有标签发布流程继续独立构建和验收两种便携格式。新增自动检查说明，后续只对可复现的问题和有依据的优化提交修复，保留硬件未验收边界。
+
+### 0.7.15：数值精度、DG 参数语义与整批输入校验 — 2026-10-23
+
+- 修复 DG、跨设备和 Vaunix 可编辑点表固定 12 位有效数字造成的精度丢失；共享 roundtrip_number 使用最短浮点往返格式，DG finite_number 同步用于 SCPI 序列化。`100000000.000001` 与 `100000000.000002` Hz 两点在表格及 DG 命令中保持不同；JSON 原格式不变，不承诺任意精度。Vaunix 仍采用 10 Hz 频率编码和 0.5 dB 实际功率网格。
+- 对照原 CHM 的 VOLT/ASK 单位说明，基本波、幅度触发和 ASK 命令均显式附加 VPP；不通过逐点切换单位补救。输出相位和 PSK 相位统一拒绝 0–360° 之外的值，不隐式折返。
+- 根据官方四型号波形表校验 SIN/SQU/RAMP/PULS/USER 频率与 1 μHz 最小值；各型号范围见用户手册及专项说明。噪声带宽不作为 FREQ 上限，未知型号不保证完整规格校验。每次 prepare_trigger 在 NI 计数开始前查询一次耦合，CH1/CH2 各读取一次 FUNC? 并保存波形快照；每点按该快照校验，仍零逐点查询、一次 write 且不提前下发 P0。面板或其他应用改变波形后须重新布防。
+- DG 手动自动恢复连接时核对型号与序列号，变化则拒绝继续发送旧配置。用户核对后可重新读取身份或断开重连确认新身份；显式 OFF 免耦合查询，但不绕过身份错配。任务写入器仍须在连接重建后重新布防。
+- Vaunix 输出、扫频与完整序列将全部输入、时间及 SDK 编码/量化校验移到首次设置之前，真实/虚拟一致。无效输入零写入；通信故障仍可能部分执行，不把预检视为设备事务回滚。
+- VirtualScpiSession 缓存连接/身份使用独立短锁，消除手动会话与 manager.info 反向取锁导致的冻结。QThreadPool 拒绝派发启动/停止时正确恢复状态；不自动重发，停止未派发成功保留当前任务及占用供重试。
+- 完整源码自动回归 406 项通过（55.936 秒），源码自检通过。DG 自检新增 one_coupling_query_per_run、waveforms_read_once_per_channel、amplitude_vpp_explicit、microhertz_points_preserved 均为 true，DG/Vaunix/SSG 恢复检查通过。编译产物的独立运行结果以本版 release-manifest.json 为准；未连接实体仪器，也未新增实机时序结论。
+- 文档同步至 0.7.15 本地构建，未发布 GitHub Release。保留 .12/.13/.14 历史结果和 0.7.12 本机模拟基准。
+- 最终复核补齐 FUNC? 的 PULSE/NOISE/HARMONIC/CUSTOM 及手册内置任意波返回名称；共享驱动保留原连接身份，直接步进和重新布防同样拒绝身份错配，新增两项回归。
+
+### 0.7.14：资源别名、启动交接及 Vaunix/日志边界补查 — 2026-10-23
+
+- 修正 DG/Vaunix 启动 CallTask 仍排队或回调尚未完成时点击停止的交接：只 request_stop 并保留 pending cancel，等指定 start task finished 后才提交 stop。启动/停止/错误回调绑定 controller/task 身份，迟到旧回调不能清除新控制器或释放新租约。
+- Vaunix 手动 submit 在提交与后台执行时双 guard，并在设备 transaction 内执行；运行任务不接受手动命令插入。真实设备缓存状态改用短 status 锁，manager.info 不再为读取缓存而等待 SDK 长调用，实际硬件操作继续串行锁保护。
+- DeviceConnectionManager 对 DG4000/SSG/Generic SCPI 同一规范化资源键统一别名租约；禁止多记录同时连接，repository 新保存跨 kind 重复拒绝，旧列表读取保持兼容。connect/disconnect 增加过渡 reservation，阻止检查与 I/O 之间的别名连接/NI 任务获取；close_all 拒绝活动占用和连接过渡。
+- 首页编辑/删除必须尊重 window.close() 拒绝，不能提前移除 open_windows 或设备记录，保留仍在执行的窗口与租约跟踪；Generic SCPI 的 raw CallTask 未返回时也拒绝关闭并保留任务。
+- SSG 窗口持有自身 native lease 时，首次连接和停止恢复使用 manager.connect(record, owner=self.owner) 的精确当前记录授权。首页或同资源别名不得借此为运行扫描重连；保留恢复后回读状态和现场重新布防的操作边界。
+- Linkage 先提交真实 device_results，全成功才增加 applied_count，然后写 CSV。日志失败停止后续点，保留本点全部/部分执行及原设备错误，不因缺日志重放；已有空 CSV 首次写入补表头。
+- Vaunix real/virtual prepare_trigger 绑定 connection_generation；断开/重连后旧 writer 在 SDK 设置前拒绝，整点预验证拒绝 empty/CH2/不支持及越界参数。任务 setter 失败只调用一次；StartSweep(True)、非 STOP 的 StartSequence、SaveSettings 不重试，普通 setter/读取和 STOP 保留既有短暂错误重试。
+- 首页后台探测通过 manager.probe 协调资源，已连接记录复用缓存身份；探测期间的连接请求以集合合并，完成后仅提交一次连接。创建虚拟实验室不先探测再连接，避免两个后台会话竞争。补充旧测试环境隔离和 20 次重复请求合并回归。
+- 验证：382 项完整自动回归通过（52.372 秒），源码自检通过，涵盖 DG CH2 隔离、Vaunix 25 个累计边沿/连接代次失效和 SSG 断线停止恢复。目录包、单文件 EXE、ZIP 解压后检查及正常 Windows 启动的实际运行证据另存 release-manifest.json；这些检查不替代实机验收。
+- 文档同步至 0.7.14 本地构建，未发布 GitHub Release。历史 .12/.13 测试和基准保留，未进行实体仪器操作或新增实机性能测量。
+
+### 0.7.13：触发任务停止、取消与状态交接完善 — 2026-10-23
+
+- 补查 0.7.12 停止边界：旧实现可能在写线程仍阻塞或 NI 清理失败时丢弃控制器/释放设备。新增共享 ControllerLifecycle，is_quiescent 同时核对启动检查、monitor、writer 和 NI 清理，成功结束后才释放；超时或清理失败保持控制器与租约，UI 禁止重启/关闭并提供“重试停止”。
+- 启动预检查或 counter.start 执行期间取消，停止等待在后台进行；先等待启动调用返回，再清理可能部分打开的 NI 任务，取消后不创建写线程。Qt QThreadPool 对应的 Python _DummyThread 不能 join，改用 Condition 和启动完成标志等待，常规 monitor/writer 仍等待实际退出。
+- DG prepare_trigger 返回的专用 writer 绑定 connection_generation，下发前在 SCPI 事务锁内核对；断开或连接恢复使旧耦合检查失效，拒绝旧 writer 继续写点，要求完成停止并重新布防。不自动恢复旧积压、不增加逐点硬件查询。
+- Trigger/Linkage 快照增加递增 revision；SnapshotBridge 同时约束会话、快照次序及累计计数，防止旧 RUNNING 覆盖新错误、计数回退或不同任务快照混入。
+- 严格顺序跨设备下发在下一设备发送前检查停止；已进入 VISA 的当前操作不能强制撤回，返回后不继续剩余设备。尚未全部完成的点以 partial_stopped 写入 CSV，保留已执行部分且不增加 applied_count；通信失败仍为 partial_error，全部已成功返回的点可计 complete。
+- 拒绝 NaN/Infinity/非正轮询周期，校验设备执行顺序非空、唯一并与参与 writer 一致。同步使用说明、专项核对和发行文档；保留 0.7.12 模拟基准与历史测试记录，未新增实机性能结论。
+- 验证：本地全量回归和 0.7.13 源码自检通过，自检新增 quiescent_after_stop / ordered_snapshot_revisions / reconnected_writer_blocked_without_io 均为 true。编译产物实际运行证据记录于 release-manifest.json，与源码及实机验收分开；未进行实体仪器操作。
+
+### 0.7.12：DG4000 + NI 单参数触发提速与通道核对 — 2026-10-23
+
+- 用户确认使用 DG4000 + NI 单参数步进，要求提速并检查 CH2 对 CH1 的影响。单参数原本只有一次 VISA write，合包本身没有收益；发现 Windows CPython 3.13 上 Event.wait(0.002) 实际平均约 15.5 ms。
+- 新增 poll_waiter.py，在 Windows CPython ≥3.11 使用高分辨率 sleep 和最多 5 ms 切片；其他环境仍用原等待。不修改全局系统时钟，不忙等，不改变累计计数或丢弃触发。相同请求等待均值约 2.24 ms；模拟 5 ms 通信时单触发至 write 返回约 12.07→6.71 ms，均为本机模拟。
+- DG4000 原生扫频/脉冲串页面从硬编码 SOUR1 改为各自选择、保存 CH1/CH2；点击时固定通道，异步执行不跟随后续选择变化。普通波形/调制/步进本来已使用显式通道头，未发现直接 CH2→CH1 写错。
+- 对照本地 CHM 确认 :COUP:STAT? 总查询返回 FREQ:OFF,PHASE:OFF,AMPL:OFF。typed 配置及任务布防前检查耦合，启用或未知则拒绝，不自动修改全局开关；手动配置重连后重新检查。显式单通道输出 OFF 仍可使用。
+- prepare_trigger 在 NI 启动前完成所有设备检查，返回任务专用写入器；每点不重复查询、不重连重放，传输失败不误计完成。多参数点一条分号消息且每项都带绝对 SOUR<n> 头；任一不合法值在写入前拒绝。软件完成仅表示 VISA write 返回，不表示射频输出已稳定。
+- DG 手动操作提交及执行前双检设备租约，在同一 SCPI 事务锁内执行，避免全局/其他通道命令插入任务。UI SnapshotBridge 约 20 Hz 合并显示，不每触发排队 Qt 事件；终态、会话和计数回退受保护。外部 observer 和跨设备 CSV 仍逐点记录。
+- 全量 307 项回归通过；新增覆盖等待、桥、通道 UI、CH2 五类参数/100 个累计边沿、耦合拒绝、重连复检、点传输失败和多设备预检查失败。冻结检查增加 CH2 25 次触发、CH1 全状态不变及拒绝耦合布防。说明见 DG4000_TRIGGER_AUDIT_CN.md；未实机验收。
+
+- 补查将跨设备启动的耦合/NI 检查移到后台，主线程保持响应；启动前排队或预检查期间取消后不再布防，计数器打开期间取消则关闭计数器，不启写线程。关闭窗口须等待后台完成，保留租约和回调；新增 Qt 阻塞检查/取消回归。
 
 ### 0.7.11：便携 ZIP 和单文件 EXE 内置 Vaunix DLL — 2026-10-10
 
@@ -814,7 +889,10 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 | SSG 尚无逐点数据与触发时间记录 | UI 当前点只用于监视 | 如需采集，单独设计硬件同步与记录 |
 | DG/Vaunix SCPI/USB 吞吐低于触发速率 | 累计计数、有序积压、实时指标 | 仪器端序列预装载或硬件触发 |
 | 多台 DG 完成时刻不同 | 严格串行、记录 skew | 公共触发线或支持并发的明确模式 |
-| 跨设备部分成功 | 停止并记录 partial_error | 可选补偿命令，但不能承诺原子回滚 |
+| 跨设备部分成功 | 错误记录 partial_error；途中停止记录 partial_stopped，均不误计完成 | 核对已执行设备状态，不能承诺原子回滚 |
+| 运行日志写入失败 | 先保留设备执行结果，停后续点并报告日志错误 | CSV 可能缺最后一条，禁止仅按缺行重放 |
+| 同仪器以不同接口地址重复保存 | 相同规范化地址隔离；不同 USB/LAN 地址未自动合并 | 每台仪器选一致资源，避免外部或跨接口并发控制 |
+| 停止超时或 NI 清理失败 | 保留控制器/设备占用，后台重试停止；不把错误状态视为资源已释放 | 记录阻塞通信与清理错误，等待实际结束后继续 |
 | 驱动/型号能力差异 | 连接探测、诊断、SCPI 控制台 | 型号能力表和动态控件限制 |
 | 长时间文本文件很大 | 逐块写入、有限内存 | 文件轮转、分段索引和容量预警 |
 | 磁盘满或写入失败 | 采集进入错误并关闭资源 | 预分配/剩余空间监视 |
@@ -851,6 +929,27 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 2. 检查一次联合点包含的命令数和设备数。
 3. 用虚拟 DG 延迟复现吞吐瓶颈。
 4. 降低触发速率或采用仪器端序列；不要用软件最小间隔掩盖积压。
+
+### DG/Vaunix 步进或跨设备任务停止未完成
+
+1. 查看“等待停止 / 重试停止”和原始错误，区分启动预检查、VISA 下发未返回与 NI 清理失败。
+2. 保留控制器、设备占用和窗口；界面错误或计数不再增长均不代表线程已退出。
+3. 等当前通信返回或排除 NI 清理问题后点击“重试停止”；确认完成前不要重启任务、断开复用或关闭窗口。
+4. DG/Vaunix 会话断开/恢复后，原 writer 的 connection_generation 已失效；完成停止并核对仪器状态，再重新布防。不要复用旧 writer 或重放积压。
+5. 跨设备日志若为 partial_stopped，核对其中已执行设备；未执行的后续设备不会因停止而补发，已执行部分也不会自动回滚。
+
+### 同资源连接被拒或首页不能编辑/删除
+
+1. 检查 DG、SSG、通用 SCPI 是否保存了相同地址的多个记录；旧配置可读不意味着允许同时连接。
+2. 等待正在连接/断开的操作结束，或先停止原任务并断开已连接的记录，不要用另一别名绕过占用。
+3. 若设备窗口拒绝关闭，首页会保留记录；完成停止/后台操作后再编辑或删除。
+4. 不把不同 USB/LAN 地址自动视为已受同一资源键保护；实验配置保持一致入口。
+
+### 跨设备 CSV 写入失败
+
+1. 保留错误消息中的设备结果、完成计数、原设备错误与日志错误。
+2. 本点可能已全部或部分改变仪器参数，CSV 缺行不代表没有执行；不得自动重放。
+3. 完成停止后检查磁盘空间、目录权限和文件状态，核对仪器输出后重新准备实验。
 
 ### NI 模拟输入停止或文本不增长
 

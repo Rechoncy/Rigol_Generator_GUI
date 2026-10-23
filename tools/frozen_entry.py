@@ -300,6 +300,129 @@ def _bundle_self_test(report_path: Path) -> int:
             raise AssertionError("Wheel acceptance check found no numeric inputs or dropdowns")
         report["input_wheel_policy"] = {"numeric_inputs_unchanged": True, "closed_dropdowns_unchanged": True,
                                         "numeric_inputs_checked": checked_spins, "dropdowns_checked": checked_combos}
+        # Exercise the packaged NI-to-DG path, keeping the other virtual
+        # channel's entire state unchanged and never opening real hardware.
+        from rigol_control.drivers.dg4000 import StepParameter
+        from rigol_control.trigger import TriggerStepController
+        from rigol_control.poll_waiter import _WINDOWS_HIGH_RESOLUTION_SLEEP
+        dg = next(w for w in home.open_windows.values() if type(w).__name__ == "DG4000Window")
+        ni = next(r for r in records if r.resource.startswith("SIM::NI_DAQ"))
+        generator = dg.driver.session._generator
+        ch1_before = generator.snapshot().channels[0]
+        generator.commands.clear()
+        controller = TriggerStepController(home.connection_manager.counter_for(ni), dg.driver,
+                                           StepParameter.FREQUENCY, 2, [1000, 2000, 3000])
+        try:
+            controller.start()
+            if controller.snapshot().applied_count:
+                raise AssertionError("DG parameters changed before the first NI trigger")
+            home.connection_manager.virtual_lab.emit_trigger(ni.resource, 25)
+            deadline = time.monotonic() + 5
+            while controller.snapshot().applied_count < 25 and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(.002)
+            if controller.snapshot().applied_count != 25 or controller.snapshot().backlog:
+                raise AssertionError("DG trigger stepping lost cumulative edges")
+        finally:
+            controller.stop()
+        if not controller.is_quiescent:
+            raise AssertionError("DG trigger controller reported stopped with pending work")
+        first_revision = controller.snapshot().revision
+        if first_revision < 1 or controller.snapshot().revision <= first_revision:
+            raise AssertionError("DG trigger snapshots have no monotonic revision")
+        if generator.snapshot().channels[0] != ch1_before:
+            raise AssertionError("DG CH2 trigger stepping modified CH1")
+        if list(generator.commands).count(":COUP:STAT?") != 1:
+            raise AssertionError("Coupling check ran per edge instead of once before arming")
+        if any(list(generator.commands).count(f":SOUR{channel}:FUNC?") != 1 for channel in (1, 2)):
+            raise AssertionError("Waveform checks did not run exactly once per channel before arming")
+        from rigol_control.drivers.dg4000 import StepValue
+        prepared = dg.driver.prepare_trigger()
+        dg.driver.write(":SOUR2:VOLT:UNIT VRMS")
+        prepared.apply_steps((StepValue(StepParameter.AMPLITUDE, 2, 1.25),))
+        if generator.channels[2]["amplitude_vpp"] != 1.25:
+            raise AssertionError("Typed DG amplitude inherited the instrument's Vrms unit")
+        precise_frequencies = (100000000.000001, 100000000.000002)
+        for frequency in precise_frequencies:
+            prepared.apply_steps((StepValue(StepParameter.FREQUENCY, 2, frequency),))
+            if generator.channels[2]["frequency_hz"] != frequency:
+                raise AssertionError("DG command serialization lost a microhertz step")
+        if generator.snapshot().channels[0] != ch1_before:
+            raise AssertionError("DG unit or precision checks changed CH1")
+        generator.values["COUP:STAT"] = "FREQ:ON,PHASE:OFF,AMPL:OFF"
+        try:
+            try:
+                controller.start()
+            except ValueError:
+                pass
+            else:
+                controller.stop()
+                raise AssertionError("A coupled DG device was allowed to arm")
+        finally:
+            generator.values.pop("COUP:STAT", None)
+        prepared = dg.driver.prepare_trigger()
+        dg.driver.session.disconnect()
+        dg.driver.session.connect()
+        command_count = len(generator.commands)
+        try:
+            from rigol_control.drivers.dg4000 import StepValue
+            prepared.apply_steps((StepValue(StepParameter.FREQUENCY, 2, 4000),))
+        except RuntimeError as exc:
+            if "通道检查已失效" not in str(exc):
+                raise
+        else:
+            raise AssertionError("A stale DG trigger writer survived reconnection")
+        if len(generator.commands) != command_count:
+            raise AssertionError("Stale DG trigger writer issued I/O after reconnection")
+        report["dg_trigger_dispatch"] = {"ch2_preserved_ch1": True, "all_25_edges_applied": True,
+                                          "one_coupling_query_per_run": True, "coupled_arming_blocked": True,
+                                          "waveforms_read_once_per_channel": True,
+                                          "amplitude_vpp_explicit": True, "microhertz_points_preserved": True,
+                                          "quiescent_after_stop": True, "ordered_snapshot_revisions": True,
+                                          "reconnected_writer_blocked_without_io": True,
+                                          "high_resolution_poll_wait": _WINDOWS_HIGH_RESOLUTION_SLEEP}
+        from rigol_control.scan import ScanPoint
+        vaunix = next(w for w in home.open_windows.values() if type(w).__name__ == "VaunixLmsWindow")
+        device = vaunix.device
+        before = (device.frequency_hz, device.power_dbm)
+        controller = TriggerStepController(
+            home.connection_manager.counter_for(ni), device,
+            scan_points=[ScanPoint((StepValue(StepParameter.FREQUENCY, 1, frequency),
+                                    StepValue(StepParameter.AMPLITUDE, 1, power)))
+                         for frequency, power in ((5e9, -10), (6e9, -9))],
+        )
+        try:
+            controller.start()
+            if (device.frequency_hz, device.power_dbm) != before:
+                raise AssertionError("Vaunix arming changed output before the first trigger")
+            home.connection_manager.virtual_lab.emit_trigger(ni.resource, 25)
+            deadline = time.monotonic() + 5
+            while controller.snapshot().applied_count < 25 and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(.002)
+            if controller.snapshot().applied_count != 25 or controller.snapshot().backlog:
+                raise AssertionError("Vaunix trigger stepping lost cumulative edges")
+        finally:
+            controller.stop()
+        if not controller.is_quiescent or (device.frequency_hz, device.power_dbm) != (5e9, -10):
+            raise AssertionError("Vaunix point order or stop cleanup failed")
+        prepared = device.prepare_trigger()
+        device.disconnect()
+        device.connect()
+        try:
+            prepared.apply_steps((StepValue(StepParameter.FREQUENCY, 1, 7e9),))
+        except RuntimeError as exc:
+            if "原触发任务已失效" not in str(exc):
+                raise
+        else:
+            raise AssertionError("A stale Vaunix trigger writer survived reconnection")
+        if device.frequency_hz != 5e9 or device.rf_on:
+            raise AssertionError("Stale Vaunix writer changed output or RF was enabled")
+        report["vaunix_trigger_dispatch"] = {
+            "arming_preserved_output": True, "all_25_edges_applied": True,
+            "frequency_power_order_preserved": True, "quiescent_after_stop": True,
+            "reconnected_writer_blocked_without_io": True, "rf_remained_off": True,
+        }
         # Exercise the actual SSG connect button and its GUI completion callback,
         # including an invalid numeric reply. Merely opening the window misses it.
         ssg = next(window for window in home.open_windows.values() if type(window).__name__ == "SiglentWindow")

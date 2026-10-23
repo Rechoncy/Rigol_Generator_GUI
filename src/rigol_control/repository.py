@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import DeviceRecord
+from .models import DeviceKind, DeviceRecord
 from .runtime import resolve_data_dir
 
 
@@ -42,7 +42,13 @@ class DeviceRepository:
     def save(self, record: DeviceRecord) -> DeviceRecord:
         record.validate()
         devices = self.list()
-        self._ensure_unique(record, devices)
+        previous = next((item for item in devices if item.id == record.id), None)
+        # Older files may already contain two SCPI profiles for one resource.
+        # Keep them readable/editable so users can remove the obsolete entry;
+        # only adding a record or changing its address/type introduces a duplicate.
+        if (previous is None or previous.kind is not record.kind
+                or previous.resource.strip().casefold() != record.resource.strip().casefold()):
+            self._ensure_unique(record, devices)
         for index, existing in enumerate(devices):
             if existing.id == record.id:
                 devices[index] = record
@@ -62,14 +68,17 @@ class DeviceRepository:
 
     @staticmethod
     def _ensure_unique(record: DeviceRecord, devices: Iterable[DeviceRecord]) -> None:
-        key = (record.kind.value.casefold(), record.resource.strip().casefold())
+        scpi_kinds = {DeviceKind.DG4000, DeviceKind.SIGLENT_SSG, DeviceKind.GENERIC_SCPI}
+        def resource_key(item: DeviceRecord) -> tuple[str, str]:
+            kind = "scpi" if item.kind in scpi_kinds else item.kind.value.casefold()
+            return kind, item.resource.strip().casefold()
+        key = resource_key(record)
         for existing in devices:
-            existing_key = (
-                existing.kind.value.casefold(),
-                existing.resource.strip().casefold(),
-            )
+            existing_key = resource_key(existing)
             if existing.id != record.id and existing_key == key:
-                raise DuplicateDeviceError("该类型和资源地址的设备已经存在")
+                message = ("该物理资源地址的设备已经存在，不能通过不同 SCPI 类型重复添加"
+                           if record.kind in scpi_kinds else "该类型和资源地址的设备已经存在")
+                raise DuplicateDeviceError(message)
 
     def _write(self, devices: Iterable[DeviceRecord]) -> None:
         payload = {

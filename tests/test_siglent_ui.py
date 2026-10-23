@@ -89,6 +89,39 @@ class SiglentUiTests(unittest.TestCase):
         self.assertEqual(restored.controls["sweep.point_trigger"].currentData(), "BUS")
         self.assertEqual(restored.table.item(0, 1).text(), "-33.5")
 
+    def test_initial_connection_uses_its_native_communication_lease_owner(self):
+        calls = []
+        original = self.manager.connect
+
+        def connect(record, *, owner=None):
+            calls.append((record.id, owner, self.manager.lease_owner(record.id)))
+            return original(record, owner=owner)
+
+        with patch.object(self.manager, "connect", side_effect=connect):
+            self.connect()
+        self.assertEqual(calls, [(self.record.id, self.window.owner, self.window.owner)])
+        self.assertTrue(self.window.session.is_connected)
+        self.assertFalse(self.manager.active_leases())
+
+    def test_stop_reconnect_uses_owner_and_retains_lease_until_confirmed_off(self):
+        self.arm_external_scan()
+        self.window.session.disconnect()
+        self.assertEqual(self.manager.lease_owner(self.record.id), self.window.owner)
+        calls = []
+        original = self.manager.connect
+
+        def connect(record, *, owner=None):
+            calls.append((record.id, owner, self.manager.lease_owner(record.id)))
+            return original(record, owner=owner)
+
+        with patch.object(self.manager, "connect", side_effect=connect):
+            self.window._safety(self.window.driver.stop)
+            self.idle()
+        self.assertEqual(calls, [(self.record.id, self.window.owner, self.window.owner)])
+        self.assertTrue(self.window.session.is_connected)
+        self.assertEqual(self.window.driver.state, "off")
+        self.assertFalse(self.manager.active_leases())
+
     def test_power_unit_switch_preserves_prepared_step_configuration(self):
         self.connect()
         self.window.apply_sweep()

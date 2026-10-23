@@ -42,6 +42,7 @@ class NIDaqEdgeCounter:
                     "未安装 nidaqmx；请先安装 NI-DAQmx 驱动及 Python 包"
                 ) from exc
             task = nidaqmx.Task(new_task_name="DG4000_Trigger_Edge_Count")
+            self._task = task
             try:
                 channel = task.ci_channels.add_ci_count_edges_chan(
                     f"{self.device_name}/{self.counter}",
@@ -56,8 +57,8 @@ class NIDaqEdgeCounter:
                 task.start()
             except Exception as exc:
                 task.close()
+                self._task = None
                 raise NIDaqError(f"无法启动 NI 边沿计数：{exc}") from exc
-            self._task = task
 
     def read_count(self) -> int:
         with self._lock:
@@ -73,7 +74,7 @@ class NIDaqEdgeCounter:
 
     def stop(self) -> None:
         with self._lock:
-            task, self._task = self._task, None
+            task = self._task
             if task is None:
                 return
             try:
@@ -82,3 +83,6 @@ class NIDaqEdgeCounter:
                 pass
             finally:
                 task.close()
+            # Retain the task if close raises, so cleanup can be retried and
+            # the caller cannot start a second task over an unconfirmed one.
+            self._task = None

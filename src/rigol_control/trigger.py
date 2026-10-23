@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from threading import Condition, Event, RLock, Thread, current_thread
+from threading import Condition, Event, RLock, Thread
 from typing import Protocol
 
+from .controller_lifecycle import ControllerLifecycle
 from .drivers.dg4000 import StepParameter, StepValue
+from .poll_waiter import wait_for_poll
 from .scan import ScanPoint
 from .sequence import CyclicSequence
 
@@ -42,6 +45,7 @@ class TriggerSnapshot:
     current_value: float | None
     error: str | None
     current_values: tuple[StepValue, ...] = ()
+    revision: int = 0
 
     @property
     def backlog(self) -> int:
@@ -51,7 +55,7 @@ class TriggerSnapshot:
 UpdateCallback = Callable[[TriggerSnapshot], None]
 
 
-class TriggerStepController:
+class TriggerStepController(ControllerLifecycle):
     """Two-thread hardware-count-to-SCPI controller with lossless ordering.
 
     The monitor only samples a cumulative hardware counter. Its poll cadence is
@@ -71,10 +75,11 @@ class TriggerStepController:
         scan_points: list[ScanPoint] | tuple[ScanPoint, ...] | None = None,
         monitor_poll_seconds: float = 0.002,
     ) -> None:
-        if monitor_poll_seconds <= 0:
+        if not math.isfinite(monitor_poll_seconds) or monitor_poll_seconds <= 0:
             raise ValueError("累计计数读取周期必须大于 0")
         self.counter = counter
         self.writer = writer
+        self._active_writer = writer
         self.parameter = parameter
         self.channel = channel
         if scan_points is not None:
@@ -93,6 +98,7 @@ class TriggerStepController:
         self._lock = RLock()
         self._condition = Condition(self._lock)
         self._stop_event = Event()
+        self._cancel_before_start = False
         self._state = ControllerState.STOPPED
         self._received_count = 0
         self._applied_count = 0
@@ -101,8 +107,10 @@ class TriggerStepController:
         self._current_values: tuple[StepValue, ...] = ()
         self._error: str | None = None
         self._callbacks: list[UpdateCallback] = []
+        self._snapshot_revision = 0
         self._monitor_thread: Thread | None = None
         self._writer_thread: Thread | None = None
+        self._init_lifecycle()
 
     def add_callback(self, callback: UpdateCallback) -> None:
         with self._lock:
@@ -116,6 +124,7 @@ class TriggerStepController:
 
     def snapshot(self) -> TriggerSnapshot:
         with self._lock:
+            self._snapshot_revision += 1
             return TriggerSnapshot(
                 state=self._state,
                 received_count=self._received_count,
@@ -124,68 +133,63 @@ class TriggerStepController:
                 current_value=self._current_value,
                 error=self._error,
                 current_values=self._current_values,
+                revision=self._snapshot_revision,
             )
 
-    def start(self) -> None:
+    def _start_run(self) -> None:
         with self._condition:
-            if self._state in {ControllerState.STARTING, ControllerState.RUNNING}:
-                raise RuntimeError("触发步进任务已经运行")
-            self._state = ControllerState.STARTING
+            if self._cancel_before_start or self._stop_event.is_set():
+                self._cancel_before_start = False
+                self._state = ControllerState.STOPPED
+                self._publish()
+                return
             self._received_count = 0
             self._applied_count = 0
             self._current_index = None
             self._current_value = None
             self._current_values = ()
             self._error = None
-            self._stop_event.clear()
         self._publish()
         try:
-            self.counter.start()
+            prepare = getattr(self.writer, "prepare_trigger", None)
+            self._active_writer = prepare() if callable(prepare) else self.writer
+            with self._condition:
+                if self._stop_event.is_set():
+                    self._state = ControllerState.STOPPED
+                    self._publish()
+                    return
+            self._open_counter()
         except Exception as exc:
-            self._fail(f"启动硬件计数器失败：{exc}")
+            self._fail(f"启动前检查或硬件计数器启动失败：{exc}")
             raise
 
         with self._condition:
-            self._state = ControllerState.RUNNING
-            self._monitor_thread = Thread(
-                target=self._monitor_loop,
-                name="ni-trigger-monitor",
-                daemon=True,
-            )
-            self._writer_thread = Thread(
-                target=self._writer_loop,
-                name="instrument-step-writer",
-                daemon=True,
-            )
-            monitor = self._monitor_thread
-            writer = self._writer_thread
-        monitor.start()
-        writer.start()
+            cancelled = self._stop_event.is_set()
+            if not cancelled:
+                self._start_workers_locked()
+        if cancelled:
+            self._close_counter()
+            with self._condition:
+                self._state = ControllerState.STOPPED
         self._publish()
 
-    def stop(self) -> None:
-        with self._condition:
-            if self._state is ControllerState.STOPPED:
-                return
-            if self._state is not ControllerState.ERROR:
-                self._state = ControllerState.STOPPING
-            self._stop_event.set()
-            self._condition.notify_all()
-            monitor = self._monitor_thread
-            writer = self._writer_thread
-        self._publish()
-        for thread in (monitor, writer):
-            if thread is not None and thread is not current_thread():
-                thread.join(timeout=3.0)
-        try:
-            self.counter.stop()
-        finally:
-            with self._condition:
-                if self._state is not ControllerState.ERROR:
-                    self._state = ControllerState.STOPPED
-                self._monitor_thread = None
-                self._writer_thread = None
-            self._publish()
+    def _start_workers_locked(self) -> None:
+        self._state = ControllerState.RUNNING
+        self._monitor_thread = Thread(
+            target=self._monitor_loop,
+            name="ni-trigger-monitor",
+            daemon=True,
+        )
+        self._writer_thread = Thread(
+            target=self._writer_loop,
+            name="instrument-step-writer",
+            daemon=True,
+        )
+        monitor = self._monitor_thread
+        writer = self._writer_thread
+        # Stop cannot join these threads between creation and start.
+        monitor.start()
+        writer.start()
 
     def _monitor_loop(self) -> None:
         try:
@@ -201,7 +205,7 @@ class TriggerStepController:
                         changed = True
                 if changed:
                     self._publish()
-                self._stop_event.wait(self.monitor_poll_seconds)
+                wait_for_poll(self._stop_event, self.monitor_poll_seconds)
         except Exception as exc:
             self._fail(f"监视 NI 触发失败：{exc}")
 
@@ -218,12 +222,12 @@ class TriggerStepController:
                     trigger_number = self._applied_count + 1
                     position = self.sequence.for_trigger(trigger_number)
                 values = position.value.values
-                apply_many = getattr(self.writer, "apply_steps", None)
+                apply_many = getattr(self._active_writer, "apply_steps", None)
                 if callable(apply_many):
                     apply_many(values)
                 else:
                     for item in values:
-                        self.writer.apply_step(item.parameter, item.channel, item.value)
+                        self._active_writer.apply_step(item.parameter, item.channel, item.value)
                 with self._condition:
                     # Only the sole writer thread mutates applied_count.
                     self._applied_count = trigger_number
@@ -240,6 +244,10 @@ class TriggerStepController:
             self._state = ControllerState.ERROR
             self._stop_event.set()
             self._condition.notify_all()
+        try:
+            self._close_counter()
+        except Exception:
+            pass  # Keep _counter_open set so the lease cannot be released.
         self._publish()
 
     def _publish(self) -> None:

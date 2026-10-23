@@ -368,10 +368,13 @@ class NewportUiTests(unittest.TestCase):
 
     def test_home_factory_includes_virtual_newport(self):
         repo = DeviceRepository(Path(self.tmp.name) / "home")
-        home = DeviceCenterWindow(repo, self.manager)
+        # This empty repository owns newly generated record IDs. Reusing the
+        # fixture's connected stage/NI profiles would create physical aliases.
+        manager = DeviceConnectionManager()
+        home = DeviceCenterWindow(repo, manager)
         self.windows.append(home)
         home.create_virtual_lab()
-        self.assertTrue(self.wait(lambda: len(repo.list()) == 6 and all(self.manager.is_connected(r) for r in repo.list())))
+        self.assertTrue(self.wait(lambda: len(repo.list()) == 6 and all(manager.is_connected(r) for r in repo.list())))
         stage = next(r for r in repo.list() if r.kind is DeviceKind.NEWPORT_SMC100)
         home.open_device(stage.id)
         self.assertIsInstance(home.open_windows[stage.id], NewportWindow)

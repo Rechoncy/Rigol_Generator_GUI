@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import RLock
 
@@ -11,7 +12,7 @@ from .drivers.ni_counter import NIDaqEdgeCounter
 from .drivers.scpi import ScpiSession
 from .drivers.vaunix_lms import VaunixLmsDevice, VirtualVaunixLmsDevice
 from .models import DeviceKind, DeviceRecord
-from .services import DeviceProbeService, ProbeState
+from .services import DeviceProbeService, ProbeResult, ProbeState
 from .virtual_lab import (
     VirtualAnalogInput,
     VirtualEdgeCounter,
@@ -63,9 +64,116 @@ class DeviceConnectionManager:
         self._leases: dict[str, str] = {}
         self._newport_devices: dict[str, Smc100Device | VirtualSmc100Device] = {}
         self._newport_connecting: set[str] = set()
+        self._known_records: dict[str, DeviceRecord] = {}
+        self._physical_resources: dict[str, str] = {}
+        self._transitions: dict[str, str] = {}
+        self._closing_all = False
         self._lock = RLock()
 
-    def connect(self, record: DeviceRecord) -> ConnectionInfo:
+    @staticmethod
+    def physical_resource(record: DeviceRecord) -> str:
+        """Use one identity for SCPI profiles addressing the same VISA resource."""
+        resource = record.resource.strip().casefold()
+        if record.kind in {DeviceKind.DG4000, DeviceKind.SIGLENT_SSG, DeviceKind.GENERIC_SCPI}:
+            return f"scpi:{resource}"
+        if record.kind is DeviceKind.NEWPORT_SMC100 and not is_virtual_resource(record.resource):
+            port, _ = parse_resource(record.resource)
+            return f"serial:{port.casefold()}"
+        if record.kind is DeviceKind.NI_DAQ:
+            resource = resource.strip("/")
+        return f"{record.kind.value}:{resource}"
+
+    def _register_record_locked(self, record: DeviceRecord) -> str:
+        key = self.physical_resource(record)
+        old_key = self._physical_resources.get(record.id)
+        if old_key is not None and old_key != key:
+            if self._lease_for_resource_locked(record.id) or old_key in self._transitions:
+                raise DeviceBusyError("设备仍被任务占用或正在连接/断开，不能替换资源地址")
+            if self._record_connected_locked(record.id):
+                raise DeviceBusyError("请先断开旧设备地址，再替换资源")
+        self._known_records[record.id] = record
+        self._physical_resources[record.id] = key
+        return key
+
+    def _record_connected_locked(self, device_id: str) -> bool:
+        if device_id in self._scpi_connected:
+            session = self._sessions.get(device_id)
+            return session is not None and session.is_connected
+        if device_id in self._ni_connected:
+            return True
+        if device_id in self._vaunix_connected:
+            device = self._vaunix_devices.get(device_id)
+            return device is not None and device.is_connected
+        device = self._newport_devices.get(device_id)
+        return device is not None and device.is_connected
+
+    def _lease_for_resource_locked(self, device_id: str) -> str | None:
+        key = self._physical_resources.get(device_id)
+        for other_id, owner in self._leases.items():
+            if other_id == device_id or (key is not None and self._physical_resources.get(other_id) == key):
+                return owner
+        return None
+
+    @contextmanager
+    def _connection_transition(self, record: DeviceRecord, action: str, *, owner: str | None = None):
+        with self._lock:
+            if self._closing_all:
+                raise DeviceBusyError("正在关闭设备连接，请等待操作完成")
+            key = self._register_record_locked(record)
+            current_owner = self._lease_for_resource_locked(record.id)
+            owns_exact_lease = owner is not None and self._leases.get(record.id) == owner
+            if current_owner is not None and not (action == "连接" and owns_exact_lease):
+                if current_owner.startswith("siglent-native:"):
+                    raise DeviceBusyError(f"设备“{record.name}”正在执行 SSG 通信或原生扫描，请先停止并确认后{action}")
+                raise DeviceBusyError(f"设备“{record.name}”正被联动任务占用，停止任务后才能{action}")
+            if key in self._transitions:
+                raise DeviceBusyError(f"同一资源正在{self._transitions[key]}，请稍后重试")
+            if action in {"连接", "探测"}:
+                aliases = [other_id for other_id, other_key in self._physical_resources.items()
+                           if other_id != record.id and other_key == key and self._record_connected_locked(other_id)]
+                if aliases:
+                    raise DeviceBusyError("同一物理资源已由另一设备记录连接，请先断开该记录")
+            self._transitions[key] = action
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._transitions.pop(key, None)
+
+    def assert_manual_access(self, record: DeviceRecord) -> None:
+        """Reject manual commands through either a task's record or its aliases."""
+        with self._lock:
+            if self._closing_all:
+                raise DeviceBusyError("正在关闭设备连接，请等待操作完成")
+            key = self._register_record_locked(record)
+            if self._lease_for_resource_locked(record.id) is not None:
+                raise DeviceBusyError("同一物理资源正在执行扫描/联动任务，请先停止任务再执行手动操作")
+            if key in self._transitions:
+                raise DeviceBusyError(f"同一资源正在{self._transitions[key]}，请等待操作完成")
+
+    def active_transitions(self) -> dict[str, str]:
+        with self._lock:
+            return {**self._transitions, **({"all-devices": "关闭"} if self._closing_all else {})}
+
+    def connect(self, record: DeviceRecord, *, owner: str | None = None) -> ConnectionInfo:
+        if record.kind in {DeviceKind.DG4000, DeviceKind.SIGLENT_SSG, DeviceKind.GENERIC_SCPI}:
+            self.session_for(record)
+        else:
+            with self._lock:
+                self._register_record_locked(record)
+        if self.is_connected(record):
+            return self.info(record)
+        with self._connection_transition(record, "连接", owner=owner):
+            return self._connect_record(record)
+
+    def probe(self, record: DeviceRecord, service: DeviceProbeService | None = None):
+        if self.is_connected(record):
+            info = self.info(record)
+            return ProbeResult(ProbeState.ONLINE, "已连接（共享现有会话）", info.identity)
+        with self._connection_transition(record, "探测"):
+            return (service or self._probe_service).probe(record)
+
+    def _connect_record(self, record: DeviceRecord) -> ConnectionInfo:
         if record.kind is DeviceKind.NEWPORT_SMC100:
             with self._lock:
                 device = self.newport_device_for(record)
@@ -128,6 +236,10 @@ class DeviceConnectionManager:
         return ConnectionInfo(record.id, True, identity, "VISA 会话已连接")
 
     def disconnect(self, record: DeviceRecord) -> ConnectionInfo:
+        with self._connection_transition(record, "断开"):
+            return self._disconnect_record(record)
+
+    def _disconnect_record(self, record: DeviceRecord) -> ConnectionInfo:
         with self._lock:
             owner = self._leases.get(record.id)
         if owner is not None:
@@ -227,10 +339,25 @@ class DeviceConnectionManager:
         if not normalized:
             raise ValueError("至少需要占用一台设备")
         with self._lock:
+            if self._closing_all:
+                raise DeviceBusyError("正在关闭设备连接，不能启动任务")
+            resource_keys = [self._physical_resources.get(item, f"device:{item}") for item in normalized]
+            if len(set(resource_keys)) != len(resource_keys):
+                raise DeviceBusyError("同一物理资源不能通过多条设备记录参与同一任务")
+            transitions = [item for item in normalized
+                           if self._physical_resources.get(item) in self._transitions]
+            if transitions:
+                raise DeviceBusyError("设备正在连接/断开，不能启动任务：" + ", ".join(transitions))
+            disconnected = [item for item in normalized
+                            if item in self._known_records and not self._record_connected_locked(item)
+                            and not (self._known_records[item].kind is DeviceKind.SIGLENT_SSG
+                                     and owner == f"siglent-native:{item}")]
+            if disconnected:
+                raise DeviceBusyError("设备连接已改变，请重新连接后启动任务：" + ", ".join(disconnected))
             conflicts = [
                 device_id
                 for device_id in normalized
-                if device_id in self._leases and self._leases[device_id] != owner
+                if self._lease_for_resource_locked(device_id) not in {None, owner}
             ]
             if conflicts:
                 raise DeviceBusyError(
@@ -248,7 +375,7 @@ class DeviceConnectionManager:
 
     def lease_owner(self, device_id: str) -> str | None:
         with self._lock:
-            return self._leases.get(device_id)
+            return self._lease_for_resource_locked(device_id)
 
     def active_leases(self) -> dict[str, str]:
         """Snapshot used to prevent configuration replacement during hardware work."""
@@ -265,8 +392,11 @@ class DeviceConnectionManager:
             )
             connected = record.id in self._scpi_connected
         if resource_changed and connected:
-            self.disconnect(record)
+            with self._lock:
+                previous = self._known_records.get(record.id)
+            self.disconnect(previous or record.updated(resource=self._resources[record.id]))
         with self._lock:
+            self._register_record_locked(record)
             if resource_changed:
                 self._sessions.pop(record.id, None)
                 self._resources.pop(record.id, None)
@@ -275,7 +405,9 @@ class DeviceConnectionManager:
     def dg_driver_for(self, record: DeviceRecord) -> DG4000Driver:
         if record.kind is not DeviceKind.DG4000:
             raise ValueError("只有 DG4000 设备可创建 DG4000Driver")
-        return DG4000Driver(self.session_for(record))
+        driver = DG4000Driver(self.session_for(record))
+        driver.set_identity(self.info(record).identity)
+        return driver
 
     def vaunix_device_for(
         self,
@@ -284,6 +416,7 @@ class DeviceConnectionManager:
         if record.kind is not DeviceKind.VAUNIX_LMS:
             raise ValueError("只有 Vaunix LMS/BLX 可创建设备驱动")
         with self._lock:
+            self._register_record_locked(record)
             resource_changed = (
                 record.id in self._vaunix_devices
                 and self._vaunix_resources.get(record.id) != record.resource
@@ -309,6 +442,7 @@ class DeviceConnectionManager:
             raise ValueError("只有 Newport 设备可创建 SMC100 驱动")
         record.validate()
         with self._lock:
+            self._register_record_locked(record)
             existing = self._newport_devices.get(record.id)
             if existing is not None and existing.resource != record.resource:
                 if existing.is_connected or self._leases.get(record.id):
@@ -338,6 +472,8 @@ class DeviceConnectionManager:
     ) -> NIDaqEdgeCounter | VirtualEdgeCounter:
         if record.kind is not DeviceKind.NI_DAQ:
             raise ValueError("只有 NI DAQ 设备可创建触发计数器")
+        with self._lock:
+            self._register_record_locked(record)
         if is_virtual_resource(record.resource):
             return self.virtual_lab.edge_counter_for(record.resource)
         return NIDaqEdgeCounter(
@@ -378,16 +514,20 @@ class DeviceConnectionManager:
         return NIDaqAnalogInput(record.resource, config)
 
     def forget(self, record: DeviceRecord) -> None:
-        self.disconnect(record)
-        with self._lock:
-            self._sessions.pop(record.id, None)
-            self._resources.pop(record.id, None)
-            self._vaunix_devices.pop(record.id, None)
-            self._vaunix_resources.pop(record.id, None)
-            self._newport_devices.pop(record.id, None)
+        with self._connection_transition(record, "删除"):
+            self._disconnect_record(record)
+            with self._lock:
+                self._sessions.pop(record.id, None)
+                self._resources.pop(record.id, None)
+                self._vaunix_devices.pop(record.id, None)
+                self._vaunix_resources.pop(record.id, None)
+                self._newport_devices.pop(record.id, None)
 
     def close_all(self) -> None:
         with self._lock:
+            if self._leases or self._transitions or self._closing_all:
+                raise DeviceBusyError("仍有任务占用设备或设备正在连接/断开，请先停止任务并等待操作完成")
+            self._closing_all = True
             sessions = [
                 session
                 for device_id, session in self._sessions.items()
@@ -404,16 +544,20 @@ class DeviceConnectionManager:
             self._identities.clear()
             self._leases.clear()
             newport_devices = list(self._newport_devices.values())
-        for session in sessions:
-            try:
-                session.disconnect()
-            except Exception:
-                pass
-        for device in [*vaunix_devices, *newport_devices]:
-            try:
-                device.disconnect()
-            except Exception:
-                pass
+        try:
+            for session in sessions:
+                try:
+                    session.disconnect()
+                except Exception:
+                    pass
+            for device in [*vaunix_devices, *newport_devices]:
+                try:
+                    device.disconnect()
+                except Exception:
+                    pass
+        finally:
+            with self._lock:
+                self._closing_all = False
 
     def _session_for_locked(self, record: DeviceRecord) -> ScpiSession:
         existing = self._sessions.get(record.id)

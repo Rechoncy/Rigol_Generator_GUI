@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QObject, Qt, pyqtSignal
+from PyQt6.QtCore import QThreadPool, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -49,8 +49,10 @@ from ..repository import DeviceRepository
 from ..scan import MAX_SCAN_AXES, ScanMode
 from ..sequence import MAX_SCAN_POINTS
 from ..trigger import ControllerState
-from ..units import default_unit, from_base, to_base, unit_spec, unit_specs
+from ..units import default_unit, from_base, roundtrip_number, to_base, unit_spec, unit_specs
 from ..virtual_lab import is_virtual_resource
+from .snapshot_bridge import SnapshotBridge
+from .widgets import CallTask
 
 
 def _panel(title: str) -> tuple[QFrame, QVBoxLayout]:
@@ -65,8 +67,8 @@ def _panel(title: str) -> tuple[QFrame, QVBoxLayout]:
     return frame, layout
 
 
-class LinkageBridge(QObject):
-    updated = pyqtSignal(object)
+class LinkageBridge(SnapshotBridge):
+    pass
 
 
 class CompactDoubleSpinBox(QDoubleSpinBox):
@@ -230,7 +232,14 @@ class LinkageTaskWindow(QMainWindow):
         self._current_task_id: str | None = None
         self._lease_owner: str | None = None
         self.controller: MultiDeviceTriggerController | None = None
-        self.bridge = LinkageBridge()
+        self.thread_pool = QThreadPool.globalInstance()
+        self._call_tasks: set[CallTask] = set()
+        self._pending_stop = False
+        self._start_error: str | None = None
+        self._start_task: CallTask | None = None
+        self._stop_task: CallTask | None = None
+        self._stop_error: str | None = None
+        self.bridge = LinkageBridge(self)
         self.bridge.updated.connect(self._controller_updated)
         self._runtime_rows: dict[str, RuntimeDeviceRow] = {}
         self._last_error: str | None = None
@@ -537,7 +546,7 @@ class LinkageTaskWindow(QMainWindow):
             self.point_table.setItem(row, 0, number)
             for column, item in enumerate(point.values, start=1):
                 self.point_table.setItem(
-                    row, column, QTableWidgetItem(f"{item.display_value:.12g}")
+                    row, column, QTableWidgetItem(roundtrip_number(item.display_value))
                 )
             self.point_table.setItem(
                 row,
@@ -758,7 +767,7 @@ class LinkageTaskWindow(QMainWindow):
         self.statusBar().showMessage(f"已连接 {len(records)} 台参与设备", 5000)
 
     def _start(self) -> None:
-        if self.controller is not None:
+        if self.controller is not None or self._call_tasks:
             return
         try:
             points = self._points_from_table()
@@ -804,7 +813,7 @@ class LinkageTaskWindow(QMainWindow):
                 dispatch_mode=self.dispatch_mode.currentData(),
                 logger=LinkageRunLogger(log_path),
             )
-            controller.add_callback(self.bridge.updated.emit)
+            controller.add_callback(self.bridge.begin_session())
             self.controller = controller
             self._prepare_runtime_table(dg_records)
             self.log_path.setText(f"运行日志：{log_path}")
@@ -812,22 +821,104 @@ class LinkageTaskWindow(QMainWindow):
             self._last_logged_applied = 0
             self.run_log.clear()
             self._set_editing_enabled(False)
-            controller.start()
+            self._pending_stop = False
+            self._start_error = None
+            self.start_button.setText("启动中…")
+            self.stop_button.setEnabled(True)
+            task = CallTask(controller.start)
+            self._start_task = task
+            self._call_tasks.add(task)
+            task.signals.failed.connect(lambda message, item=task: self._start_failed(message, item))
+            task.signals.finished.connect(lambda item=task: self._start_finished(item))
+            try:
+                self.thread_pool.start(task)
+            except Exception:
+                self._call_tasks.discard(task)
+                self._start_task = None
+                raise
         except Exception as exc:
+            self.bridge.flush()
             if self._lease_owner:
                 self.connection_manager.release_devices(self._lease_owner)
                 self._lease_owner = None
             self.controller = None
             self._set_editing_enabled(True)
+            self.start_button.setText("启动联动")
+            self.stop_button.setEnabled(False)
             QMessageBox.warning(self, "无法启动跨设备联动", str(exc))
 
+    def _start_failed(self, message: str, task: CallTask | None = None) -> None:
+        # Keep the controller and leases until CallTask has fully returned.
+        if task is None or task is self._start_task:
+            self._start_error = message
+
+    def _start_finished(self, task: CallTask) -> None:
+        self._call_tasks.discard(task)
+        if task is not self._start_task:
+            return
+        self._start_task = None
+        self.bridge.flush()
+        error, self._start_error = self._start_error, None
+        if error or self._pending_stop:
+            self._stop()
+        if error:
+            QMessageBox.warning(self, "无法启动跨设备联动", error)
+
     def _stop(self) -> None:
-        controller, self.controller = self.controller, None
-        if controller is not None:
-            try:
-                controller.stop()
-            except Exception as exc:
-                self.run_log.appendPlainText(f"停止任务时发生错误：{exc}")
+        if self._stop_task is not None:
+            return
+        if self._call_tasks:
+            self._pending_stop = True
+            if self.controller is not None:
+                self.controller.request_stop()
+            self.start_button.setText("正在取消…")
+            self.stop_button.setEnabled(False)
+            self.statusBar().showMessage("已请求停止，正在等待设备预检查返回…")
+            return
+        self._pending_stop = False
+        controller = self.controller
+        if controller is None:
+            self._finish_stopped()
+            return
+        controller.request_stop()
+        self._stop_error = None
+        self.start_button.setText("停止中…")
+        self.stop_button.setEnabled(False)
+        task = CallTask(controller.stop)
+        self._stop_task = task
+        self._call_tasks.add(task)
+        task.signals.failed.connect(lambda message, item=task: self._stop_failed(message, item))
+        task.signals.finished.connect(lambda item=task: self._stop_finished(item))
+        try:
+            self.thread_pool.start(task)
+        except Exception as exc:
+            self._stop_failed(f"后台任务未能提交：{exc}", task)
+            self._stop_finished(task)
+
+    def _stop_failed(self, message: str, task: CallTask | None = None) -> None:
+        if task is None or task is self._stop_task:
+            self._stop_error = message
+
+    def _stop_finished(self, task: CallTask) -> None:
+        self._call_tasks.discard(task)
+        if task is not self._stop_task:
+            return
+        self._stop_task = None
+        self.bridge.flush()
+        error, self._stop_error = self._stop_error, None
+        if error or (self.controller is not None and not self.controller.is_quiescent):
+            message = error or "后台操作尚未结束，请等待后重试停止。"
+            self.run_log.appendPlainText(f"停止任务时发生错误：{message}")
+            self.statusBar().showMessage(message, 15000)
+            self.start_button.setText("等待停止")
+            self.start_button.setEnabled(False)
+            self.stop_button.setText("重试停止")
+            self.stop_button.setEnabled(True)
+            return
+        self._finish_stopped()
+
+    def _finish_stopped(self) -> None:
+        self.controller = None
         if self._lease_owner:
             self.connection_manager.release_devices(self._lease_owner)
             self._lease_owner = None
@@ -835,6 +926,7 @@ class LinkageTaskWindow(QMainWindow):
         self.metrics["state"].setText("停止")
         self.start_button.setText("启动联动")
         self.stop_button.setEnabled(False)
+        self.stop_button.setText("停止")
 
     def _prepare_runtime_table(self, records: list[DeviceRecord]) -> None:
         self.device_table.setRowCount(len(records))
@@ -878,12 +970,19 @@ class LinkageTaskWindow(QMainWindow):
                 f"积压 {snapshot.backlog}；设备偏差 {snapshot.skew_ms:.3f} ms"
             )
         running = snapshot.state in {ControllerState.STARTING, ControllerState.RUNNING}
-        self.start_button.setText("运行中" if running else "启动联动")
-        self.stop_button.setEnabled(running or snapshot.state is ControllerState.ERROR)
+        if self._stop_task is not None or (self._pending_stop and self._call_tasks):
+            self.start_button.setText("停止中…" if self._stop_task is not None else "正在取消…")
+            self.stop_button.setEnabled(False)
+        else:
+            self.start_button.setText("运行中" if running else "启动联动")
+            self.stop_button.setEnabled(
+                running or snapshot.state in {ControllerState.ERROR, ControllerState.STOPPING}
+            )
         if snapshot.error and snapshot.error != self._last_error:
             self._last_error = snapshot.error
             self.run_log.appendPlainText(snapshot.error)
-            if self._lease_owner:
+            if (self._lease_owner and not self._call_tasks and self.controller is not None
+                    and self.controller.is_quiescent):
                 self.connection_manager.release_devices(self._lease_owner)
                 self._lease_owner = None
 
@@ -925,5 +1024,19 @@ class LinkageTaskWindow(QMainWindow):
         self.start_button.setEnabled(enabled)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self._stop()
+        if self._call_tasks or (self.controller is not None and not self.controller.is_quiescent):
+            self._stop()
+            self.statusBar().showMessage("后台任务尚未停止，请等待完成后再关闭窗口。", 8000)
+            event.ignore()
+            return
+        if self.controller is not None:
+            try:
+                self.controller.stop(timeout_seconds=0)
+            except Exception as exc:
+                self.statusBar().showMessage(str(exc), 15000)
+                event.ignore()
+                return
+        self.bridge.flush()
+        self._finish_stopped()
+        self.bridge.close()
         super().closeEvent(event)

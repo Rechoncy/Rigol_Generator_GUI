@@ -494,7 +494,7 @@ class SiglentWindow(BaseDeviceWindow):
         def operation():
             if not self.session.is_connected:
                 self.connection_manager.info(self.record)
-                self.connection_manager.connect(self.record)
+                self.connection_manager.connect(self.record, owner=self.owner)
             self.driver.identify()
         self._run(operation)
 
@@ -538,7 +538,7 @@ class SiglentWindow(BaseDeviceWindow):
             if not self.session.is_connected:
                 previous = self.driver.caps
                 self.connection_manager.info(self.record)  # Drop stale manager connection flags.
-                info = self.connection_manager.connect(self.record)
+                info = self.connection_manager.connect(self.record, owner=self.owner)
                 current = capabilities(info.identity)
                 if (not current.known or
                         (previous.model and previous.model != current.model) or

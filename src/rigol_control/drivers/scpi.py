@@ -82,6 +82,7 @@ class ScpiSession:
         # publish cached state under this short lock; never call I/O inside it.
         self._status_lock = Lock()
         self._status = (False, "")
+        self._connection_generation = 0
 
     @property
     def is_connected(self) -> bool:
@@ -92,6 +93,16 @@ class ScpiSession:
     def identity(self) -> str:
         with self._status_lock:
             return self._status[1]
+
+    @property
+    def connection_generation(self) -> int:
+        """Identify a backend lifetime without performing or waiting for I/O."""
+        with self._status_lock:
+            return self._connection_generation
+
+    def _advance_connection_generation(self) -> None:
+        with self._status_lock:
+            self._connection_generation += 1
 
     def _publish_status(self, connected: bool) -> None:
         with self._status_lock:
@@ -104,6 +115,7 @@ class ScpiSession:
                 self._publish_status(True)
                 return self._identity
             self._backend = self._backend_factory(self.resource, self.timeout_ms)
+            self._advance_connection_generation()
             try:
                 self._identity = self._query_locked("*IDN?")
                 self._publish_status(True)
@@ -116,10 +128,10 @@ class ScpiSession:
         with self._lock:
             self._close_locked()
 
-    def write(self, command: str, *, recover: bool = False) -> None:
+    def write(self, command: str, *, recover: bool = False, after_recover: Callable[[], None] | None = None) -> None:
         normalized = self._normalize(command)
         with self._lock:
-            self._write_locked(normalized, recover=recover)
+            self._write_locked(normalized, recover=recover, after_recover=after_recover)
 
     @contextmanager
     def transaction(self):
@@ -127,11 +139,11 @@ class ScpiSession:
         with self._lock:
             yield self
 
-    def write_many(self, commands: Iterable[str], *, recover: bool = False) -> None:
+    def write_many(self, commands: Iterable[str], *, recover: bool = False, after_recover: Callable[[], None] | None = None) -> None:
         normalized = [self._normalize(command) for command in commands]
         with self._lock:
             for command in normalized:
-                self._write_locked(command, recover=recover, batch=True)
+                self._write_locked(command, recover=recover, batch=True, after_recover=after_recover)
 
     def query(self, command: str, *, recover: bool = False) -> str:
         normalized = self._normalize(command)
@@ -159,6 +171,7 @@ class ScpiSession:
         *,
         recover: bool,
         batch: bool = False,
+        after_recover: Callable[[], None] | None = None,
     ) -> None:
         backend = self._require_backend()
         try:
@@ -171,6 +184,8 @@ class ScpiSession:
         if not recover or self.recovery_attempts < 1:
             raise first_error from first_exception
         self._recover_locked(command, first_error)
+        if after_recover is not None:
+            after_recover()
         try:
             self._require_backend().write(command)
         except Exception as retry_exc:
@@ -184,6 +199,7 @@ class ScpiSession:
         # while a successful recovery is still in flight. Failure clears it.
         old_backend, self._backend = self._backend, None
         if old_backend is not None:
+            self._advance_connection_generation()
             try:
                 old_backend.close()
             except Exception:
@@ -191,6 +207,7 @@ class ScpiSession:
         try:
             backend = self._backend_factory(self.resource, self.timeout_ms)
             self._backend = backend
+            self._advance_connection_generation()
             identity = str(backend.query("*IDN?")).strip()
             if not identity:
                 raise ScpiConnectionError("自动重连后 *IDN? 返回为空")
@@ -220,6 +237,7 @@ class ScpiSession:
         backend, self._backend = self._backend, None
         self._identity = ""
         if backend is not None:
+            self._advance_connection_generation()
             try:
                 backend.close()
             except Exception as exc:
@@ -230,6 +248,7 @@ class ScpiSession:
         backend, self._backend = self._backend, None
         self._identity = ""
         if backend is not None:
+            self._advance_connection_generation()
             try:
                 backend.close()
             except Exception:

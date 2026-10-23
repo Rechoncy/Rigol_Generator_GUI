@@ -4,9 +4,10 @@ import ctypes
 import math
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any, Callable
 
 from .dg4000 import StepParameter, StepValue
@@ -347,15 +348,36 @@ class VaunixLmsDevice:
         self._capabilities: VaunixCapabilities | None = None
         self._identity = ""
         self._lock = RLock()
+        self._connection_generation = 0
+        # Connection-card timers must not wait behind USB calls or a whole
+        # multi-parameter point. This lock protects cached fields only.
+        self._status_lock = Lock()
+        self._connection_status = (False, "")
+
+    @contextmanager
+    def transaction(self):
+        """Serialize a related UI operation with task arming and device writes."""
+        with self._lock:
+            yield self
+
+    @property
+    def connection_generation(self) -> int:
+        with self._lock:
+            return self._connection_generation
 
     @property
     def is_connected(self) -> bool:
-        with self._lock:
-            return self._device_id is not None
+        with self._status_lock:
+            return self._connection_status[0]
 
     @property
     def identity(self) -> str:
-        return self._identity
+        with self._status_lock:
+            return self._connection_status[1]
+
+    def _publish_connection_status(self, connected: bool) -> None:
+        with self._status_lock:
+            self._connection_status = (connected, self._identity if connected else "")
 
     @property
     def capabilities(self) -> VaunixCapabilities:
@@ -382,6 +404,7 @@ class VaunixLmsDevice:
                 )
             self._api = api
             self._device_id = descriptor.device_id
+            self._connection_generation += 1
             self._descriptor = descriptor
             try:
                 minimum_frequency = self._get_frequency("fnLMS_GetMinFreqEx")
@@ -408,10 +431,12 @@ class VaunixLmsDevice:
                 f"DLL {format_dll_version(api.dll_version)} "
                 f"(0x{api.dll_version:04X})"
             )
+            self._publish_connection_status(True)
             return self._identity
 
     def disconnect(self) -> None:
         with self._lock:
+            self._publish_connection_status(False)
             if self._device_id is None or self._api is None:
                 return
             try:
@@ -422,11 +447,13 @@ class VaunixLmsDevice:
                 self._clear_connection()
 
     def _clear_connection(self) -> None:
+        self._connection_generation += 1
         self._api = None
         self._device_id = None
         self._descriptor = None
         self._capabilities = None
         self._identity = ""
+        self._publish_connection_status(False)
 
     def _invalidate_connection(self) -> None:
         # Preserve the original USB error even if releasing a stale handle fails.
@@ -484,10 +511,12 @@ class VaunixLmsDevice:
                 f"输出功率必须在 {caps.minimum_power_dbm:g} 至 "
                 f"{caps.maximum_power_dbm:g} dBm 之间"
             )
+        frequency_units = _frequency_units(frequency)
+        power_units = _power_units(power, "输出功率")
         with self._lock:
             self._set("fnLMS_SetUseInternalRef", bool(internal_reference))
-            self._set("fnLMS_SetFrequencyEx", _frequency_units(frequency))
-            self._set("fnLMS_SetPowerLevel", _power_units(power, "输出功率"))
+            self._set("fnLMS_SetFrequencyEx", frequency_units)
+            self._set("fnLMS_SetPowerLevel", power_units)
             self._set("fnLMS_SetRFOn", bool(rf_on))
 
     def configure_sweep(
@@ -518,22 +547,33 @@ class VaunixLmsDevice:
             raise ValueError("向上扫频要求起点小于终点")
         if not upward and start <= end:
             raise ValueError("向下扫频要求起点大于终点")
+        start_units, end_units = _frequency_units(start), _frequency_units(end)
+        if (upward and start_units >= end_units) or (not upward and start_units <= end_units):
+            raise ValueError("扫频起点和终点按 10 Hz 分辨率量化后必须保持扫描方向")
+        if caps.is_blx:
+            step_units = _frequency_units(step)
+            if step_units < 1:
+                raise ValueError("扫频步长按 10 Hz 分辨率量化后必须大于 0")
+            dwell_ms = _milliseconds(dwell_time_ms, "扫频驻留时间", 10)
+            idle_ms = _milliseconds(idle_time_ms, "扫频空闲时间", 0)
+        else:
+            duration_ms = _milliseconds(sweep_time_ms, "扫频时间", 1)
         with self._lock:
-            self._set("fnLMS_SetStartFrequencyEx", _frequency_units(start))
-            self._set("fnLMS_SetEndFrequencyEx", _frequency_units(end))
+            self._set("fnLMS_SetStartFrequencyEx", start_units)
+            self._set("fnLMS_SetEndFrequencyEx", end_units)
             if caps.is_blx:
-                self._set("fnLMS_SetFrequencyStepEx", _frequency_units(step))
-                self._set("fnLMS_SetDwellTime", max(10, int(dwell_time_ms)))
-                self._set("fnLMS_SetIdleTime", max(0, int(idle_time_ms)))
+                self._set("fnLMS_SetFrequencyStepEx", step_units)
+                self._set("fnLMS_SetDwellTime", dwell_ms)
+                self._set("fnLMS_SetIdleTime", idle_ms)
             else:
-                self._set("fnLMS_SetSweepTime", max(1, int(sweep_time_ms)))
+                self._set("fnLMS_SetSweepTime", duration_ms)
             self._set("fnLMS_SetSweepDirection", bool(upward))
             self._set("fnLMS_SetSweepMode", bool(repeating))
             self._set("fnLMS_SetSweepType", bool(bidirectional))
             self._set("fnLMS_SetUseExternalSweepTrigger", bool(external_trigger))
 
     def start_sweep(self, enabled: bool) -> None:
-        self._set("fnLMS_StartSweep", bool(enabled))
+        self._set("fnLMS_StartSweep", bool(enabled), retry_transient=not enabled)
 
     def configure_pulse(
         self,
@@ -616,23 +656,16 @@ class VaunixLmsDevice:
         dwell_time_ms: int,
         idle_time_ms: int,
     ) -> None:
-        normalized = tuple(elements)
-        if not 1 <= len(normalized) <= MAX_SEQUENCE_ENTRIES:
-            raise ValueError("序列必须包含 1 至 50 项")
-        if not 0 <= int(start_index) < len(normalized):
-            raise ValueError("序列起始索引超出当前序列")
         with self._lock:
-            for index, element in enumerate(normalized):
-                self.set_sequence_element(
-                    index,
-                    element.frequency_hz,
-                    element.power_dbm,
-                    element.controls_power,
-                )
-            self._set("fnLMS_SetSequenceStart", int(start_index))
-            self._set("fnLMS_SetSequenceCount", len(normalized))
-            self._set("fnLMS_SetSequenceDwellTime", max(10, int(dwell_time_ms)))
-            self._set("fnLMS_SetSequenceIdleTime", max(0, int(idle_time_ms)))
+            encoded, start, dwell_ms, idle_ms = _sequence_configuration(
+                elements, self.capabilities, start_index, dwell_time_ms, idle_time_ms,
+            )
+            for index, (frequency, power, controls_power) in enumerate(encoded):
+                self._set("fnLMS_SetSequenceElement", index, frequency, power, controls_power)
+            self._set("fnLMS_SetSequenceStart", start)
+            self._set("fnLMS_SetSequenceCount", len(encoded))
+            self._set("fnLMS_SetSequenceDwellTime", dwell_ms)
+            self._set("fnLMS_SetSequenceIdleTime", idle_ms)
 
     def control_sequence(self, control: int) -> None:
         if not self.capabilities.is_blx:
@@ -645,44 +678,36 @@ class VaunixLmsDevice:
             RESUME_SEQUENCE,
         }:
             raise ValueError("无效的序列控制命令")
-        self._set("fnLMS_StartSequence", int(control))
+        self._set("fnLMS_StartSequence", int(control), retry_transient=control == STOP_SEQUENCE)
 
     def save_settings(self) -> None:
-        self._set("fnLMS_SaveSettings")
+        self._set("fnLMS_SaveSettings", retry_transient=False)
 
     def apply_step(self, parameter: StepParameter, channel: int, value: float) -> None:
-        del channel
-        if parameter is StepParameter.FREQUENCY:
-            self.set_frequency_hz(value)
-        elif parameter is StepParameter.AMPLITUDE:
-            self.set_power_dbm(value)
-        else:
-            raise ValueError("Vaunix NI 联动仅支持频率和输出功率")
+        self.apply_steps((StepValue(parameter, channel, value),))
 
     def apply_steps(self, values: list[StepValue] | tuple[StepValue, ...]) -> None:
-        normalized = tuple(values)
-        for item in normalized:
-            if item.parameter is StepParameter.FREQUENCY:
-                frequency = _finite(item.value, "步进频率")
-                if not (
-                    self.capabilities.minimum_frequency_hz
-                    <= frequency
-                    <= self.capabilities.maximum_frequency_hz
-                ):
-                    raise ValueError("步进频率超出设备范围")
-            elif item.parameter is StepParameter.AMPLITUDE:
-                power = validate_power_dbm(item.value, "步进功率")
-                if not (
-                    self.capabilities.minimum_power_dbm
-                    <= power
-                    <= self.capabilities.maximum_power_dbm
-                ):
-                    raise ValueError("步进功率超出设备范围")
-            else:
-                raise ValueError("Vaunix NI 联动仅支持频率和输出功率")
         with self._lock:
-            for item in normalized:
-                self.apply_step(item.parameter, item.channel, item.value)
+            commands = _step_commands(values, self.capabilities)
+            for name, argument in commands:
+                self._set(name, argument)
+
+    def prepare_trigger(self) -> _VaunixTriggerWriter:
+        """Bind this run to one connection without reading or changing output."""
+        with self._lock:
+            self._require()
+            return _VaunixTriggerWriter(self, self._connection_generation)
+
+    def _apply_trigger_steps(self, values, connection_generation: int) -> None:
+        with self._lock:
+            if connection_generation != self._connection_generation:
+                raise VaunixLmsError("Vaunix 连接已经断开或重建，原触发任务已失效；请停止并重新布防")
+            self._require()
+            commands = _step_commands(values, self.capabilities)
+            for name, argument in commands:
+                # An SDK transport error may occur after accepting a setting.
+                # Preserve the incomplete point and stop, never repeat it.
+                self._set(name, argument, retry_transient=False)
 
     def _connected_status(self) -> int:
         status = self._get_int("fnLMS_GetDeviceStatus")
@@ -813,16 +838,17 @@ class VaunixLmsDevice:
             raise VaunixLmsError("Vaunix LMS/BLX 尚未连接")
         return self._api, self._device_id
 
-    def _set(self, function_name: str, *args: Any) -> None:
+    def _set(self, function_name: str, *args: Any, retry_transient: bool = True) -> None:
         with self._lock:
             api, device_id = self._require()
             with api._lock:
-                for attempt in range(_HID_RETRY_ATTEMPTS + 1):
+                attempts = _HID_RETRY_ATTEMPTS if retry_transient else 0
+                for attempt in range(attempts + 1):
                     status = getattr(api.dll, function_name)(device_id, *args)
                     code = _unsigned_32(status)
                     if code == 0:
                         return
-                    if attempt < _HID_RETRY_ATTEMPTS and code in _TRANSIENT_STATUS_CODES:
+                    if attempt < attempts and code in _TRANSIENT_STATUS_CODES:
                         time.sleep(_HID_RETRY_DELAY_SECONDS)
                         continue
                     if code in _CONNECTION_STATUS_CODES:
@@ -869,6 +895,7 @@ class VirtualVaunixLmsDevice:
         self.resource = resource
         self._connected = False
         self._lock = RLock()
+        self._connection_generation = 0
         self._caps = VaunixCapabilities(
             model="BLX-403-VIRTUAL",
             serial_number=4030001,
@@ -928,11 +955,27 @@ class VirtualVaunixLmsDevice:
         return self._caps
 
     def connect(self) -> str:
-        self._connected = True
-        return self.identity
+        with self._lock:
+            if not self._connected:
+                self._connection_generation += 1
+            self._connected = True
+            return self.identity
 
     def disconnect(self) -> None:
-        self._connected = False
+        with self._lock:
+            if self._connected:
+                self._connection_generation += 1
+            self._connected = False
+
+    @contextmanager
+    def transaction(self):
+        with self._lock:
+            yield self
+
+    @property
+    def connection_generation(self) -> int:
+        with self._lock:
+            return self._connection_generation
 
     def _delay(self) -> None:
         if not self._connected:
@@ -989,24 +1032,36 @@ class VirtualVaunixLmsDevice:
         self._delay()
         start = _finite(settings["start_hz"], "扫频起点")
         end = _finite(settings["end_hz"], "扫频终点")
-        step = _finite(settings["step_hz"], "扫频步长")
+        step = _finite(settings["step_hz"], "扫频步长") if self._caps.is_blx else None
         upward = bool(settings["upward"])
         if not self._caps.minimum_frequency_hz <= start <= self._caps.maximum_frequency_hz:
             raise ValueError("扫频起点超出虚拟设备范围")
         if not self._caps.minimum_frequency_hz <= end <= self._caps.maximum_frequency_hz:
             raise ValueError("扫频终点超出虚拟设备范围")
-        if step <= 0:
+        if step is not None and step <= 0:
             raise ValueError("扫频步长必须大于 0")
         if upward and start >= end:
             raise ValueError("向上扫频要求起点小于终点")
         if not upward and start <= end:
             raise ValueError("向下扫频要求起点大于终点")
-        self.sweep_start_hz = round(start / 10.0) * 10.0
-        self.sweep_end_hz = round(end / 10.0) * 10.0
-        self.sweep_step_hz = round(step / 10.0) * 10.0
-        self.sweep_time_ms = max(1, int(settings["sweep_time_ms"]))
-        self.dwell_time_ms = max(10, int(settings["dwell_time_ms"]))
-        self.idle_time_ms = max(0, int(settings["idle_time_ms"]))
+        start_units, end_units = _frequency_units(start), _frequency_units(end)
+        if (upward and start_units >= end_units) or (not upward and start_units <= end_units):
+            raise ValueError("扫频起点和终点按 10 Hz 分辨率量化后必须保持扫描方向")
+        if self._caps.is_blx:
+            step_units = _frequency_units(step)
+            if step_units < 1:
+                raise ValueError("扫频步长按 10 Hz 分辨率量化后必须大于 0")
+            dwell_ms = _milliseconds(settings["dwell_time_ms"], "扫频驻留时间", 10)
+            idle_ms = _milliseconds(settings["idle_time_ms"], "扫频空闲时间", 0)
+        else:
+            duration_ms = _milliseconds(settings["sweep_time_ms"], "扫频时间", 1)
+        self.sweep_start_hz = start_units * 10.0
+        self.sweep_end_hz = end_units * 10.0
+        if self._caps.is_blx:
+            self.sweep_step_hz = step_units * 10.0
+            self.dwell_time_ms, self.idle_time_ms = dwell_ms, idle_ms
+        else:
+            self.sweep_time_ms = duration_ms
         self.sweep_up = upward
         self.sweep_repeat = bool(settings["repeating"])
         self.sweep_bidirectional = bool(settings["bidirectional"])
@@ -1076,30 +1131,14 @@ class VirtualVaunixLmsDevice:
         idle_time_ms: int,
     ) -> None:
         self._delay()
-        normalized = tuple(elements)
-        if not 1 <= len(normalized) <= MAX_SEQUENCE_ENTRIES:
-            raise ValueError("序列必须包含 1 至 50 项")
-        if not 0 <= int(start_index) < len(normalized):
-            raise ValueError("序列起始索引超出当前序列")
-        checked = []
-        for element in normalized:
-            frequency = _finite(element.frequency_hz, "序列频率")
-            power = validate_power_dbm(element.power_dbm, "序列功率")
-            if not self._caps.minimum_frequency_hz <= frequency <= self._caps.maximum_frequency_hz:
-                raise ValueError("序列频率超出虚拟设备范围")
-            if not self._caps.minimum_power_dbm <= power <= self._caps.maximum_power_dbm:
-                raise ValueError("序列功率超出虚拟设备范围")
-            checked.append(
-                VaunixSequenceElement(
-                    round(frequency / 10.0) * 10.0,
-                    round(power / POWER_RESOLUTION_DB) * POWER_RESOLUTION_DB,
-                    bool(element.controls_power),
-                )
-            )
-        self.sequence = checked
-        self.sequence_start = int(start_index)
-        self.sequence_dwell_ms = max(10, int(dwell_time_ms))
-        self.sequence_idle_ms = max(0, int(idle_time_ms))
+        encoded, start, dwell_ms, idle_ms = _sequence_configuration(
+            elements, self._caps, start_index, dwell_time_ms, idle_time_ms,
+        )
+        self.sequence = [VaunixSequenceElement(frequency * 10.0, power * POWER_ENCODING_DB, controls)
+                         for frequency, power, controls in encoded]
+        self.sequence_start = start
+        self.sequence_dwell_ms = dwell_ms
+        self.sequence_idle_ms = idle_ms
 
     def control_sequence(self, control: int) -> None:
         self._delay()
@@ -1118,38 +1157,28 @@ class VirtualVaunixLmsDevice:
         self.saved_settings_count += 1
 
     def apply_step(self, parameter: StepParameter, channel: int, value: float) -> None:
-        del channel
-        if parameter is StepParameter.FREQUENCY:
-            self.set_frequency_hz(value)
-        elif parameter is StepParameter.AMPLITUDE:
-            self.set_power_dbm(value)
-        else:
-            raise ValueError("Vaunix NI 联动仅支持频率和输出功率")
+        self.apply_steps((StepValue(parameter, channel, value),))
 
     def apply_steps(self, values: list[StepValue] | tuple[StepValue, ...]) -> None:
-        normalized = tuple(values)
-        for item in normalized:
-            if item.parameter is StepParameter.FREQUENCY:
-                frequency = _finite(item.value, "步进频率")
-                if not (
-                    self._caps.minimum_frequency_hz
-                    <= frequency
-                    <= self._caps.maximum_frequency_hz
-                ):
-                    raise ValueError("步进频率超出虚拟设备范围")
-            elif item.parameter is StepParameter.AMPLITUDE:
-                power = validate_power_dbm(item.value, "步进功率")
-                if not (
-                    self._caps.minimum_power_dbm
-                    <= power
-                    <= self._caps.maximum_power_dbm
-                ):
-                    raise ValueError("步进功率超出虚拟设备范围")
-            else:
-                raise ValueError("Vaunix NI 联动仅支持频率和输出功率")
         with self._lock:
-            for item in normalized:
-                self.apply_step(item.parameter, item.channel, item.value)
+            commands = _step_commands(values, self._caps)
+            for name, argument in commands:
+                if name == "fnLMS_SetFrequencyEx":
+                    self.set_frequency_hz(argument * 10.0)
+                else:
+                    self.set_power_dbm(argument * POWER_ENCODING_DB)
+
+    def prepare_trigger(self) -> _VaunixTriggerWriter:
+        with self._lock:
+            if not self._connected:
+                raise VaunixLmsError("虚拟 Vaunix 尚未连接")
+            return _VaunixTriggerWriter(self, self._connection_generation)
+
+    def _apply_trigger_steps(self, values, connection_generation: int) -> None:
+        with self._lock:
+            if connection_generation != self._connection_generation:
+                raise VaunixLmsError("Vaunix 连接已经断开或重建，原触发任务已失效；请停止并重新布防")
+            self.apply_steps(values)
 
     def output_snapshot(self) -> VaunixOutputSnapshot:
         with self._lock:
@@ -1207,6 +1236,74 @@ class VirtualVaunixLmsDevice:
             sequence=tuple(self.sequence),
             device_status=status,
         )
+
+
+class _VaunixTriggerWriter:
+    def __init__(self, device, connection_generation: int) -> None:
+        self.device = device
+        self.connection_generation = connection_generation
+
+    def apply_steps(self, values) -> None:
+        self.device._apply_trigger_steps(values, self.connection_generation)
+
+
+def _milliseconds(value: int, label: str, minimum: int) -> int:
+    try:
+        result = max(minimum, int(value))
+    except (ValueError, OverflowError, TypeError) as exc:
+        raise ValueError(f"{label}必须是有限毫秒数") from exc
+    if result > 0x7FFFFFFF:
+        raise ValueError(f"{label}超出 SDK 32 位整数范围")
+    return result
+
+
+def _sequence_configuration(elements, capabilities, start_index, dwell_time_ms, idle_time_ms):
+    if not capabilities.is_blx:
+        raise VaunixLmsError("序列功能仅适用于 BLX 型号")
+    normalized = tuple(elements)
+    if not 1 <= len(normalized) <= MAX_SEQUENCE_ENTRIES:
+        raise ValueError("序列必须包含 1 至 50 项")
+    try:
+        start = int(start_index)
+    except (ValueError, OverflowError, TypeError) as exc:
+        raise ValueError("序列起始索引必须为有限整数") from exc
+    if not 0 <= start < len(normalized):
+        raise ValueError("序列起始索引超出当前序列")
+    dwell_ms = _milliseconds(dwell_time_ms, "序列驻留时间", 10)
+    idle_ms = _milliseconds(idle_time_ms, "序列空闲时间", 0)
+    encoded = []
+    for element in normalized:
+        frequency = _finite(element.frequency_hz, "序列频率")
+        power = validate_power_dbm(element.power_dbm, "序列功率")
+        if not capabilities.minimum_frequency_hz <= frequency <= capabilities.maximum_frequency_hz:
+            raise ValueError("序列频率超出设备范围")
+        if not capabilities.minimum_power_dbm <= power <= capabilities.maximum_power_dbm:
+            raise ValueError("序列功率超出设备范围")
+        encoded.append((_frequency_units(frequency), _power_units(power, "序列功率"), bool(element.controls_power)))
+    return tuple(encoded), start, dwell_ms, idle_ms
+
+
+def _step_commands(values, capabilities: VaunixCapabilities) -> tuple[tuple[str, int], ...]:
+    normalized = tuple(values)
+    if not normalized:
+        raise ValueError("Vaunix 步进点至少需要一个参数")
+    commands = []
+    for item in normalized:
+        if item.channel != 1:
+            raise ValueError("Vaunix 只有一个射频输出，步进通道必须为 1")
+        if item.parameter is StepParameter.FREQUENCY:
+            frequency = _finite(item.value, "步进频率")
+            if not capabilities.minimum_frequency_hz <= frequency <= capabilities.maximum_frequency_hz:
+                raise ValueError("步进频率超出设备范围")
+            commands.append(("fnLMS_SetFrequencyEx", _frequency_units(frequency)))
+        elif item.parameter is StepParameter.AMPLITUDE:
+            power = validate_power_dbm(item.value, "步进功率")
+            if not capabilities.minimum_power_dbm <= power <= capabilities.maximum_power_dbm:
+                raise ValueError("步进功率超出设备范围")
+            commands.append(("fnLMS_SetPowerLevel", _power_units(power, "步进功率")))
+        else:
+            raise ValueError("Vaunix NI 联动仅支持频率和输出功率")
+    return tuple(commands)
 
 
 def _serial_from_resource(resource: str) -> int:

@@ -32,7 +32,7 @@ from ..repository import (
     DeviceRepository,
     DuplicateDeviceError,
 )
-from ..services import DeviceProbeService, ProbeResult
+from ..services import DeviceProbeService, ProbeResult, ProbeState
 from ..virtual_lab import VIRTUAL_DG2_RESOURCE, VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
 from .device_windows import BaseDeviceWindow, create_device_window
 from .dialogs import DeviceDialog
@@ -56,6 +56,7 @@ class DeviceCenterWindow(QMainWindow):
         self.card_widgets: list[QWidget] = []
         self.probe_tasks: dict[str, ProbeTask] = {}
         self.connection_tasks: dict[str, CallTask] = {}
+        self._pending_connections: set[str] = set()
         self.open_windows: dict[str, BaseDeviceWindow] = {}
         self.linkage_window: LinkageTaskWindow | None = None
         self._last_columns = 0
@@ -225,6 +226,8 @@ class DeviceCenterWindow(QMainWindow):
             raise RuntimeError("设备连接或探测尚未完成，请稍后再导入")
         if self.connection_manager.active_leases():
             raise RuntimeError("请先停止扫描、触发和模拟采集，再导入配置")
+        if self.connection_manager.active_transitions():
+            raise RuntimeError("设备正在连接或断开，请等待完成后再导入配置")
         windows = [*self.open_windows.values()]
         if self.linkage_window is not None:
             windows.append(self.linkage_window)
@@ -394,7 +397,9 @@ class DeviceCenterWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "无法创建虚拟实验室", str(exc))
             return
-        self.reload_devices()
+        # The following connection tasks already read identity. Do not open a
+        # competing probe session before these newly created records connect.
+        self.reload_devices(probe=False)
         for device_id in virtual_ids:
             QTimer.singleShot(0, lambda key=device_id: self.connect_device(key))
 
@@ -434,6 +439,12 @@ class DeviceCenterWindow(QMainWindow):
             if existing is not None and (
                 existing.kind is not record.kind or existing.resource != record.resource
             ):
+                self.repository._ensure_unique(record, self.repository.list())
+                window = self.open_windows.get(record.id)
+                if window and not window.close():
+                    self.statusBar().showMessage("设备窗口仍在停止后台任务，原设备记录已保留，请稍后重试编辑。", 10000)
+                    return
+                self.open_windows.pop(record.id, None)
                 self.connection_manager.forget(existing)
             self.repository.save(record)
         except (DuplicateDeviceError, RuntimeError, ValueError) as exc:
@@ -454,9 +465,12 @@ class DeviceCenterWindow(QMainWindow):
         )
         if answer is not QMessageBox.StandardButton.Yes:
             return
-        window = self.open_windows.pop(device_id, None)
-        if window:
-            window.close()
+        self._pending_connections.discard(device_id)
+        window = self.open_windows.get(device_id)
+        if window and not window.close():
+            self.statusBar().showMessage("设备窗口仍在停止后台任务，请等待完成后重试删除。", 10000)
+            return
+        self.open_windows.pop(device_id, None)
         try:
             self.connection_manager.forget(record)
             self.repository.delete(device_id)
@@ -510,10 +524,16 @@ class DeviceCenterWindow(QMainWindow):
             card.status.setText("● 检测中")
             card.status.style().unpolish(card.status)
             card.status.style().polish(card.status)
-            task = ProbeTask(card.record, self.probe_service)
+            task = ProbeTask(card.record, self)
             task.signals.completed.connect(self._probe_completed)
             self.probe_tasks[device_id] = task
             self.thread_pool.start(task)
+
+    def probe(self, record: DeviceRecord) -> ProbeResult:
+        try:
+            return self.connection_manager.probe(record, self.probe_service)
+        except RuntimeError as exc:
+            return ProbeResult(ProbeState.UNCHECKED, str(exc))
 
     def _probe_completed(self, device_id: str, result: ProbeResult) -> None:
         self.probe_tasks.pop(device_id, None)
@@ -523,11 +543,19 @@ class DeviceCenterWindow(QMainWindow):
                 card.set_connection_state(True)
             else:
                 card.set_probe_result(result)
+        if device_id in self._pending_connections:
+            self._pending_connections.discard(device_id)
+            self.connect_device(device_id)
 
     def connect_device(self, device_id: str) -> None:
         record = self.repository.get(device_id)
         card = self.cards.get(device_id)
         if record is None or card is None or device_id in self.connection_tasks:
+            return
+        if device_id in self.probe_tasks:
+            self._pending_connections.add(device_id)
+            card.set_connection_state(False, busy=True)
+            self.statusBar().showMessage("正在读取设备状态，完成后将继续连接…", 4000)
             return
         card.set_connection_state(False, busy=True)
         task = CallTask(lambda: self.connection_manager.connect(record))
@@ -568,9 +596,10 @@ class DeviceCenterWindow(QMainWindow):
     def _connection_failed(self, device_id: str, message: str) -> None:
         card = self.cards.get(device_id)
         if card:
-            card.set_connection_state(False)
-            card.status.setObjectName("StatusOffline")
-            card.status.setText("● 连接失败")
+            connected = self.connection_manager.is_connected(card.record)
+            card.set_connection_state(connected)
+            card.status.setObjectName("StatusOnline" if connected else "StatusOffline")
+            card.status.setText("● 已连接" if connected else "● 连接失败")
             card.status.setToolTip(message)
             card.status.style().unpolish(card.status)
             card.status.style().polish(card.status)
@@ -597,6 +626,7 @@ class DeviceCenterWindow(QMainWindow):
                 update_ni_devices(records)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._pending_connections.clear()
         if self._transfer_task is not None:
             event.ignore()
             return
@@ -607,7 +637,16 @@ class DeviceCenterWindow(QMainWindow):
                 event.ignore()
                 return
         if self.linkage_window is not None:
-            self.linkage_window.close()
+            if not self.linkage_window.close():
+                self.connection_timer.start()
+                event.ignore()
+                return
             self.linkage_window = None
-        self.connection_manager.close_all()
+        try:
+            self.connection_manager.close_all()
+        except RuntimeError as exc:
+            self.connection_timer.start()
+            self.statusBar().showMessage(str(exc), 15000)
+            event.ignore()
+            return
         super().closeEvent(event)

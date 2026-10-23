@@ -41,7 +41,7 @@ from ..analog import (
     AnalogAcquisitionState,
     AnalogAcquisitionUpdate,
 )
-from ..connections import ConnectionInfo, DeviceConnectionManager
+from ..connections import ConnectionInfo, DeviceBusyError, DeviceConnectionManager
 from ..drivers.dg4000 import (
     BasicWaveform,
     DG4000Capabilities,
@@ -69,8 +69,9 @@ from ..scan import (
 from ..sequence import MAX_SCAN_POINTS
 from ..services import DeviceProbeService, ProbeResult, ProbeState
 from ..trigger import ControllerState, TriggerSnapshot, TriggerStepController
-from ..units import default_unit, from_base, to_base, unit_spec, unit_specs
+from ..units import default_unit, from_base, roundtrip_number, to_base, unit_spec, unit_specs
 from ..virtual_lab import is_virtual_resource
+from .snapshot_bridge import SnapshotBridge
 from .waveform import WaveformPlot
 from .widgets import CallTask, metric_card
 
@@ -307,8 +308,8 @@ class ScanAxisControls:
     active_unit: str
 
 
-class TriggerBridge(QObject):
-    updated = pyqtSignal(object)
+class TriggerBridge(SnapshotBridge):
+    pass
 
 
 class AnalogBridge(QObject):
@@ -404,7 +405,11 @@ class BaseDeviceWindow(QMainWindow):
             task.signals.succeeded.connect(on_success)
         task.signals.failed.connect(on_error or self._show_hardware_error)
         task.signals.finished.connect(lambda item=task: self._call_tasks.discard(item))
-        self.thread_pool.start(task)
+        try:
+            self.thread_pool.start(task)
+        except Exception as exc:
+            self._call_tasks.discard(task)
+            (on_error or self._show_hardware_error)(f"后台任务未能提交：{exc}")
 
     def _show_hardware_error(self, message: str) -> None:
         QMessageBox.warning(self, "仪器操作失败", message)
@@ -653,6 +658,10 @@ class DG4000Window(BaseDeviceWindow):
             else DG4000Driver(ScpiSession(record.resource))
         )
         self.controller: TriggerStepController | None = None
+        self._trigger_stop_in_progress = False
+        self._trigger_start_task: CallTask | None = None
+        self._trigger_start_error: str | None = None
+        self._trigger_pending_stop = False
         self._trigger_lease_owner = f"single-trigger:{record.id}"
         self.trigger_bridge = TriggerBridge()
         self.trigger_bridge.updated.connect(self._trigger_updated)
@@ -673,6 +682,7 @@ class DG4000Window(BaseDeviceWindow):
             ("存储与系统", self._system_page),
         ]
         super().__init__(record, navigation, parameter_repository)
+        self.trigger_bridge.setParent(self)
         if self.driver.is_connected:
             identity = (
                 self.connection_manager.info(record).identity
@@ -680,6 +690,53 @@ class DG4000Window(BaseDeviceWindow):
                 else self.driver.identify()
             )
             self._connected(identity)
+
+    def _require_manual_access(self) -> None:
+        if self.connection_manager is not None:
+            self.connection_manager.assert_manual_access(self.record)
+        owner = (
+            self.connection_manager.lease_owner(self.record.id)
+            if self.connection_manager is not None
+            else None
+        )
+        running = self.controller is not None and (
+            self._trigger_start_task is not None
+            or self.controller.snapshot().state in {
+                ControllerState.STARTING,
+                ControllerState.RUNNING,
+                ControllerState.STOPPING,
+            }
+            or not self.controller.is_quiescent
+        )
+        if owner is not None or running:
+            raise DeviceBusyError("DG4000 正在执行触发/联动任务，请先停止任务再执行手动操作。")
+
+    def submit(
+        self,
+        operation: Callable[[], Any],
+        *,
+        on_success: Callable[[Any], None] | None = None,
+        on_error: Callable[[str], None] | None = None,
+        allow_during_scan: bool = False,
+    ) -> None:
+        if allow_during_scan:
+            super().submit(operation, on_success=on_success, on_error=on_error)
+            return
+        try:
+            self._require_manual_access()
+        except DeviceBusyError as exc:
+            (on_error or self._show_hardware_error)(str(exc))
+            return
+
+        def guarded_operation() -> Any:
+            # The lease may have been acquired after this UI task was queued.
+            # Share the SCPI lock with scan preflight so a pending global/raw
+            # command cannot slip between the isolation check and arming.
+            with self.driver.session.transaction():
+                self._require_manual_access()
+                return operation()
+
+        super().submit(guarded_operation, on_success=on_success, on_error=on_error)
 
     def sync_connection_state(self) -> None:
         """Reflect connection changes made from the device center."""
@@ -1122,12 +1179,17 @@ class DG4000Window(BaseDeviceWindow):
         )
 
     def _sweep_burst_page(self) -> QWidget:
-        page, layout = page_shell("扫频与脉冲串", "配置仪器原生扫频、标记频率、触发源及脉冲串周期。")
+        page, layout = page_shell("扫频与脉冲串", "分别选择目标通道，配置仪器原生扫频、触发源及脉冲串周期。")
         tabs = QTabWidget()
         sweep = QWidget()
         sweep_layout = QVBoxLayout(sweep)
         sweep_panel, sweep_form_layout = panel("扫频设置")
         form = QFormLayout()
+        self.sweep_channel = QComboBox()
+        self.sweep_channel.addItem("CH1", 1)
+        self.sweep_channel.addItem("CH2", 2)
+        self._set_parameter_key(self.sweep_channel, "dg4000.sweep.channel")
+        form.addRow("输出通道", self.sweep_channel)
         mode = QComboBox()
         mode.addItems(["线性", "对数", "步进"])
         sweep_start = unit_value_spin(
@@ -1156,9 +1218,13 @@ class DG4000Window(BaseDeviceWindow):
         form.addRow("触发源", trigger)
         sweep_form_layout.addLayout(form)
         sweep_apply = QPushButton("应用并启用扫频")
+        self.sweep_apply_button = sweep_apply
         sweep_apply.setObjectName("PrimaryButton")
         sweep_apply.clicked.connect(
-            lambda: self._apply_sweep(mode, sweep_start, sweep_stop, sweep_time, trigger)
+            lambda: self._apply_sweep(
+                mode, sweep_start, sweep_stop, sweep_time, trigger,
+                channel=self.sweep_channel.currentData(),
+            )
         )
         sweep_form_layout.addWidget(sweep_apply, alignment=Qt.AlignmentFlag.AlignLeft)
         sweep_layout.addWidget(sweep_panel)
@@ -1169,6 +1235,11 @@ class DG4000Window(BaseDeviceWindow):
         burst_layout = QVBoxLayout(burst)
         burst_panel, burst_form_layout = panel("脉冲串设置")
         burst_form = QFormLayout()
+        self.burst_channel = QComboBox()
+        self.burst_channel.addItem("CH1", 1)
+        self.burst_channel.addItem("CH2", 2)
+        self._set_parameter_key(self.burst_channel, "dg4000.burst.channel")
+        burst_form.addRow("输出通道", self.burst_channel)
         burst_mode = QComboBox()
         burst_mode.addItems(["N 周期", "无限", "门控"])
         count = QSpinBox()
@@ -1182,9 +1253,13 @@ class DG4000Window(BaseDeviceWindow):
         burst_form.addRow("起始相位", burst_phase)
         burst_form_layout.addLayout(burst_form)
         burst_apply = QPushButton("应用并启用脉冲串")
+        self.burst_apply_button = burst_apply
         burst_apply.setObjectName("PrimaryButton")
         burst_apply.clicked.connect(
-            lambda: self._apply_burst(burst_mode, count, burst_period, burst_phase)
+            lambda: self._apply_burst(
+                burst_mode, count, burst_period, burst_phase,
+                channel=self.burst_channel.currentData(),
+            )
         )
         burst_form_layout.addWidget(burst_apply, alignment=Qt.AlignmentFlag.AlignLeft)
         burst_layout.addWidget(burst_panel)
@@ -1200,6 +1275,8 @@ class DG4000Window(BaseDeviceWindow):
         stop: UnitValueWidget,
         duration: UnitValueWidget,
         trigger: QComboBox,
+        *,
+        channel: int = 1,
     ) -> None:
         if not self._require_connection():
             return
@@ -1220,16 +1297,16 @@ class DG4000Window(BaseDeviceWindow):
         spacing = {"线性": "LIN", "对数": "LOG", "步进": "STEP"}[mode.currentText()]
         source = {"内部": "INT", "外部": "EXT", "手动": "MAN"}[trigger.currentText()]
         commands = [
-            f":SOUR1:FREQ:START {start.value():.12g}",
-            f":SOUR1:FREQ:STOP {stop.value():.12g}",
-            f":SOUR1:SWE:TIME {duration.value():.12g}",
-            f":SOUR1:SWE:SPAC {spacing}",
-            f":SOUR1:SWE:TRIG:SOUR {source}",
-            ":SOUR1:SWE:STAT ON",
+            f":SOUR{channel}:FREQ:START {start.value():.12g}",
+            f":SOUR{channel}:FREQ:STOP {stop.value():.12g}",
+            f":SOUR{channel}:SWE:TIME {duration.value():.12g}",
+            f":SOUR{channel}:SWE:SPAC {spacing}",
+            f":SOUR{channel}:SWE:TRIG:SOUR {source}",
+            f":SOUR{channel}:SWE:STAT ON",
         ]
         self.submit(
-            lambda: self.driver.write_settings(commands),
-            on_success=lambda _=None: self.statusBar().showMessage("CH1 扫频已启用", 4000),
+            lambda: self.driver.write_channel_settings(channel, commands),
+            on_success=lambda _=None: self.statusBar().showMessage(f"CH{channel} 扫频已启用", 4000),
         )
 
     def _apply_burst(
@@ -1238,20 +1315,22 @@ class DG4000Window(BaseDeviceWindow):
         count: QSpinBox,
         period: UnitValueWidget,
         phase: UnitValueWidget,
+        *,
+        channel: int = 1,
     ) -> None:
         if not self._require_connection():
             return
         mode_word = {"N 周期": "TRIG", "无限": "INF", "门控": "GAT"}[mode.currentText()]
         commands = [
-            f":SOUR1:BURS:MODE {mode_word}",
-            f":SOUR1:BURS:NCYC {count.value()}",
-            f":SOUR1:BURS:INT:PER {period.value():.12g}",
-            f":SOUR1:BURS:PHAS {phase.value():.12g}",
-            ":SOUR1:BURS ON",
+            f":SOUR{channel}:BURS:MODE {mode_word}",
+            f":SOUR{channel}:BURS:NCYC {count.value()}",
+            f":SOUR{channel}:BURS:INT:PER {period.value():.12g}",
+            f":SOUR{channel}:BURS:PHAS {phase.value():.12g}",
+            f":SOUR{channel}:BURS ON",
         ]
         self.submit(
-            lambda: self.driver.write_settings(commands),
-            on_success=lambda _=None: self.statusBar().showMessage("CH1 脉冲串已启用", 4000),
+            lambda: self.driver.write_channel_settings(channel, commands),
+            on_success=lambda _=None: self.statusBar().showMessage(f"CH{channel} 脉冲串已启用", 4000),
         )
 
     def _trigger_step_page(self) -> QWidget:
@@ -1846,7 +1925,7 @@ class DG4000Window(BaseDeviceWindow):
         number.setFlags(number.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.step_table.setItem(row, 0, number)
         for column, value in enumerate(display_values, start=1):
-            self.step_table.setItem(row, column, QTableWidgetItem(f"{value:.12g}"))
+            self.step_table.setItem(row, column, QTableWidgetItem(roundtrip_number(value)))
         self.step_table.setItem(row, len(display_values) + 1, QTableWidgetItem(note))
 
     def _add_manual_scan_point(self) -> None:
@@ -1867,6 +1946,12 @@ class DG4000Window(BaseDeviceWindow):
         self._append_scan_point_row(values, "")
 
     def _start_trigger(self) -> None:
+        if self.controller is not None:
+            self.statusBar().showMessage("请先完成当前任务的停止，再启动新的触发任务。", 5000)
+            return
+        if self._call_tasks:
+            self.statusBar().showMessage("请等待设备后台操作完成，再启动触发任务。", 5000)
+            return
         if not self._require_connection():
             return
         ni_id = self.ni_source.currentData()
@@ -1924,19 +2009,56 @@ class DG4000Window(BaseDeviceWindow):
                 self.connection_manager.release_devices(self._trigger_lease_owner)
             QMessageBox.warning(self, "无法创建触发任务", str(exc))
             return
-        controller.add_callback(self.trigger_bridge.updated.emit)
+        controller.add_callback(self.trigger_bridge.begin_session())
         self.controller = controller
         self._last_trigger_error = None
         self.trigger_start.setEnabled(False)
         self.trigger_start.setText("启动中…")
         self._set_scan_editing_enabled(False)
-        self.submit(
-            controller.start,
-            on_success=lambda _=None: self.statusBar().showMessage("NI 触发步进已启动", 4000),
-            on_error=self._trigger_start_failed,
+        self._trigger_pending_stop = False
+        self._trigger_start_error = None
+        task = CallTask(controller.start)
+        self._trigger_start_task = task
+        self._call_tasks.add(task)
+        task.signals.failed.connect(
+            lambda message, item=task, source=controller: self._trigger_start_task_failed(source, item, message)
         )
+        task.signals.finished.connect(
+            lambda item=task, source=controller: self._trigger_start_finished(source, item)
+        )
+        self.trigger_stop.setEnabled(True)
+        try:
+            self.thread_pool.start(task)
+        except Exception as exc:
+            self._trigger_start_task_failed(controller, task, f"后台任务未能提交：{exc}")
+            self._trigger_start_finished(controller, task)
+
+    def _trigger_start_task_failed(self, controller: TriggerStepController, task: CallTask, message: str) -> None:
+        if controller is self.controller and task is self._trigger_start_task:
+            self._trigger_start_error = message
+
+    def _trigger_start_finished(self, controller: TriggerStepController, task: CallTask) -> None:
+        self._call_tasks.discard(task)
+        if task is not self._trigger_start_task:
+            return
+        self._trigger_start_task = None
+        error, self._trigger_start_error = self._trigger_start_error, None
+        if controller is not self.controller:
+            return
+        self.trigger_bridge.flush()
+        if self._trigger_pending_stop:
+            self._trigger_pending_stop = False
+            self._stop_trigger()
+        elif error:
+            self._trigger_start_failed(error)
+        else:
+            self.statusBar().showMessage("NI 触发步进已启动", 4000)
 
     def _trigger_start_failed(self, message: str) -> None:
+        self.trigger_bridge.flush()
+        if self.controller is not None and not self.controller.is_quiescent:
+            self._trigger_stop_failed(message)
+            return
         if self.connection_manager is not None:
             self.connection_manager.release_devices(self._trigger_lease_owner)
         self.controller = None
@@ -1948,20 +2070,48 @@ class DG4000Window(BaseDeviceWindow):
 
     def _stop_trigger(self) -> None:
         controller = self.controller
-        if controller is None:
+        if controller is None or self._trigger_stop_in_progress:
             return
+        controller.request_stop()
+        if self._trigger_start_task is not None:
+            self._trigger_pending_stop = True
+            self.trigger_stop.setEnabled(False)
+            self.statusBar().showMessage("已请求停止，正在等待启动任务返回…", 8000)
+            return
+        self._trigger_stop_in_progress = True
         self.trigger_stop.setEnabled(False)
 
         def stopped(_result: Any = None) -> None:
+            if controller is not self.controller:
+                return
+            self.trigger_bridge.flush()
+            if not controller.is_quiescent:
+                self._trigger_stop_failed("后台操作尚未结束，请等待后重试停止。")
+                return
+            self._trigger_stop_in_progress = False
             if self.connection_manager is not None:
                 self.connection_manager.release_devices(self._trigger_lease_owner)
             self.controller = None
             self.trigger_start.setText("启动联动")
             self.trigger_start.setEnabled(True)
+            self.trigger_stop.setEnabled(False)
+            self.trigger_stop.setText("停止")
             self._set_scan_editing_enabled(True)
             self.statusBar().showMessage("触发步进已停止", 4000)
 
-        self.submit(controller.stop, on_success=stopped)
+        self.submit(controller.stop, on_success=stopped,
+                    on_error=lambda message: self._trigger_stop_failed(message)
+                    if controller is self.controller else None,
+                    allow_during_scan=True)
+
+    def _trigger_stop_failed(self, message: str) -> None:
+        self._trigger_stop_in_progress = False
+        self.trigger_bridge.flush()
+        self.trigger_start.setEnabled(False)
+        self.trigger_start.setText("等待停止")
+        self.trigger_stop.setText("重试停止")
+        self.trigger_stop.setEnabled(self.controller is not None)
+        self.statusBar().showMessage(message, 15000)
 
     def _trigger_updated(self, snapshot: TriggerSnapshot) -> None:
         self.trigger_metrics["received"].setText(str(snapshot.received_count))
@@ -1990,7 +2140,10 @@ class DG4000Window(BaseDeviceWindow):
                 )
             self.trigger_metrics["current"].setToolTip("\n".join(details))
         running = snapshot.state in {ControllerState.STARTING, ControllerState.RUNNING}
-        self.trigger_stop.setEnabled(running or snapshot.state is ControllerState.ERROR)
+        self.trigger_stop.setEnabled(
+            self.controller is not None and not self._trigger_stop_in_progress and not self._trigger_pending_stop
+            and (running or snapshot.state in {ControllerState.ERROR, ControllerState.STOPPING})
+        )
         if snapshot.state is ControllerState.RUNNING:
             self.trigger_start.setText("运行中")
         elif snapshot.state is ControllerState.ERROR:
@@ -1998,7 +2151,8 @@ class DG4000Window(BaseDeviceWindow):
         if snapshot.error and snapshot.error != self._last_trigger_error:
             self._last_trigger_error = snapshot.error
             self.statusBar().showMessage(snapshot.error, 10000)
-            if self.connection_manager is not None:
+            if (self.connection_manager is not None and self.controller is not None
+                    and self.controller.is_quiescent and not self._call_tasks):
                 self.connection_manager.release_devices(self._trigger_lease_owner)
 
     def _clear_trigger_display(self) -> None:
@@ -2303,11 +2457,22 @@ class DG4000Window(BaseDeviceWindow):
         self.submit(operation, on_success=completed)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._call_tasks or (self.controller is not None and not self.controller.is_quiescent):
+            self._stop_trigger()
+            self.statusBar().showMessage("后台任务尚未停止，请等待完成后再关闭窗口。", 8000)
+            event.ignore()
+            return
         if hasattr(self, "virtual_generator_timer"):
             self.virtual_generator_timer.stop()
         if self.controller is not None:
-            self.controller.stop()
+            try:
+                self.controller.stop(timeout_seconds=0)
+            except Exception as exc:
+                self._trigger_stop_failed(str(exc))
+                event.ignore()
+                return
             self.controller = None
+        self.trigger_bridge.close()
         if self.connection_manager is not None:
             self.connection_manager.release_devices(self._trigger_lease_owner)
         if self.driver.is_connected and self.connection_manager is None:
@@ -3367,6 +3532,28 @@ class NIDeviceWindow(BaseDeviceWindow):
 
 
 class GenericScpiWindow(BaseDeviceWindow):
+    def submit(
+        self,
+        operation: Callable[[], Any],
+        *,
+        on_success: Callable[[Any], None] | None = None,
+        on_error: Callable[[str], None] | None = None,
+    ) -> None:
+        try:
+            if self.connection_manager is not None:
+                self.connection_manager.assert_manual_access(self.record)
+        except DeviceBusyError as exc:
+            (on_error or self._show_hardware_error)(str(exc))
+            return
+
+        def guarded_operation() -> Any:
+            with self.session.transaction():
+                if self.connection_manager is not None:
+                    self.connection_manager.assert_manual_access(self.record)
+                return operation()
+
+        super().submit(guarded_operation, on_success=on_success, on_error=on_error)
+
     def __init__(
         self,
         record: DeviceRecord,
@@ -3502,6 +3689,10 @@ class GenericScpiWindow(BaseDeviceWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._call_tasks:
+            self.statusBar().showMessage("后台命令尚未完成，请等待返回后再关闭窗口。", 8000)
+            event.ignore()
+            return
         if self.session.is_connected and self.connection_manager is None:
             try:
                 self.session.disconnect()

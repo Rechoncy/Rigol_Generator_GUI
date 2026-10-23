@@ -1,4 +1,5 @@
 import csv
+from contextlib import nullcontext
 import os
 import tempfile
 import time
@@ -418,6 +419,9 @@ class UiSmokeTests(unittest.TestCase):
             def write_many(self, commands, *, recover=False):
                 del commands, recover
 
+            def transaction(self):
+                return nullcontext(self)
+
         manager = DeviceConnectionManager(session_factory=FakeSession)
         home = DeviceCenterWindow(self.repository, manager)
         home.connect_device(self.dg.id)
@@ -702,6 +706,7 @@ class UiSmokeTests(unittest.TestCase):
         window._generate_trigger_table(show_message=False)
         self.assertEqual(window.trigger_table.rowCount(), 2)
         self.assertEqual(window.trigger_ni.currentData(), ni.id)
+        self.assertTrue(self._wait_for(lambda: not window._call_tasks))
         window._start_trigger()
         self.assertTrue(
             self._wait_for(
@@ -748,6 +753,7 @@ class UiSmokeTests(unittest.TestCase):
             manager,
             parameter_repository=parameter_repository,
         )
+        self.assertTrue(self._wait_for(lambda: not window._call_tasks))
         self.assertAlmostEqual(window.output_power.singleStep(), 0.5)
         self.assertAlmostEqual(window.trigger_power_start.singleStep(), 0.5)
         self.assertAlmostEqual(window.trigger_power_step.singleStep(), 0.5)
@@ -958,6 +964,7 @@ class UiSmokeTests(unittest.TestCase):
         log_path = Path(window.log_path.text().split("：", 1)[1])
         self.assertTrue(log_path.exists())
         window._stop()
+        self.assertTrue(self._wait_for(lambda: not window._call_tasks))
         self.assertIsNone(manager.lease_owner(generators[0].id))
         saved_task_id = window._current_task_id
         window.close()

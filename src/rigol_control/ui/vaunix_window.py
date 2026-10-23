@@ -3,7 +3,7 @@ from __future__ import annotations
 from itertools import product
 from typing import Any, Callable
 
-from PyQt6.QtCore import QObject, Qt, pyqtSignal
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..connections import DeviceConnectionManager
+from ..connections import DeviceBusyError, DeviceConnectionManager
 from ..drivers.dg4000 import StepParameter, StepValue
 from ..drivers.ni_counter import NIDaqEdgeCounter
 from ..drivers.vaunix_lms import (
@@ -49,6 +49,7 @@ from ..repository import DeviceParameterRepository
 from ..scan import ScanPoint
 from ..sequence import MAX_SCAN_POINTS, linear_scan_points
 from ..trigger import ControllerState, TriggerSnapshot, TriggerStepController
+from ..units import roundtrip_number
 from ..virtual_lab import is_virtual_resource
 from .device_windows import (
     BaseDeviceWindow,
@@ -58,10 +59,12 @@ from .device_windows import (
     panel,
     unit_value_spin,
 )
+from .snapshot_bridge import SnapshotBridge
+from .widgets import CallTask
 
 
-class VaunixTriggerBridge(QObject):
-    updated = pyqtSignal(object)
+class VaunixTriggerBridge(SnapshotBridge):
+    pass
 
 
 class VaunixLmsWindow(BaseDeviceWindow):
@@ -91,6 +94,10 @@ class VaunixLmsWindow(BaseDeviceWindow):
         self._ni_signature: tuple[tuple[str, str, str, bool], ...] = ()
         self._lease_owner = f"vaunix-trigger:{record.id}"
         self.controller: TriggerStepController | None = None
+        self._trigger_stop_in_progress = False
+        self._trigger_start_task: CallTask | None = None
+        self._trigger_start_error: str | None = None
+        self._trigger_pending_stop = False
         self.trigger_bridge = VaunixTriggerBridge()
         self.trigger_bridge.updated.connect(self._trigger_updated)
         self._last_trigger_error: str | None = None
@@ -104,8 +111,42 @@ class VaunixLmsWindow(BaseDeviceWindow):
             ("状态与存储", self._system_page),
         ]
         super().__init__(record, navigation, parameter_repository)
+        self.trigger_bridge.setParent(self)
         if self.device.is_connected:
             self._connected(self.device.identity)
+
+    def _require_manual_access(self) -> None:
+        if self.connection_manager is not None:
+            self.connection_manager.assert_manual_access(self.record)
+        owner = (self.connection_manager.lease_owner(self.record.id)
+                 if self.connection_manager is not None else None)
+        busy = self.controller is not None and (
+            self._trigger_start_task is not None
+            or self.controller.snapshot().state in {
+                ControllerState.STARTING, ControllerState.RUNNING, ControllerState.STOPPING,
+            }
+            or not self.controller.is_quiescent
+        )
+        if owner is not None or busy:
+            raise DeviceBusyError("Vaunix 正在执行触发任务，请先停止任务再执行手动操作。")
+
+    def submit(self, operation: Callable[[], Any], *, on_success: Callable[[Any], None] | None = None,
+               on_error: Callable[[str], None] | None = None, allow_during_scan: bool = False) -> None:
+        if allow_during_scan:
+            super().submit(operation, on_success=on_success, on_error=on_error)
+            return
+        try:
+            self._require_manual_access()
+        except DeviceBusyError as exc:
+            (on_error or self._show_hardware_error)(str(exc))
+            return
+
+        def guarded_operation() -> Any:
+            with self.device.transaction():
+                self._require_manual_access()
+                return operation()
+
+        super().submit(guarded_operation, on_success=on_success, on_error=on_error)
 
     def _overview_page(self) -> QWidget:
         page, layout = page_shell(
@@ -659,7 +700,12 @@ class VaunixLmsWindow(BaseDeviceWindow):
     def _refresh_metrics_only(self) -> None:
         if not self.device.is_connected:
             return
-        self.submit(self.device.output_snapshot, on_success=self._metrics_refreshed)
+        try:
+            self._require_manual_access()
+        except DeviceBusyError:
+            return
+        self.submit(self.device.output_snapshot, on_success=self._metrics_refreshed,
+                    on_error=lambda message: self.statusBar().showMessage(message, 8000))
 
     def _metrics_refreshed(self, snapshot: VaunixSnapshot | VaunixOutputSnapshot) -> None:
         self.overview_metrics["frequency"].setText(
@@ -842,8 +888,8 @@ class VaunixLmsWindow(BaseDeviceWindow):
         number = QTableWidgetItem(str(row))
         number.setFlags(number.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.sequence_table.setItem(row, 0, number)
-        self.sequence_table.setItem(row, 1, QTableWidgetItem(f"{frequency_mhz:.12g}"))
-        self.sequence_table.setItem(row, 2, QTableWidgetItem(f"{power_dbm:.12g}"))
+        self.sequence_table.setItem(row, 1, QTableWidgetItem(roundtrip_number(frequency_mhz)))
+        self.sequence_table.setItem(row, 2, QTableWidgetItem(roundtrip_number(power_dbm)))
         enabled = QTableWidgetItem("是" if controls_power else "否")
         enabled.setFlags(enabled.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         enabled.setCheckState(
@@ -1063,12 +1109,12 @@ class VaunixLmsWindow(BaseDeviceWindow):
             self.trigger_table.setItem(
                 row,
                 1,
-                QTableWidgetItem("" if frequency is None else f"{frequency:.12g}"),
+                QTableWidgetItem("" if frequency is None else roundtrip_number(frequency)),
             )
             self.trigger_table.setItem(
                 row,
                 2,
-                QTableWidgetItem("" if power is None else f"{power:.12g}"),
+                QTableWidgetItem("" if power is None else roundtrip_number(power)),
             )
             self.trigger_table.setItem(
                 row,
@@ -1116,6 +1162,12 @@ class VaunixLmsWindow(BaseDeviceWindow):
         return tuple(points)
 
     def _start_trigger(self) -> None:
+        if self.controller is not None:
+            self.statusBar().showMessage("请先完成当前任务的停止，再启动新的触发任务。", 5000)
+            return
+        if self._call_tasks:
+            self.statusBar().showMessage("请等待设备后台操作完成，再启动触发任务。", 5000)
+            return
         if not self._require_connected():
             return
         ni_id = self.trigger_ni.currentData()
@@ -1155,17 +1207,55 @@ class VaunixLmsWindow(BaseDeviceWindow):
                 self.connection_manager.release_devices(self._lease_owner)
             QMessageBox.warning(self, "无法启动联动", str(exc))
             return
-        controller.add_callback(self.trigger_bridge.updated.emit)
+        controller.add_callback(self.trigger_bridge.begin_session())
         self.controller = controller
         self.trigger_start_button.setEnabled(False)
         self.trigger_start_button.setText("启动中…")
         self.trigger_stop_button.setEnabled(False)
-        self.submit(
-            controller.start,
-            on_error=self._trigger_start_failed,
+        self._trigger_pending_stop = False
+        self._trigger_start_error = None
+        task = CallTask(controller.start)
+        self._trigger_start_task = task
+        self._call_tasks.add(task)
+        task.signals.failed.connect(
+            lambda message, item=task, source=controller: self._trigger_start_task_failed(source, item, message)
         )
+        task.signals.finished.connect(
+            lambda item=task, source=controller: self._trigger_start_finished(source, item)
+        )
+        self.trigger_stop_button.setEnabled(True)
+        try:
+            self.thread_pool.start(task)
+        except Exception as exc:
+            self._trigger_start_task_failed(controller, task, f"后台任务未能提交：{exc}")
+            self._trigger_start_finished(controller, task)
+
+    def _trigger_start_task_failed(self, controller: TriggerStepController, task: CallTask, message: str) -> None:
+        if controller is self.controller and task is self._trigger_start_task:
+            self._trigger_start_error = message
+
+    def _trigger_start_finished(self, controller: TriggerStepController, task: CallTask) -> None:
+        self._call_tasks.discard(task)
+        if task is not self._trigger_start_task:
+            return
+        self._trigger_start_task = None
+        error, self._trigger_start_error = self._trigger_start_error, None
+        if controller is not self.controller:
+            return
+        self.trigger_bridge.flush()
+        if self._trigger_pending_stop:
+            self._trigger_pending_stop = False
+            self._stop_trigger()
+        elif error:
+            self._trigger_start_failed(error)
+        else:
+            self.statusBar().showMessage("NI 触发步进已启动", 4000)
 
     def _trigger_start_failed(self, message: str) -> None:
+        self.trigger_bridge.flush()
+        if self.controller is not None and not self.controller.is_quiescent:
+            self._trigger_stop_failed(message)
+            return
         if self.connection_manager is not None:
             self.connection_manager.release_devices(self._lease_owner)
         self.controller = None
@@ -1174,19 +1264,47 @@ class VaunixLmsWindow(BaseDeviceWindow):
         self._show_hardware_error(message)
 
     def _stop_trigger(self) -> None:
-        if self.controller is None:
+        if self.controller is None or self._trigger_stop_in_progress:
             return
+        self.controller.request_stop()
+        if self._trigger_start_task is not None:
+            self._trigger_pending_stop = True
+            self.trigger_stop_button.setEnabled(False)
+            self.statusBar().showMessage("已请求停止，正在等待启动任务返回…", 8000)
+            return
+        self._trigger_stop_in_progress = True
         self.trigger_stop_button.setEnabled(False)
-        self.submit(self.controller.stop, on_success=self._trigger_stopped)
+        controller = self.controller
+        self.submit(controller.stop,
+                    on_success=lambda result: self._trigger_stopped(result)
+                    if controller is self.controller else None,
+                    on_error=lambda message: self._trigger_stop_failed(message)
+                    if controller is self.controller else None,
+                    allow_during_scan=True)
 
     def _trigger_stopped(self, _result: Any = None) -> None:
+        self.trigger_bridge.flush()
+        if self.controller is not None and not self.controller.is_quiescent:
+            self._trigger_stop_failed("后台操作尚未结束，请等待后重试停止。")
+            return
+        self._trigger_stop_in_progress = False
         if self.connection_manager is not None:
             self.connection_manager.release_devices(self._lease_owner)
         self.controller = None
         self.trigger_start_button.setText("启动联动")
         self.trigger_start_button.setEnabled(True)
         self.trigger_stop_button.setEnabled(False)
+        self.trigger_stop_button.setText("停止")
         self.trigger_ni.setEnabled(bool(self.ni_devices))
+
+    def _trigger_stop_failed(self, message: str) -> None:
+        self._trigger_stop_in_progress = False
+        self.trigger_bridge.flush()
+        self.trigger_start_button.setEnabled(False)
+        self.trigger_start_button.setText("等待停止")
+        self.trigger_stop_button.setText("重试停止")
+        self.trigger_stop_button.setEnabled(self.controller is not None)
+        self.statusBar().showMessage(message, 15000)
 
     def _trigger_updated(self, snapshot: TriggerSnapshot) -> None:
         self.trigger_metrics["received"].setText(str(snapshot.received_count))
@@ -1205,14 +1323,18 @@ class VaunixLmsWindow(BaseDeviceWindow):
                 f"#{snapshot.current_index + 1} · " + " · ".join(details)
             )
         running = snapshot.state in {ControllerState.STARTING, ControllerState.RUNNING}
-        self.trigger_stop_button.setEnabled(running)
+        self.trigger_stop_button.setEnabled(
+            self.controller is not None and not self._trigger_stop_in_progress and not self._trigger_pending_stop
+            and (running or snapshot.state in {ControllerState.ERROR, ControllerState.STOPPING})
+        )
         if snapshot.state is ControllerState.RUNNING:
             self.trigger_start_button.setText("运行中")
             self.trigger_ni.setEnabled(False)
         elif snapshot.state is ControllerState.ERROR:
             self.trigger_start_button.setText("任务错误")
-            self.trigger_start_button.setEnabled(True)
-            if self.connection_manager is not None:
+            self.trigger_start_button.setEnabled(False)
+            if (self.connection_manager is not None and self.controller is not None
+                    and self.controller.is_quiescent and not self._call_tasks):
                 self.connection_manager.release_devices(self._lease_owner)
         if snapshot.error and snapshot.error != self._last_trigger_error:
             self._last_trigger_error = snapshot.error
@@ -1286,12 +1408,20 @@ class VaunixLmsWindow(BaseDeviceWindow):
                     self.trigger_table.setItem(row, column, QTableWidgetItem(str(value)))
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._call_tasks or (self.controller is not None and not self.controller.is_quiescent):
+            self._stop_trigger()
+            self.statusBar().showMessage("后台任务尚未停止，请等待完成后再关闭窗口。", 8000)
+            event.ignore()
+            return
         if self.controller is not None:
             try:
-                self.controller.stop()
-            except Exception:
-                pass
+                self.controller.stop(timeout_seconds=0)
+            except Exception as exc:
+                self._trigger_stop_failed(str(exc))
+                event.ignore()
+                return
             self.controller = None
+        self.trigger_bridge.close()
         if self.connection_manager is not None:
             self.connection_manager.release_devices(self._lease_owner)
         elif self.device.is_connected:

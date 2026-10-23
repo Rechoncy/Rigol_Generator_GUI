@@ -1,0 +1,106 @@
+name: Windows checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python 3.13 / Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+      PYTHONUNBUFFERED: "1"
+      CI_DIAGNOSTICS_DIR: ${{ runner.temp }}/rigol-gui-ci
+      RIGOL_GUI_DATA_DIR: ${{ runner.temp }}/rigol-gui-ci-data
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            release/requirements-build.txt
+            pyproject.toml
+
+      - name: Check source test inputs
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:CI_DIAGNOSTICS_DIR | Out-Null
+          python -VV 2>&1 | Tee-Object -FilePath "$env:CI_DIAGNOSTICS_DIR/python.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "import struct, sys; assert sys.platform == 'win32' and struct.calcsize('P') == 8, 'Windows x64 Python is required'"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($path in @('Lab Control Center.exe', 'vnx_fmsynth.dll')) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required tracked test input is missing: $path"
+            }
+          }
+
+      # Use the release's Python 3.13 dependency lock without running PyInstaller.
+      - name: Install application and instrument dependencies
+        id: install
+        timeout-minutes: 8
+        run: |
+          python -m pip install --disable-pip-version-check -r release/requirements-build.txt 2>&1 | Tee-Object -FilePath "$env:CI_DIAGNOSTICS_DIR/install.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install --disable-pip-version-check --no-build-isolation --no-deps --editable ".[instrument]" 2>&1 | Tee-Object -FilePath "$env:CI_DIAGNOSTICS_DIR/install.log" -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check 2>&1 | Tee-Object -FilePath "$env:CI_DIAGNOSTICS_DIR/install.log" -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip freeze | Set-Content -Encoding utf8 "$env:CI_DIAGNOSTICS_DIR/dependencies.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run complete regression suite
+        timeout-minutes: 8
+        run: |
+          python -X faulthandler -m unittest discover -s tests -v 2>&1 | Tee-Object -FilePath "$env:CI_DIAGNOSTICS_DIR/unittest.log"
+          exit $LASTEXITCODE
+
+      - name: Run source application self-test with virtual devices
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          python -X faulthandler tools/frozen_entry.py --bundle-self-test "$env:CI_DIAGNOSTICS_DIR/source-self-test.json" 2>&1 | Tee-Object -FilePath "$env:CI_DIAGNOSTICS_DIR/self-test.log"
+          exit $LASTEXITCODE
+
+      - name: Collect failure diagnostics
+        if: failure()
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:CI_DIAGNOSTICS_DIR | Out-Null
+          $logRoots = @(
+            (Join-Path $env:LOCALAPPDATA 'RigolGeneratorControl/logs'),
+            (Join-Path $env:GITHUB_WORKSPACE 'logs')
+          )
+          if ($env:pythonLocation) {
+            $logRoots += Join-Path $env:pythonLocation 'logs'
+          }
+          for ($index = 0; $index -lt $logRoots.Count; $index++) {
+            if (Test-Path -LiteralPath $logRoots[$index] -PathType Container) {
+              Copy-Item -LiteralPath $logRoots[$index] -Destination "$env:CI_DIAGNOSTICS_DIR/runtime-logs-$index" -Recurse -Force
+            }
+          }
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-check-diagnostics-${{ github.run_attempt }}
+          path: ${{ env.CI_DIAGNOSTICS_DIR }}/
+          if-no-files-found: warn
+          retention-days: 14

@@ -5,8 +5,9 @@ import math
 import random
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Event, RLock
+from threading import Event, Lock, RLock
 
 from .drivers.ni_analog import AnalogInputBlock, AnalogInputConfig
 
@@ -52,6 +53,7 @@ class VirtualGenerator:
         self.connected = False
         self.scpi_delay_ms = 5
         self.channels = {1: self._default_channel(), 2: self._default_channel()}
+        self.amplitude_units = {1: "VPP", 2: "VPP"}
         self.values: dict[str, str] = {}
         self.commands: deque[str] = deque(maxlen=500)
         self.lock = RLock()
@@ -75,6 +77,7 @@ class VirtualGenerator:
     def reset(self) -> None:
         with self.lock:
             self.channels = {1: self._default_channel(), 2: self._default_channel()}
+            self.amplitude_units = {1: "VPP", 2: "VPP"}
             self.values.clear()
             self.commands.append("*RST")
 
@@ -88,15 +91,17 @@ class VirtualGenerator:
             upper = normalized.upper()
             if upper == "*RST":
                 self.channels = {1: self._default_channel(), 2: self._default_channel()}
+                self.amplitude_units = {1: "VPP", 2: "VPP"}
                 self.values.clear()
                 return
             if upper in {"*CLS", "*WAI"}:
                 return
-            command_path, _, raw_value = normalized.partition(" ")
-            path = command_path.strip().upper().lstrip(":")
-            value = raw_value.strip()
-            self.values[path] = value
-            self._apply_known(path, value)
+            for part in normalized.split(";"):
+                command_path, _, raw_value = part.partition(" ")
+                path = command_path.strip().upper().lstrip(":")
+                value = raw_value.strip()
+                self.values[path] = value
+                self._apply_known(path, value)
 
     def query(self, command: str) -> str:
         normalized = command.strip()
@@ -113,6 +118,8 @@ class VirtualGenerator:
             if upper in {":SYST:ERR?", "SYST:ERR?"}:
                 return '0,"No error"'
             path = upper.rstrip("?").lstrip(":")
+            if path in {"COUP:STAT", "COUP:STATE", "COUPLING:STATE"}:
+                return self.values.get("COUP:STAT", "FREQ:OFF,PHASE:OFF,AMPL:OFF")
             known = self._query_known(path)
             if known is not None:
                 return known
@@ -130,15 +137,33 @@ class VirtualGenerator:
         source_match = re.fullmatch(r"SOUR(?:CE)?(1|2):(.+)", path)
         if not source_match:
             return
-        channel = self.channels[int(source_match.group(1))]
+        channel_index = int(source_match.group(1))
+        channel = self.channels[channel_index]
         suffix = source_match.group(2)
         numeric = self._number(value)
         if suffix in {"FUNC", "FUNCTION", "FUNCTION:SHAPE"}:
             channel["function"] = value.upper()
         elif suffix in {"FREQ", "FREQUENCY", "FREQUENCY:FIXED"} and numeric is not None:
             channel["frequency_hz"] = numeric
-        elif suffix in {"VOLT", "VOLTAGE", "VOLTAGE:LEVEL:IMMEDIATE:AMPLITUDE"} and numeric is not None:
-            channel["amplitude_vpp"] = numeric
+        elif suffix in {"VOLT:UNIT", "VOLTAGE:UNIT"}:
+            if value.upper() not in {"VPP", "VRMS", "DBM"}:
+                raise ValueError("不支持的虚拟 DG 幅度单位")
+            self.amplitude_units[channel_index] = value.upper()
+        elif suffix in {"VOLT", "VOLTAGE", "VOLTAGE:LEVEL:IMMEDIATE:AMPLITUDE"}:
+            match = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?)\s*(MVPP|VPP|MVRMS|VRMS|DBM)?", value.upper())
+            if match:
+                amplitude = float(match.group(1))
+                unit = match.group(2) or self.amplitude_units[channel_index]
+                if unit in {"MVPP", "MVRMS"}:
+                    amplitude *= .001
+                if unit in {"VRMS", "MVRMS"}:
+                    amplitude *= 2 * math.sqrt(2)
+                elif unit == "DBM":
+                    load = channel["load_ohms"]
+                    if load is None:
+                        raise ValueError("高阻负载不支持 dBm")
+                    amplitude = 2 * math.sqrt(2 * float(load) * .001 * 10 ** (amplitude / 10))
+                channel["amplitude_vpp"] = amplitude
         elif suffix in {"VOLT:OFFS", "VOLTAGE:OFFSET", "VOLTAGE:LEVEL:IMMEDIATE:OFFSET"} and numeric is not None:
             channel["offset_v"] = numeric
         elif suffix in {"PHAS", "PHASE", "PHASE:ADJUST"} and numeric is not None:
@@ -165,6 +190,8 @@ class VirtualGenerator:
             return None
         channel = self.channels[int(source_match.group(1))]
         suffix = source_match.group(2)
+        if suffix in {"VOLT:UNIT", "VOLTAGE:UNIT"}:
+            return self.amplitude_units[int(source_match.group(1))]
         mapping = {
             "FUNC": "function",
             "FUNCTION": "function",
@@ -232,36 +259,70 @@ class VirtualScpiSession:
         self._generator = generator
         self._identity = ""
         self._lock = RLock()
+        self._connection_generation = 0
+        self._status_lock = Lock()
+        self._status = (False, "")
 
     @property
     def is_connected(self) -> bool:
-        with self._lock:
-            return self._generator.connected
+        with self._status_lock:
+            return self._status[0]
 
     @property
     def identity(self) -> str:
+        with self._status_lock:
+            return self._status[1]
+
+    def _publish_status(self, connected: bool) -> None:
+        # Match the real session: manager/card status reads must never acquire
+        # the I/O lock held by a manual transaction that checks manager leases.
+        with self._status_lock:
+            self._status = (connected, self._identity if connected else "")
+
+    @property
+    def connection_generation(self) -> int:
         with self._lock:
-            return self._identity
+            return self._connection_generation
 
     def connect(self) -> str:
         with self._lock:
+            previously_connected = self._generator.connected
+            if not previously_connected:
+                self._connection_generation += 1
             self._generator.connected = True
-            self._identity = self._generator.query("*IDN?")
+            try:
+                self._identity = self._generator.query("*IDN?")
+            except Exception:
+                if not previously_connected:
+                    self._generator.connected = False
+                    self._connection_generation += 1
+                    self._identity = ""
+                    self._publish_status(False)
+                raise
+            self._publish_status(True)
             return self._identity
 
     def disconnect(self) -> None:
         with self._lock:
+            if self._generator.connected:
+                self._connection_generation += 1
             self._generator.connected = False
             self._identity = ""
+            self._publish_status(False)
 
-    def write(self, command: str, *, recover: bool = False) -> None:
-        del recover
+    def write(self, command: str, *, recover: bool = False, after_recover=None) -> None:
+        del recover, after_recover
         with self._lock:
             self._require_connection()
             self._generator.write(command)
 
-    def write_many(self, commands, *, recover: bool = False) -> None:
-        del recover
+    @contextmanager
+    def transaction(self):
+        with self._lock:
+            yield self
+
+    def write_many(self, commands, *, recover: bool = False, after_recover=None) -> None:
+        del recover, after_recover
         with self._lock:
             self._require_connection()
             for command in commands:
@@ -274,6 +335,7 @@ class VirtualScpiSession:
             result = self._generator.query(command)
             if command.strip().upper() == "*IDN?":
                 self._identity = result
+                self._publish_status(True)
             return result
 
     def _require_connection(self) -> None:
