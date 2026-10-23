@@ -53,7 +53,7 @@ from ..drivers.dg4000 import (
     output_load_value,
     validate_dg4000_frequency,
 )
-from ..drivers.ni_analog import AnalogInputConfig, NIDaqAnalogInput
+from ..drivers.ni_analog import AnalogInputBlock, AnalogInputConfig, NIDaqAnalogInput
 from ..drivers.ni_counter import NIDaqEdgeCounter
 from ..drivers.scpi import ScpiSession
 from ..models import DeviceKind, DeviceRecord
@@ -2497,8 +2497,17 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.counter_read_pending = False
         self.analog_controller: AnalogAcquisitionController | None = None
         self.analog_bridge = AnalogBridge()
-        self.analog_bridge.updated.connect(self._analog_updated)
+        self.analog_bridge.updated.connect(self._analog_published)
         self._last_analog_error: str | None = None
+        self._analog_start_pending = False
+        self._analog_cancel_start = False
+        self._analog_stop_pending = False
+        self._analog_revision = 0
+        self._analog_last_plot_end = 0
+        self._analog_plot_revision_floor = 0
+        self._counter_stop_pending = False
+        self._counter_start_pending = False
+        self._counter_stop_requested = False
         self._ui_connected = False
         navigation = [
             ("总览", self._overview_page),
@@ -2509,6 +2518,9 @@ class NIDeviceWindow(BaseDeviceWindow):
             ("诊断", self._diagnostics_page),
         ]
         super().__init__(record, navigation, parameter_repository)
+        self._analog_lifecycle_timer = QTimer(self)
+        self._analog_lifecycle_timer.setInterval(100)
+        self._analog_lifecycle_timer.timeout.connect(self._poll_analog_lifecycle)
         if self.connection_manager is not None and self.connection_manager.is_connected(record):
             self._ni_connected(self.connection_manager.info(record))
 
@@ -2678,22 +2690,22 @@ class NIDeviceWindow(BaseDeviceWindow):
         self._show_hardware_error(message)
 
     def _disconnect_ni(self) -> None:
-        self.ni_disconnect_button.setEnabled(False)
-        if self.test_counter is not None:
+        if self._analog_busy() or self.test_counter is not None or self._call_tasks:
+            self._stop_analog_input()
             self._stop_ni_counter()
-        if self.analog_controller is not None and self.analog_controller.snapshot().state in {
-            AnalogAcquisitionState.STARTING,
-            AnalogAcquisitionState.RUNNING,
-            AnalogAcquisitionState.ERROR,
-        }:
-            self.analog_controller.stop()
-            self._analog_stopped()
+            self.statusBar().showMessage("后台任务尚未停止，确认停止后可断开连接。", 8000)
+            return
+        self.ni_disconnect_button.setEnabled(False)
         if self.connection_manager is None:
             self._ni_disconnected()
             return
         self.submit(
             lambda: self.connection_manager.disconnect(self.record),
             on_success=self._ni_disconnected,
+            on_error=lambda message: (
+                self.ni_disconnect_button.setEnabled(True),
+                self._show_hardware_error(message),
+            ),
         )
 
     def _ni_disconnected(self, _result: Any = None) -> None:
@@ -3084,6 +3096,9 @@ class NIDeviceWindow(BaseDeviceWindow):
         return config
 
     def _start_analog_input(self) -> None:
+        if self._analog_busy():
+            self.statusBar().showMessage("上次采集尚未停止，请先停止并确认清理完成。", 8000)
+            return
         connected = (
             self.connection_manager.is_connected(self.record)
             if self.connection_manager is not None
@@ -3140,9 +3155,17 @@ class NIDeviceWindow(BaseDeviceWindow):
             QMessageBox.warning(self, "采集配置无效", str(exc))
             return
 
-        controller.add_callback(self.analog_bridge.updated.emit)
+        controller.add_callback(
+            lambda update, source=controller: self.analog_bridge.updated.emit((source, update))
+        )
         self.analog_controller = controller
         self._last_analog_error = None
+        self._analog_revision = 0
+        self._analog_last_plot_end = 0
+        self._analog_plot_revision_floor = 0
+        self._analog_start_pending = True
+        self._analog_cancel_start = False
+        self._analog_lifecycle_timer.start()
         self.ai_plot.clear()
         self.ai_start.setEnabled(False)
         self.ai_start.setText("启动中…")
@@ -3152,39 +3175,101 @@ class NIDeviceWindow(BaseDeviceWindow):
             f"连续文本记录：{stream_path}" if stream_path else "连续文本记录：已关闭"
         )
         self._set_analog_config_enabled(False)
+        def start_if_requested() -> None:
+            if not self._analog_cancel_start:
+                controller.start()
+
         self.submit(
-            controller.start,
-            on_success=lambda _=None: self.statusBar().showMessage(
-                "NI 模拟输入采集已启动", 4000
-            ),
+            start_if_requested,
+            on_success=self._analog_started,
             on_error=self._analog_start_failed,
         )
 
+    def _analog_started(self, _result: Any = None) -> None:
+        self._analog_start_pending = False
+        if self._analog_cancel_start:
+            self._stop_analog_input()
+        self._refresh_analog_controls()
+        self._release_ni_lease_if_idle()
+        if self.analog_controller and self.analog_controller.snapshot().state is AnalogAcquisitionState.RUNNING:
+            self.statusBar().showMessage("NI 模拟输入采集已启动", 4000)
+
     def _analog_start_failed(self, message: str) -> None:
-        self.ai_start.setText("开始采集")
-        self.ai_start.setEnabled(True)
-        self.ai_stop.setEnabled(False)
-        self._set_analog_config_enabled(True)
+        self._analog_start_pending = False
+        if self._analog_cancel_start:
+            self._stop_analog_input()
+        self._refresh_analog_controls()
         self._release_ni_lease_if_idle()
         self._show_hardware_error(message)
 
+    def _analog_busy(self) -> bool:
+        return bool(
+            self._analog_start_pending
+            or self._analog_stop_pending
+            or (self.analog_controller is not None and self.analog_controller.is_running)
+        )
+
+    def _refresh_analog_controls(self) -> None:
+        controller = self.analog_controller
+        snapshot = controller.snapshot() if controller is not None else None
+        busy = self._analog_busy()
+        self.ai_start.setEnabled(not busy)
+        self.ai_start.setText(
+            "停止中…" if self._analog_stop_pending else
+            "启动中…" if self._analog_start_pending else
+            "采集中" if snapshot and snapshot.state is AnalogAcquisitionState.RUNNING else
+            "等待停止确认" if busy else "开始采集"
+        )
+        self.ai_stop.setText("重试停止" if snapshot and snapshot.cleanup_pending else "停止采集")
+        self.ai_stop.setEnabled(bool(controller and busy and not self._analog_stop_pending and not self._analog_start_pending))
+        self._set_analog_config_enabled(not busy)
+        self.ai_save_csv.setEnabled(bool(snapshot and snapshot.retained_samples > 0 and not busy))
+
+    def _poll_analog_lifecycle(self) -> None:
+        if self.analog_controller is not None:
+            self._analog_updated(AnalogAcquisitionUpdate(self.analog_controller.snapshot()))
+        if not self._analog_busy():
+            self._analog_lifecycle_timer.stop()
+
     def _stop_analog_input(self) -> None:
         controller = self.analog_controller
-        if controller is None:
+        if controller is None or self._analog_stop_pending:
             return
-        self.ai_stop.setEnabled(False)
-        self.submit(controller.stop, on_success=self._analog_stopped)
+        if not self._analog_busy():
+            return
+        self._analog_cancel_start = True
+        controller.request_stop()
+        if self._analog_start_pending:
+            # A queued start may not have entered the controller yet. Never
+            # let a faster stop worker finish first and leave that start live.
+            self.ai_stop.setEnabled(False)
+            return
+        self._analog_stop_pending = True
+        self._refresh_analog_controls()
+        self.submit(
+            controller.stop,
+            on_success=self._analog_stopped,
+            on_error=self._analog_stop_failed,
+        )
+
+    def _analog_stop_failed(self, message: str) -> None:
+        self._analog_stop_pending = False
+        self._refresh_analog_controls()
+        self._release_ni_lease_if_idle()
+        self.statusBar().showMessage(f"模拟采集停止未确认：{message}；请重试停止。", 10000)
 
     def _analog_stopped(self, _result: Any = None) -> None:
-        self.ai_start.setText("开始采集")
-        self.ai_start.setEnabled(True)
-        self.ai_stop.setEnabled(False)
-        self._set_analog_config_enabled(True)
+        self._analog_stop_pending = False
+        self._refresh_analog_controls()
         controller = self.analog_controller
-        has_data = bool(controller and controller.snapshot().retained_samples)
-        self.ai_save_csv.setEnabled(has_data)
         self._release_ni_lease_if_idle()
         snapshot = controller.snapshot() if controller else None
+        if self._analog_busy():
+            self.statusBar().showMessage("模拟采集清理尚未完成，请重试停止。", 8000)
+            return
+        if snapshot and snapshot.error:
+            self.statusBar().showMessage(f"采集已停止并完成清理：{snapshot.error}", 10000)
+            return
         if snapshot and snapshot.stream_path:
             self.statusBar().showMessage(
                 f"连续采集已停止，{snapshot.saved_samples} 点/通道已写入 {snapshot.stream_path}",
@@ -3193,10 +3278,31 @@ class NIDeviceWindow(BaseDeviceWindow):
         else:
             self.statusBar().showMessage("NI 模拟输入采集已停止，内存数据仍保留", 4000)
 
+    def _analog_published(self, payload: tuple[AnalogAcquisitionController, AnalogAcquisitionUpdate]) -> None:
+        controller, update = payload
+        if controller is self.analog_controller:
+            self._analog_updated(update)
+
     def _analog_updated(self, update: AnalogAcquisitionUpdate) -> None:
         snapshot = update.snapshot
-        if update.block is not None:
-            self.ai_plot.append_block(update.block)
+        # A timer may have displayed a newer snapshot before the queued block
+        # signal arrives. Order data by sample index, independently of states.
+        block = update.block
+        if block is not None and snapshot.revision > self._analog_plot_revision_floor:
+            end = block.first_sample_index + block.sample_count
+            if end > self._analog_last_plot_end:
+                first = max(block.first_sample_index, self._analog_last_plot_end)
+                offset = first - block.first_sample_index
+                if offset:
+                    block = AnalogInputBlock(
+                        block.channel_names, block.sample_rate_hz, first,
+                        tuple(values[offset:] for values in block.samples),
+                    )
+                self.ai_plot.append_block(block)
+                self._analog_last_plot_end = end
+        if snapshot.revision and snapshot.revision <= self._analog_revision:
+            return
+        self._analog_revision = snapshot.revision
         self.ai_metrics["channels"].setText(str(len(snapshot.channel_names)))
         self.ai_metrics["samples"].setText(str(snapshot.total_samples))
         self.ai_metrics["duration"].setText(f"{snapshot.duration_seconds:.6g} s")
@@ -3248,22 +3354,8 @@ class NIDeviceWindow(BaseDeviceWindow):
         )
         self.ai_plot_status.style().unpolish(self.ai_plot_status)
         self.ai_plot_status.style().polish(self.ai_plot_status)
-        self.ai_stop.setEnabled(online)
-        if snapshot.state is AnalogAcquisitionState.RUNNING:
-            self.ai_start.setText("采集中")
-        elif snapshot.state is AnalogAcquisitionState.ERROR:
-            self.ai_start.setText("开始采集")
-            self.ai_start.setEnabled(True)
-            self._set_analog_config_enabled(True)
-            self._release_ni_lease_if_idle()
-        self.ai_save_csv.setEnabled(
-            snapshot.retained_samples > 0
-            and snapshot.state not in {
-                AnalogAcquisitionState.STARTING,
-                AnalogAcquisitionState.RUNNING,
-                AnalogAcquisitionState.STOPPING,
-            }
-        )
+        self._refresh_analog_controls()
+        self._release_ni_lease_if_idle()
         if snapshot.error and snapshot.error != self._last_analog_error:
             self._last_analog_error = snapshot.error
             self.statusBar().showMessage(snapshot.error, 10000)
@@ -3284,9 +3376,12 @@ class NIDeviceWindow(BaseDeviceWindow):
                 QMessageBox.information(self, "采集正在运行", str(exc))
                 return
             snapshot = controller.snapshot()
+            self._analog_revision = max(self._analog_revision, snapshot.revision)
+            self._analog_plot_revision_floor = snapshot.revision
             saved_samples = snapshot.saved_samples
             has_stream = bool(snapshot.stream_path)
         self.ai_plot.clear()
+        self._analog_last_plot_end = 0
         self.ai_metrics["channels"].setText("0")
         self.ai_metrics["samples"].setText("0")
         self.ai_metrics["duration"].setText("0 s")
@@ -3424,18 +3519,27 @@ class NIDeviceWindow(BaseDeviceWindow):
             QMessageBox.warning(self, "无法创建计数任务", str(exc))
             return
         self.ni_counter_start.setEnabled(False)
+        self.ni_counter_stop.setEnabled(False)
+        self._counter_start_pending = True
+        self._counter_stop_requested = False
 
         def started(_result: Any = None) -> None:
+            self._counter_start_pending = False
+            if self._counter_stop_requested:
+                self._stop_ni_counter()
+                return
             self.ni_counter_stop.setEnabled(True)
             self.ni_counter_timer.start()
             self.ni_overview_metrics["trigger"].setText("运行中")
             self.statusBar().showMessage("NI 累计边沿计数已启动", 4000)
 
         def failed(message: str) -> None:
-            self.test_counter = None
-            self.ni_counter_start.setEnabled(True)
-            self.ni_overview_metrics["trigger"].setText("错误")
-            self._release_ni_lease_if_idle()
+            self._counter_start_pending = False
+            self.ni_counter_start.setEnabled(False)
+            self.ni_counter_stop.setEnabled(True)
+            self.ni_overview_metrics["trigger"].setText("启动失败 / 待清理")
+            if self._counter_stop_requested:
+                self._stop_ni_counter()
             self._show_hardware_error(message)
 
         self.submit(self.test_counter.start, on_success=started, on_error=failed)
@@ -3457,32 +3561,40 @@ class NIDeviceWindow(BaseDeviceWindow):
         self.submit(self.test_counter.read_count, on_success=received, on_error=failed)
 
     def _stop_ni_counter(self) -> None:
-        counter, self.test_counter = self.test_counter, None
-        if counter is None:
+        counter = self.test_counter
+        if counter is None or self._counter_stop_pending:
             return
+        self._counter_stop_requested = True
+        if self._counter_start_pending:
+            self.ni_counter_stop.setEnabled(False)
+            return
+        self._counter_stop_pending = True
         self.ni_counter_timer.stop()
         self.ni_counter_stop.setEnabled(False)
 
         def stopped(_result: Any = None) -> None:
+            self._counter_stop_pending = False
+            self._counter_stop_requested = False
+            self.test_counter = None
             self.ni_counter_start.setEnabled(True)
             self.ni_overview_metrics["trigger"].setText("未运行")
             self.ni_overview_metrics["backlog"].setText("0")
             self._release_ni_lease_if_idle()
             self.statusBar().showMessage("NI 计数已停止", 4000)
 
-        self.submit(counter.stop, on_success=stopped)
+        def failed(message: str) -> None:
+            self._counter_stop_pending = False
+            self.ni_counter_stop.setEnabled(True)
+            self.ni_counter_start.setEnabled(False)
+            self.ni_overview_metrics["trigger"].setText("停止未确认")
+            self.statusBar().showMessage(f"NI 计数停止失败：{message}；请重试停止。", 10000)
+
+        self.submit(counter.stop, on_success=stopped, on_error=failed)
 
     def _release_ni_lease_if_idle(self) -> None:
         if self.connection_manager is None or self.test_counter is not None:
             return
-        analog_busy = False
-        if self.analog_controller is not None:
-            analog_busy = self.analog_controller.snapshot().state in {
-                AnalogAcquisitionState.STARTING,
-                AnalogAcquisitionState.RUNNING,
-                AnalogAcquisitionState.STOPPING,
-            }
-        if not analog_busy:
+        if not self._analog_busy():
             self.connection_manager.release_devices(self._ni_lease_owner)
 
     def _routing_page(self) -> QWidget:
@@ -3514,20 +3626,14 @@ class NIDeviceWindow(BaseDeviceWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._stop_virtual_continuous()
-        if self.analog_controller is not None:
-            try:
-                self.analog_controller.stop()
-            except Exception:
-                pass
-        if self.test_counter is not None:
-            self.ni_counter_timer.stop()
-            try:
-                self.test_counter.stop()
-            except Exception:
-                pass
-            self.test_counter = None
-        if self.connection_manager is not None:
-            self.connection_manager.release_devices(self._ni_lease_owner)
+        if self._call_tasks or self._analog_busy() or self.test_counter is not None:
+            self._stop_analog_input()
+            self._stop_ni_counter()
+            self.statusBar().showMessage("后台任务尚未停止，确认停止后可关闭窗口。", 8000)
+            event.ignore()
+            return
+        self._analog_lifecycle_timer.stop()
+        self._release_ni_lease_if_idle()
         super().closeEvent(event)
 
 

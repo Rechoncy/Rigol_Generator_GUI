@@ -198,6 +198,102 @@ def _bundle_self_test(report_path: Path) -> int:
         os.environ["RIGOL_GUI_DATA_DIR"] = str(data_dir)
         report["test_data_dir"] = str(data_dir)
 
+        # Exercise the shipped analog lifecycle with an entirely in-memory
+        # reader: a failed native close must retain ownership until retried.
+        from rigol_control.analog import AnalogAcquisitionController, AnalogAcquisitionState
+
+        class CleanupProbeReader:
+            def __init__(self):
+                self.reading = threading.Event()
+                self.cancelled = threading.Event()
+                self.close_attempts = 0
+
+            def start(self):
+                pass
+
+            def read(self):
+                self.reading.set()
+                if not self.cancelled.wait(5):
+                    raise TimeoutError("Virtual analog cleanup probe was not cancelled")
+                raise OSError("Virtual analog read cancelled")
+
+            def stop(self):
+                self.close_attempts += 1
+                self.cancelled.set()
+                if self.close_attempts == 1:
+                    raise OSError("BUNDLE_ANALOG_CLOSE_FAILURE")
+
+        analog_reader = CleanupProbeReader()
+        analog_probe = AnalogAcquisitionController(analog_reader, maximum_retained_samples=1000)
+        try:
+            analog_probe.start()
+            if not analog_reader.reading.wait(2):
+                raise AssertionError("Virtual analog reader did not start")
+            try:
+                analog_probe.stop(timeout_seconds=2)
+            except RuntimeError as exc:
+                if "BUNDLE_ANALOG_CLOSE_FAILURE" not in str(exc):
+                    raise
+            else:
+                raise AssertionError("Analog cleanup failure was reported as a successful stop")
+            snapshot = analog_probe.snapshot()
+            if (snapshot.state is not AnalogAcquisitionState.ERROR
+                    or not snapshot.cleanup_pending or not analog_probe.is_running):
+                raise AssertionError("Analog cleanup failure did not retain the active task")
+            try:
+                analog_probe.clear()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("Analog data was cleared before failed cleanup finished")
+            analog_probe.stop(timeout_seconds=2)
+            if analog_probe.is_running or analog_probe.snapshot().cleanup_pending:
+                raise AssertionError("Explicit analog cleanup retry did not finish")
+            if analog_reader.close_attempts != 2:
+                raise AssertionError("Analog cleanup was automatically replayed")
+            report["analog_cleanup_retry"] = {
+                "failed_close_reported": True, "ownership_retained": True,
+                "clear_blocked_during_cleanup": True, "explicit_retry_completed": True,
+                "no_automatic_close_replay": True, "hardware_access": False,
+            }
+        finally:
+            analog_reader.cancelled.set()
+            if analog_probe.is_running:
+                analog_probe.stop(timeout_seconds=2)
+
+        # Exercise the actual packaged nidaqmx close semantics, still without
+        # constructing a native task or loading any NI driver.
+        from types import SimpleNamespace
+        from rigol_control.drivers.ni_analog import AnalogInputConfig, NIDaqAnalogInput
+        from rigol_control.drivers.ni_counter import NIDaqCleanupUncertainError
+
+        clear_attempts = []
+
+        def failed_native_clear(handle):
+            clear_attempts.append(handle)
+            raise OSError("BUNDLE_NATIVE_CLEAR_FAILURE")
+
+        native_task = object.__new__(nidaqmx.Task)
+        native_task._handle = 123
+        native_task._saved_name = "in-memory-bundle-probe"
+        native_task._grpc_options = None
+        native_task._event_handler_lock = threading.RLock()
+        native_task._event_handlers = {}
+        native_task._interpreter = SimpleNamespace(stop_task=lambda _handle: None,
+                                                   clear_task=failed_native_clear)
+        native_reader = NIDaqAnalogInput("BUNDLE_NO_HARDWARE", AnalogInputConfig(("ai0",), 1000, 2))
+        native_reader._task = native_task
+        for _ in range(2):
+            try:
+                native_reader.stop()
+            except NIDaqCleanupUncertainError:
+                pass
+            else:
+                raise AssertionError("A lost NI native handle was reported as cleared")
+        if not native_reader.is_running or clear_attempts != [123] or native_task._handle is not None:
+            raise AssertionError("Unconfirmed native cleanup did not remain blocked")
+        report["analog_cleanup_retry"]["lost_native_handle_never_treated_as_success"] = True
+
         def no_dialog(_parent, title, message, *_args, **_kwargs):
             dialog_errors.append(f"{title}: {message}")
             return QMessageBox.StandardButton.Ok

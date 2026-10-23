@@ -43,6 +43,7 @@ class NewportWindow(BaseDeviceWindow):
         self.controller = None
         self.analog = None
         self._manual_busy = False
+        self._scan_stop_pending = False
         self._cancel_manual = Event()
         self._manual_done = Event()
         self._manual_done.set()
@@ -406,7 +407,7 @@ class NewportWindow(BaseDeviceWindow):
         self._tick()
 
     def _busy(self):
-        return self._manual_busy or (self.controller is not None and self.controller.is_running)
+        return self._manual_busy or self._scan_stop_pending or (self.controller is not None and self.controller.is_running)
 
     def _manual(self, operation, *, wait_motion=False, capture_initial=False):
         if self._busy():
@@ -574,7 +575,31 @@ class NewportWindow(BaseDeviceWindow):
 
     def _stop(self):
         if self.controller is not None and self.controller.is_running:
+            if self._scan_stop_pending:
+                return
             self.controller.request_stop()
+            self._scan_stop_pending = True
+            self._tick()
+
+            def completed(_result=None):
+                self._scan_stop_pending = False
+                self._tick()
+
+            def failed(message):
+                self._scan_stop_pending = False
+                self._scan_message = message
+                self._tick()
+
+            controller = self.controller
+
+            def stop_or_recover():
+                if controller.cleanup_pending and not controller.is_worker_running and not self.device.is_connected:
+                    # This explicit retry owns the existing lease. Reconnect
+                    # only the transport; never resume the scan or replay MOVE.
+                    self.connection_manager.connect(self.record, owner=controller.owner)
+                controller.stop()
+
+            self.submit(stop_or_recover, on_success=completed, on_error=failed)
         elif self._manual_busy:
             self._cancel_manual.set()
         elif self.device.is_connected:
@@ -727,9 +752,14 @@ class NewportWindow(BaseDeviceWindow):
             widget.setEnabled(not busy)
         self.initial_angle.setEnabled(not busy and self._specified_initial() is not None)
         self.start_button.setEnabled(connected and not busy and not external_busy)
-        self.stop_button.setEnabled(self.controller is not None and self.controller.is_running)
+        self.stop_button.setEnabled(self.controller is not None and self.controller.is_running and not self._scan_stop_pending)
+        self.stop_button.setText("停止中…" if self._scan_stop_pending else
+                                 "重连并停止 / 清理" if self.controller is not None and self.controller.cleanup_pending
+                                 and not self.controller.is_worker_running and not connected else
+                                 "重试停止 / 清理" if self.controller is not None and self.controller.cleanup_pending
+                                 and self.controller.snapshot().phase == "error" else "停止扫描")
         self.manual_stop.setEnabled(connected and not external_busy)
-        self.sidebar_stop.setEnabled((connected or busy) and not external_busy)
+        self.sidebar_stop.setEnabled((connected or busy) and not external_busy and not self._scan_stop_pending)
         ni = next((d for d in self.ni_devices if d.id == self.ni_combo.currentData()), None)
         self.inject_button.setEnabled(ni is not None and is_virtual_resource(ni.resource)
                                       and self.controller is not None and self.controller.is_running)
@@ -748,13 +778,9 @@ class NewportWindow(BaseDeviceWindow):
 
     def closeEvent(self, event):
         self._cancel_manual.set()
-        try:
-            if self.controller is not None:
-                self.controller.stop()
-            if not self._manual_done.wait(5):
-                raise RuntimeError("硬件操作尚未结束，请等待停止完成后关闭")
-        except Exception as exc:
-            self.operation_label.setText(str(exc))
+        if self._busy() or self._call_tasks or not self._manual_done.is_set():
+            self._stop()
+            self.operation_label.setText("硬件操作或 NI 清理尚未结束，请确认停止后关闭；失败可重试停止。")
             event.ignore()
             return
         self.timer.stop()

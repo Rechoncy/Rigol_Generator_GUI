@@ -91,13 +91,26 @@ class RotationScanController:
         self._callbacks = []
         self._log = None
         self._stream = None
+        self._counter_cleanup_pending = False
+        self._analog_cleanup_pending = False
+        self._motion_cleanup_pending = False
+        self._leased = False
+        self._cleanup_lock = RLock()
         self.points: tuple[float, ...] = ()
         if self.analog is not None:
             self.analog.add_callback(self._analog_observed)
 
     @property
-    def is_running(self) -> bool:
+    def is_worker_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def is_running(self) -> bool:
+        return self.is_worker_running or self.cleanup_pending
+
+    @property
+    def cleanup_pending(self) -> bool:
+        return self._counter_cleanup_pending or self._analog_cleanup_pending or self._motion_cleanup_pending
 
     def snapshot(self) -> RotationSnapshot:
         with self._lock:
@@ -126,10 +139,63 @@ class RotationScanController:
 
     def stop(self, timeout: float = 10.0) -> None:
         self.request_stop()
+        was_alive = self._thread is not None and self._thread.is_alive()
         if self._thread is not None and self._thread is not current_thread():
             self._thread.join(timeout)
             if self._thread.is_alive():
                 raise RuntimeError("扫描尚未停止，设备租约继续保留")
+        if self.cleanup_pending:
+            if not was_alive:
+                with self._cleanup_lock:
+                    errors = self._cleanup_remaining()
+                    if errors:
+                        self._update(phase="error", error="；".join(filter(None, [self.snapshot().error, *errors])))
+                    self._release_if_clean()
+            if self.cleanup_pending:
+                raise RuntimeError("硬件任务停止未确认，设备租约继续保留；请重试停止")
+
+    def _cleanup_counter(self) -> list[str]:
+        if not self._counter_cleanup_pending:
+            return []
+        try:
+            self.counter.stop()
+            self._counter_cleanup_pending = False
+            return []
+        except Exception as exc:
+            return [f"NI 计数停止失败：{exc}"]
+
+    def _cleanup_analog(self) -> list[str]:
+        if not self._analog_cleanup_pending:
+            return []
+        try:
+            self.analog.stop()
+            self._analog_cleanup_pending = False
+            return []
+        except Exception as exc:
+            return [f"AI 停止失败：{exc}"]
+
+    def _cleanup_motion(self) -> list[str]:
+        if not self._motion_cleanup_pending:
+            return []
+        try:
+            self.device.stop()
+            deadline = time.monotonic() + 2.0
+            while self.device.status().moving:
+                if time.monotonic() >= deadline:
+                    raise MotionError("停止后仍在运动")
+                time.sleep(0.01)
+            self._motion_cleanup_pending = False
+            return []
+        except Exception as exc:
+            return [f"运动停止未确认，状态未知：{exc}"]
+
+    def _cleanup_remaining(self) -> list[str]:
+        return [*self._cleanup_counter(), *self._cleanup_motion(), *self._cleanup_analog()]
+
+    def _release_if_clean(self) -> None:
+        if self._leased and not self.cleanup_pending:
+            self.manager.release_devices(self.owner)
+            self._leased = False
 
     def _record(self, event: str, block=None) -> None:
         with self._log_lock:
@@ -191,15 +257,13 @@ class RotationScanController:
         return None
 
     def _run(self) -> None:
-        leased = False
         counter_started = False
-        analog_started = False
         motion_active = False
         failure = ""
         try:
             if self.manager is not None:
                 self.manager.acquire_devices(self.owner, self.device_ids)
-                leased = True
+                self._leased = True
             if self._stop.is_set():
                 return
             if not self.device.status().ready:
@@ -246,11 +310,12 @@ class RotationScanController:
             if self._stop.is_set():
                 return
             if self.analog is not None:
-                analog_started = True
+                self._analog_cleanup_pending = True
                 self.analog.start()
                 self._record("analog_started")
             if self._stop.is_set():
                 return
+            self._counter_cleanup_pending = True
             self.counter.start()
             counter_started = True
             accepted = 0
@@ -277,6 +342,7 @@ class RotationScanController:
                     if self._stop.is_set():
                         break
                     motion_active = True  # Includes an uncertain PA write outcome.
+                    self._motion_cleanup_pending = True
                     self.device.move_absolute(target)
                     self._record("move_sent")
                 state = self.device.status()
@@ -305,6 +371,7 @@ class RotationScanController:
                             self._update(phase="holding", completed=accepted)
                             self._record("settled")
                             motion_active = False
+                            self._motion_cleanup_pending = False
                     else:
                         stable_since = None
                         self._update(phase="moving")
@@ -314,28 +381,11 @@ class RotationScanController:
         except Exception as exc:
             failure = str(exc)
         finally:
-            cleanup_errors = []
-            if counter_started:
-                try:
-                    self.counter.stop()
-                except Exception as exc:
-                    cleanup_errors.append(f"NI 计数停止失败：{exc}")
+            cleanup_errors = self._cleanup_counter()
             if motion_active or (failure and counter_started):
-                try:
-                    self.device.stop()
-                    # Confirm a stop before allowing a new task to own this stage.
-                    deadline = time.monotonic() + 2.0
-                    while self.device.status().moving:
-                        if time.monotonic() >= deadline:
-                            raise MotionError("停止后仍在运动")
-                        time.sleep(0.01)
-                except Exception as exc:
-                    cleanup_errors.append(f"运动停止未确认，状态未知：{exc}")
-            if analog_started:
-                try:
-                    self.analog.stop()
-                except Exception as exc:
-                    cleanup_errors.append(f"AI 停止失败：{exc}")
+                self._motion_cleanup_pending = True
+            cleanup_errors.extend(self._cleanup_motion())
+            cleanup_errors.extend(self._cleanup_analog())
             failure = "；".join(filter(None, [failure, *cleanup_errors]))
             self._update(phase="error" if failure else "stopped", error=failure)
             try:
@@ -351,5 +401,4 @@ class RotationScanController:
                     self._update(phase="error", error=f"{failure}；日志关闭失败：{exc}".strip("；"))
                 finally:
                     self._stream = self._log = None
-                    if leased:
-                        self.manager.release_devices(self.owner)
+                    self._release_if_clean()

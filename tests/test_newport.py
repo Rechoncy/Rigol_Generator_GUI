@@ -438,9 +438,20 @@ class RotationTests(unittest.TestCase):
         self.edge()
         self.assertTrue(wait_until(lambda: self.device.status().moving))
         self.device.disconnect()
-        self.assertTrue(wait_until(lambda: not c.is_running))
+        self.assertTrue(wait_until(lambda: not c._thread.is_alive()))
         self.assertIn("状态未知", c.snapshot().error)
         self.assertFalse(self.manager.is_connected(self.stage))
+        self.assertTrue(c.is_running)
+        self.assertTrue(c.cleanup_pending)
+        self.assertEqual(self.manager.lease_owner(self.stage.id), c.owner)
+        # Restore only the virtual transport so an explicit STOP retry can be
+        # confirmed; a failed MOVE is never replayed.
+        history = list(self.device.move_history)
+        self.device.connect()
+        c.stop()
+        self.assertFalse(c.is_running)
+        self.assertEqual(self.device.move_history, history)
+        self.assertIsNone(self.manager.lease_owner(self.stage.id))
 
     def test_analog_read_error_stops_scan(self):
         class BrokenReader:
@@ -563,13 +574,19 @@ class RotationTests(unittest.TestCase):
 
     def test_failed_counter_start_stops_ai_and_releases(self):
         class BadCounter:
+            stopped = False
+
             def start(self):
                 raise RuntimeError("route conflict")
+
+            def stop(self):
+                self.stopped = True
         c = self.make_controller()
         c.counter = BadCounter()
         c.start()
         self.assertTrue(wait_until(lambda: not c.is_running))
         self.assertIn("route conflict", c.snapshot().error)
+        self.assertTrue(c.counter.stopped)
         self.assertIsNone(self.manager.lease_owner(self.stage.id))
 
     def test_config_validation_and_discovery(self):

@@ -1,6 +1,6 @@
 # Windows 便携发行版使用与构建说明
 
-适用版本：0.7.15；目标平台：Windows 10/11 x64。
+正式下载版本：0.7.15；当前源码与本地开发构建：0.7.16（未发布 GitHub Release）；目标平台：Windows 10/11 x64。
 
 发行版包含运行程序所需的 Python、Qt、PyVISA、pyserial 和 nidaqmx。目标电脑无需安装 Python、pip 或创建虚拟环境，首次启动也无需联网下载 Python 组件。内置运行时只供本软件使用，不修改系统 Python。
 
@@ -16,6 +16,8 @@
 | `RELEASE-NOTES.md` | 查看本版改动和验证范围 | 升级前阅读 |
 
 项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。正式发行文件从 [v0.7.15 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.15) 下载，由版本标签对应的提交构建。发布附件的本地副本位于 `dist/published/v0.7.15/`，自行构建的输出目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以同组附件的 `release-manifest.json` 为准，完整性可用 `SHA256SUMS.txt` 核对。
+
+本文下载文件名和运行示例使用正式版 0.7.15。第 7 节从当前源码构建会生成 0.7.16 文件，不会覆盖 `dist/published/v0.7.15/` 中的已发布附件，也不会自动创建标签或 Release。0.7.16 的 NI 模拟采集修复与验证状态见[本地开发构建说明](NOTES-0.7.16.md)。
 
 仓库根目录原有的小型 `Lab Control Center.exe` 是源码启动器，仍需外部 Python/PyQt6；它与上述编译产物不同。使用免 Python 版本时，应下载发行附件或按第 7 节构建。
 
@@ -88,6 +90,10 @@ $env:RIGOL_GUI_DATA_DIR = "D:\LabData\ControlCenter"
 旧设备列表如果以 DG4000、SSG 或通用 SCPI 不同类型保存了同一个 VISA 地址，0.7.15 仍可读取，但这些记录只能选一个连接，新保存也会拒绝跨类型的重复地址。先停止任务并断开，再保留合适的一条记录；不要通过另一条记录绕过“正在占用”。正在连接/断开时同资源也暂不可启动任务。设备设置窗口因任务尚未结束而拒绝关闭时，首页编辑或删除会停止操作并保留记录；通用 SCPI 原始命令仍在后台执行时也适用。SSG 窗口自身的首次连接/必要停止恢复仍可用，该权限不能由首页或别名记录借用来重连运行扫描。
 
 0.7.15 保留原配置与任务格式。更新后，可编辑点表显示的小数位数可能比旧版多，这是为了保留原始浮点数值；JSON 中原有点值不因这次更新而改写成近似值。DG 手动操作自动恢复连接时若报告型号/序列号变化，请核对资源和仪器身份，通过重新读取身份或断开后重连确认当前设备，再重新应用配置或布防；软件不会继续向变化后的设备发送旧设置。
+
+0.7.16 本地开发构建继续保留配置与任务格式。NI 独立模拟采集停止改为后台执行，读取线程或 NI/文件清理未完成时保留窗口、控制器和占用，失败后可重试停止。独立计数与 Newport 联动的 NI 清理失败也保留任务和租约供重试。连续文本的保存点数仅计入成功写入并刷新完成的数据块；写盘失败后保留文件供核查，不会自动重放失败块。详细恢复步骤见[使用说明第 8 节](../docs/USER_MANUAL_CN.md#87-停止异常与恢复)。
+
+NI-DAQmx 关闭报错且原生句柄已丢失时，显示“原生清理未确认”，软件不会把第二次无实际动作的关闭当成功，也不恢复旧句柄。此类状态无法在当前进程内用普通停止重试确认，需结束本次实验，在 NI MAX/驱动层核对资源后重新启动软件；原任务及占用持续保留。
 
 ## 4. 实机驱动与 Python 依赖的区别
 
@@ -186,9 +192,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1 -V
 
 ```text
 dist/release/
-├─ Lab-Control-Center-0.7.15-windows-x64-portable.zip
-├─ Lab-Control-Center-0.7.15-windows-x64.exe
-├─ Lab-Control-Center-0.7.15-windows-x64-source.zip
+├─ Lab-Control-Center-0.7.16-windows-x64-portable.zip
+├─ Lab-Control-Center-0.7.16-windows-x64.exe
+├─ Lab-Control-Center-0.7.16-windows-x64-source.zip
 ├─ RELEASE-NOTES.md
 ├─ SHA256SUMS.txt
 └─ release-manifest.json
@@ -206,6 +212,6 @@ dist/release/
 
 ## 8. 本版记录
 
-变更范围和已完成验证见 [0.7.15 发行说明](NOTES-0.7.15.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
+正式发行的变更范围和验证见 [0.7.15 发行说明](NOTES-0.7.15.md)，当前本地开发构建见 [0.7.16 说明](NOTES-0.7.16.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
 
-本版已完成源码完整自动回归 404 项（55.931 秒）及源码自检。冻结包构建与运行检查尚待完成，后续实际结果由本版 `release-manifest.json` 记录；未实机验收。
+0.7.16 源码完整回归 444 项及源码虚拟自检通过。冻结产物的三种运行自检、Windows 正常启动、内置运行时和文件校验结果以本版 `release-manifest.json` 及 `dist/verification/0.7.16/` 为准，不能用源码测试或 0.7.15 的历史记录替代。两版均未实机验收。

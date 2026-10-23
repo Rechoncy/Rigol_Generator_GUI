@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 
-from .ni_counter import NIDaqError
+from .ni_counter import NIDaqCleanupUncertainError, NIDaqError, _close_ni_task
 
 
 TERMINAL_MODES = ("DEFAULT", "RSE", "NRSE", "DIFF", "PSEUDODIFF")
@@ -113,6 +113,7 @@ class NIDaqAnalogInput:
         self.device_name = device_name.strip().strip("/")
         self.config = config
         self._task = None
+        self._cleanup_uncertain: str | None = None
         self._next_sample_index = 0
         self._actual_sample_rate_hz = float(config.sample_rate_hz)
         self._lock = RLock()
@@ -156,6 +157,10 @@ class NIDaqAnalogInput:
                 "PSEUDODIFF": TerminalConfiguration.PSEUDO_DIFF,
             }
             task = nidaqmx.Task(new_task_name="Rigol_Control_Analog_Input")
+            # A partially configured task can still own DAQmx resources. Keep
+            # the handle until close succeeds, including startup failures.
+            self._task = task
+            self._cleanup_uncertain = None
             try:
                 for channel in self.config.channels:
                     task.ai_channels.add_ai_voltage_chan(
@@ -172,10 +177,17 @@ class NIDaqAnalogInput:
                 self._actual_sample_rate_hz = float(task.timing.samp_clk_rate)
                 task.start()
             except Exception as exc:
-                task.close()
+                try:
+                    _close_ni_task(task)
+                except Exception as cleanup_exc:
+                    if isinstance(cleanup_exc, NIDaqCleanupUncertainError):
+                        self._cleanup_uncertain = str(cleanup_exc)
+                    raise NIDaqError(
+                        f"无法启动 NI 模拟输入：{exc}；清理失败：{cleanup_exc}；请重试停止"
+                    ) from exc
+                self._task = None
                 raise NIDaqError(f"无法启动 NI 模拟输入：{exc}") from exc
             self._next_sample_index = 0
-            self._task = task
 
     def read(self) -> AnalogInputBlock:
         with self._lock:
@@ -208,15 +220,24 @@ class NIDaqAnalogInput:
 
     def stop(self) -> None:
         with self._lock:
-            task, self._task = self._task, None
-        if task is None:
-            return
-        try:
-            task.stop()
-        except Exception:
-            pass
-        finally:
-            task.close()
+            task = self._task
+            if task is None:
+                return
+            if self._cleanup_uncertain is not None:
+                raise NIDaqCleanupUncertainError(self._cleanup_uncertain)
+            try:
+                task.stop()
+            except Exception:
+                pass
+            finally:
+                try:
+                    _close_ni_task(task)
+                except NIDaqCleanupUncertainError as exc:
+                    self._cleanup_uncertain = str(exc)
+                    raise
+            # A failed close is not proof that DAQmx released the channel.
+            # Retain it for a serialized explicit cleanup retry.
+            self._task = None
 
     def _physical_channel(self, channel: str) -> str:
         normalized = channel.strip().strip("/")

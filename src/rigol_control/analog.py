@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import csv
+import logging
 import math
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from threading import Event, RLock, Thread, current_thread
+from threading import Condition, Event, RLock, Thread, current_thread
 from typing import Protocol, TextIO
 
 from .drivers.ni_analog import AnalogDataset, AnalogInputBlock, save_analog_csv
@@ -31,7 +33,9 @@ class ContinuousAnalogTextWriter:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self._io_lock = RLock()
         self._lock = RLock()
+        self._is_open = False
         self._stream: TextIO | None = None
         self._writer = None
         self._channel_names: tuple[str, ...] = ()
@@ -42,7 +46,7 @@ class ContinuousAnalogTextWriter:
     @property
     def is_open(self) -> bool:
         with self._lock:
-            return self._stream is not None
+            return self._is_open
 
     @property
     def saved_samples(self) -> int:
@@ -50,21 +54,24 @@ class ContinuousAnalogTextWriter:
             return self._saved_samples
 
     def open(self) -> None:
-        with self._lock:
+        with self._io_lock:
             if self._stream is not None:
                 raise RuntimeError("连续采集文本文件已经打开")
+            with self._lock:
+                self._saved_samples = 0
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._stream = self.path.open("w", encoding="utf-8-sig", newline="")
+            with self._lock:
+                self._is_open = True
             self._writer = csv.writer(self._stream)
             self._channel_names = ()
             self._sample_rate_hz = 0.0
             self._expected_sample_index = None
-            self._saved_samples = 0
 
     def write_block(self, block: AnalogInputBlock) -> None:
         if block.sample_count == 0:
             return
-        with self._lock:
+        with self._io_lock:
             if self._stream is None or self._writer is None:
                 raise RuntimeError("连续采集文本文件尚未打开")
             if not self._channel_names:
@@ -103,17 +110,38 @@ class ContinuousAnalogTextWriter:
                         *(format(value, ".12g") for value in values),
                     ]
                 )
-            self._saved_samples += block.sample_count
-            self._expected_sample_index = block.first_sample_index + block.sample_count
             self._stream.flush()
+            self._expected_sample_index = block.first_sample_index + block.sample_count
+            with self._lock:
+                self._saved_samples += block.sample_count
 
     def close(self) -> None:
-        with self._lock:
-            stream, self._stream = self._stream, None
+        with self._io_lock:
+            stream = self._stream
             self._writer = None
-        if stream is not None:
-            stream.flush()
-            stream.close()
+            if stream is None:
+                return
+            errors = []
+            try:
+                stream.flush()
+            except Exception as exc:
+                errors.append(exc)
+            try:
+                stream.close()
+            except Exception as exc:
+                errors.append(exc)
+                # TextIO.close may report a flush failure after closing its
+                # underlying handle. Retain only handles still requiring work.
+                if getattr(stream, "closed", False):
+                    self._stream = None
+            else:
+                self._stream = None
+            with self._lock:
+                self._is_open = self._stream is not None
+            if errors:
+                if len(errors) == 1:
+                    raise errors[0]
+                raise OSError("；".join(str(error) for error in errors)) from errors[0]
 
 
 class AnalogAcquisitionState(str, Enum):
@@ -139,6 +167,8 @@ class AnalogAcquisitionSnapshot:
     saved_samples: int = 0
     streaming: bool = False
     error: str | None = None
+    cleanup_pending: bool = False
+    revision: int = 0
 
     @property
     def duration_seconds(self) -> float:
@@ -169,8 +199,17 @@ class AnalogAcquisitionController:
             ContinuousAnalogTextWriter(stream_path) if stream_path is not None else None
         )
         self._lock = RLock()
+        self._condition = Condition(self._lock)
+        self._shutdown_lock = RLock()
         self._stop_event = Event()
         self._thread: Thread | None = None
+        self._start_thread = None
+        self._read_active = False
+        self._reader_open = False
+        self._cleanup_thread: Thread | None = None
+        self._cleanup_in_progress = False
+        self._cleanup_started = False
+        self._snapshot_revision = 0
         self._state = AnalogAcquisitionState.STOPPED
         self._channel_names: tuple[str, ...] = ()
         self._sample_rate_hz = 0.0
@@ -186,8 +225,30 @@ class AnalogAcquisitionController:
         with self._lock:
             self._callbacks.append(callback)
 
+    def _quiescent_locked(self) -> bool:
+        return (
+            self._start_thread is None
+            and not self._read_active
+            and not self._cleanup_in_progress
+            and not self._reader_open
+            and (self.stream_writer is None or not self.stream_writer.is_open)
+        )
+
+    @property
+    def is_quiescent(self) -> bool:
+        """True only after startup, reads and resource cleanup have finished."""
+        with self._condition:
+            return self._quiescent_locked()
+
+    @property
+    def is_running(self) -> bool:
+        """Include failed cleanup so windows retain their NI device lease."""
+        with self._condition:
+            return not self._quiescent_locked()
+
     def snapshot(self) -> AnalogAcquisitionSnapshot:
         with self._lock:
+            self._snapshot_revision += 1
             retained = len(self._buffers[0]) if self._buffers else 0
             return AnalogAcquisitionSnapshot(
                 state=self._state,
@@ -209,12 +270,25 @@ class AnalogAcquisitionController:
                     self.stream_writer.is_open if self.stream_writer is not None else False
                 ),
                 error=self._error,
+                cleanup_pending=(
+                    self._state in {
+                        AnalogAcquisitionState.ERROR,
+                        AnalogAcquisitionState.STOPPING,
+                    }
+                    and not self._quiescent_locked()
+                ),
+                revision=self._snapshot_revision,
             )
 
     def start(self) -> None:
-        with self._lock:
-            if self._state in {AnalogAcquisitionState.STARTING, AnalogAcquisitionState.RUNNING}:
-                raise RuntimeError("模拟输入采集已经运行")
+        with self._shutdown_lock, self._condition:
+            if not self._quiescent_locked() or self._state in {
+                AnalogAcquisitionState.STARTING,
+                AnalogAcquisitionState.RUNNING,
+                AnalogAcquisitionState.STOPPING,
+            }:
+                raise RuntimeError("模拟输入任务尚未完成停止和清理，请重试停止后再启动")
+            self._start_thread = current_thread()
             self._state = AnalogAcquisitionState.STARTING
             self._channel_names = ()
             self._sample_rate_hz = 0.0
@@ -224,55 +298,100 @@ class AnalogAcquisitionController:
             self._maximum_v = ()
             self._rms_v = ()
             self._error = None
+            self._cleanup_started = False
             self._stop_event.clear()
         self._publish(None)
         try:
+            if self._stop_event.is_set():
+                return
             if self.stream_writer is not None:
                 self.stream_writer.open()
+            with self._condition:
+                if self._stop_event.is_set():
+                    return
+                # A failed start may still leave a partially created NI task.
+                self._reader_open = True
             self.reader.start()
+            with self._condition:
+                if self._stop_event.is_set():
+                    return
+                self._state = AnalogAcquisitionState.RUNNING
+                self._read_active = True
+                self._thread = Thread(target=self._read_loop, name="ni-analog-input", daemon=True)
+                try:
+                    self._thread.start()
+                except Exception:
+                    self._read_active = False
+                    raise
         except Exception as exc:
-            if self.stream_writer is not None:
-                self.stream_writer.close()
             self._fail(f"启动模拟输入失败：{exc}")
             raise
-        with self._lock:
-            self._state = AnalogAcquisitionState.RUNNING
-            self._thread = Thread(target=self._read_loop, name="ni-analog-input", daemon=True)
-            thread = self._thread
-        thread.start()
+        finally:
+            with self._condition:
+                self._start_thread = None
+                cancelled = self._stop_event.is_set()
+                self._condition.notify_all()
+            if cancelled:
+                self._ensure_cleanup()
+            self._publish(None)
+
+    def request_stop(self) -> None:
+        """Request cancellation without blocking on NI reads or file I/O."""
+        with self._condition:
+            if self._quiescent_locked():
+                return
+            if self._state is not AnalogAcquisitionState.ERROR:
+                self._state = AnalogAcquisitionState.STOPPING
+            self._stop_event.set()
+            self._condition.notify_all()
         self._publish(None)
 
-    def stop(self) -> None:
-        with self._lock:
-            if self._state is AnalogAcquisitionState.STOPPED:
-                return
-            self._state = AnalogAcquisitionState.STOPPING
-            self._stop_event.set()
-            thread = self._thread
-        self._publish(None)
-        try:
-            self.reader.stop()
-        finally:
-            if thread is not None and thread is not current_thread():
-                thread.join(timeout=5.0)
-            if self.stream_writer is not None:
-                self.stream_writer.close()
-            with self._lock:
-                self._thread = None
-                self._state = AnalogAcquisitionState.STOPPED
+    def stop(self, timeout_seconds: float = 5.0) -> None:
+        if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+            raise ValueError("停止等待时间必须是非负有限数值")
+        with self._shutdown_lock:
+            with self._condition:
+                if self._quiescent_locked():
+                    return
+            self.request_stop()
+            self._ensure_cleanup(explicit_retry=True)
+            deadline = time.monotonic() + timeout_seconds
+            with self._condition:
+                # Startup can originate in Qt's _DummyThread. Wait on our
+                # condition flags rather than joining that foreign thread.
+                self._condition.wait_for(
+                    lambda: self._quiescent_locked()
+                    or (
+                        self._start_thread is None
+                        and not self._cleanup_in_progress
+                        and self._state is AnalogAcquisitionState.ERROR
+                    ),
+                    timeout=max(0.0, deadline - time.monotonic()),
+                )
+                pending = not self._quiescent_locked()
+                if pending:
+                    self._append_error_locked(
+                        "停止尚未完成，NI 读取或资源清理未结束；已保留设备占用，请重试停止"
+                    )
+                else:
+                    self._thread = None
             self._publish(None)
+            if pending:
+                raise RuntimeError(self.snapshot().error)
 
     def clear(self) -> None:
         with self._lock:
-            if self._state in {AnalogAcquisitionState.STARTING, AnalogAcquisitionState.RUNNING}:
-                raise RuntimeError("请先停止模拟输入采集再清空数据")
+            if not self._quiescent_locked():
+                raise RuntimeError("请先完成模拟输入采集的停止和清理再清空数据")
             self._total_samples = 0
             self._buffers = ()
             self._channel_names = ()
+            self._sample_rate_hz = 0.0
             self._minimum_v = ()
             self._maximum_v = ()
             self._rms_v = ()
             self._error = None
+            self._state = AnalogAcquisitionState.STOPPED
         self._publish(None)
 
     def dataset(self) -> AnalogDataset:
@@ -291,7 +410,12 @@ class AnalogAcquisitionController:
     def _read_loop(self) -> None:
         try:
             while not self._stop_event.is_set():
-                block = self.reader.read()
+                try:
+                    block = self.reader.read()
+                except Exception:
+                    if self._stop_event.is_set():
+                        break
+                    raise
                 if self._stop_event.is_set():
                     break
                 self._accept_block(block)
@@ -299,17 +423,70 @@ class AnalogAcquisitionController:
                     self.stream_writer.write_block(block)
                 self._publish(block)
         except Exception as exc:
-            if not self._stop_event.is_set():
-                if self.stream_writer is not None:
-                    self.stream_writer.close()
-                self._fail(f"模拟输入采集失败：{exc}")
+            self._fail(f"模拟输入采集失败：{exc}")
         finally:
+            with self._condition:
+                self._read_active = False
+                # An explicit stop already attempted (and possibly failed)
+                # cleanup. Only the user may retry that failed NI close.
+                first_cleanup = not self._cleanup_started
+                self._condition.notify_all()
+            if first_cleanup:
+                self._ensure_cleanup()
+
+    def _ensure_cleanup(self, *, explicit_retry: bool = False) -> None:
+        with self._condition:
+            if self._cleanup_in_progress or self._quiescent_locked():
+                return
+            if self._cleanup_started and not explicit_retry:
+                return
+            self._cleanup_started = True
+            self._cleanup_in_progress = True
+            self._cleanup_thread = Thread(
+                target=self._cleanup, name="ni-analog-cleanup", daemon=True
+            )
             try:
-                self.reader.stop()
-            except Exception:
-                pass
-            if self.stream_writer is not None:
-                self.stream_writer.close()
+                self._cleanup_thread.start()
+            except Exception as exc:
+                self._cleanup_in_progress = False
+                self._append_error_locked(f"无法启动模拟输入清理：{exc}")
+                self._condition.notify_all()
+
+    def _cleanup(self) -> None:
+        try:
+            with self._condition:
+                self._condition.wait_for(lambda: self._start_thread is None)
+                reader_open = self._reader_open
+            reader_failed = False
+            if reader_open:
+                try:
+                    self.reader.stop()
+                except Exception as exc:
+                    reader_failed = True
+                    with self._condition:
+                        self._append_error_locked(f"关闭 NI 模拟输入失败：{exc}")
+                else:
+                    with self._condition:
+                        self._reader_open = False
+            with self._condition:
+                if not reader_failed:
+                    self._condition.wait_for(lambda: not self._read_active)
+                can_close_stream = not self._read_active
+            # The read worker may still be appending its final block. Never
+            # detach its file before it has stopped writing.
+            if can_close_stream and self.stream_writer is not None:
+                try:
+                    self.stream_writer.close()
+                except Exception as exc:
+                    with self._condition:
+                        self._append_error_locked(f"关闭连续采集文件失败：{exc}")
+        finally:
+            with self._condition:
+                self._cleanup_in_progress = False
+                if self._quiescent_locked() and self._state is not AnalogAcquisitionState.ERROR:
+                    self._state = AnalogAcquisitionState.STOPPED
+                self._condition.notify_all()
+            self._publish(None)
 
     def _accept_block(self, block: AnalogInputBlock) -> None:
         if block.sample_count == 0:
@@ -337,14 +514,44 @@ class AnalogAcquisitionController:
 
     def _fail(self, message: str) -> None:
         with self._lock:
-            self._state = AnalogAcquisitionState.ERROR
-            self._error = message
+            self._append_error_locked(message)
             self._stop_event.set()
         self._publish(None)
+
+    def _append_error_locked(self, message: str) -> None:
+        self._state = AnalogAcquisitionState.ERROR
+        if self._error is None:
+            self._error = message
+        elif message not in self._error:
+            self._error += "；" + message
 
     def _publish(self, block: AnalogInputBlock | None) -> None:
         update = AnalogAcquisitionUpdate(self.snapshot(), block)
         with self._lock:
             callbacks = tuple(self._callbacks)
+        failed = []
         for callback in callbacks:
-            callback(update)
+            try:
+                callback(update)
+            except Exception as exc:
+                failed.append(callback)
+                with self._condition:
+                    self._append_error_locked(f"模拟输入状态回调失败：{exc}")
+                    self._stop_event.set()
+                logging.getLogger(__name__).exception("模拟输入状态回调失败")
+        if failed:
+            # Observers can record linked experiment data. A failed observer
+            # therefore stops acquisition, but cannot unwind startup/cleanup
+            # or recursively invoke itself through _fail/request_stop.
+            self._ensure_cleanup()
+            failure_update = AnalogAcquisitionUpdate(self.snapshot())
+            for callback in callbacks:
+                if callback in failed:
+                    continue
+                try:
+                    callback(failure_update)
+                except Exception as exc:
+                    with self._condition:
+                        self._append_error_locked(f"模拟输入状态回调失败：{exc}")
+                        self._stop_event.set()
+                    logging.getLogger(__name__).exception("模拟输入状态回调失败")

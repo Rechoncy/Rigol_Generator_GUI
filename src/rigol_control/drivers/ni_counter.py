@@ -7,6 +7,25 @@ class NIDaqError(RuntimeError):
     pass
 
 
+class NIDaqCleanupUncertainError(NIDaqError):
+    pass
+
+
+def _close_ni_task(task) -> None:
+    try:
+        task.close()
+    except Exception as exc:
+        # nidaqmx 1.6 clears Task._handle even if native clear_task fails.
+        # A second close would silently return, not confirm resource release.
+        # Never restore/replay that lost handle: it may already be reused.
+        if getattr(task, "_handle", True) is None:
+            raise NIDaqCleanupUncertainError(
+                "NI 原生任务清理未确认，Python 任务已失去原生句柄；已保留设备占用。"
+                "请在 NI MAX 核对设备状态后退出并重新启动软件。原始错误：" + str(exc)
+            ) from exc
+        raise
+
+
 class NIDaqEdgeCounter:
     """Hardware cumulative edge counter; polling never defines a trigger dead time."""
 
@@ -23,6 +42,7 @@ class NIDaqEdgeCounter:
         self.terminal = terminal
         self.rising = rising
         self._task = None
+        self._cleanup_uncertain: str | None = None
         self._lock = RLock()
 
     @property
@@ -43,6 +63,7 @@ class NIDaqEdgeCounter:
                 ) from exc
             task = nidaqmx.Task(new_task_name="DG4000_Trigger_Edge_Count")
             self._task = task
+            self._cleanup_uncertain = None
             try:
                 channel = task.ci_channels.add_ci_count_edges_chan(
                     f"{self.device_name}/{self.counter}",
@@ -56,7 +77,11 @@ class NIDaqEdgeCounter:
                     channel.ci_count_edges_term = terminal
                 task.start()
             except Exception as exc:
-                task.close()
+                try:
+                    _close_ni_task(task)
+                except NIDaqCleanupUncertainError as cleanup_exc:
+                    self._cleanup_uncertain = str(cleanup_exc)
+                    raise NIDaqError(f"无法启动 NI 边沿计数：{exc}；{cleanup_exc}") from exc
                 self._task = None
                 raise NIDaqError(f"无法启动 NI 边沿计数：{exc}") from exc
 
@@ -77,12 +102,18 @@ class NIDaqEdgeCounter:
             task = self._task
             if task is None:
                 return
+            if self._cleanup_uncertain is not None:
+                raise NIDaqCleanupUncertainError(self._cleanup_uncertain)
             try:
                 task.stop()
             except Exception:
                 pass
             finally:
-                task.close()
+                try:
+                    _close_ni_task(task)
+                except NIDaqCleanupUncertainError as exc:
+                    self._cleanup_uncertain = str(exc)
+                    raise
             # Retain the task if close raises, so cleanup can be retried and
             # the caller cannot start a second task over an unconfirmed one.
             self._task = None
