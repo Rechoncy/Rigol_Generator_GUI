@@ -2,7 +2,7 @@
 
 这是一个面向 RIGOL DG4000、鼎阳 SIGLENT SSG、Vaunix Lab Brick LMS/BLX 信号源、Newport SMC100CC / PR50CC 旋转台与 NI DAQ 的多设备桌面控制程序。首页用于保存和管理多台设备；点击设备卡片后，会打开独立的设备设置窗口，多台设备窗口可同时存在。
 
-**Windows 便携版：** 0.7.15 的本地构建格式为内置 Python/Qt 与 Python 仪器接口的目录 ZIP 和单文件 EXE；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。构建与验收状态以 `dist/release/release-manifest.json` 为准。具体文件、数据迁移、实机驱动及编译方法见 [发行版使用与构建说明](release/README.md)和[0.7.15 发行说明](release/NOTES-0.7.15.md)。
+**Windows 便携版：** [v0.7.15](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.15) 提供内置 Python/Qt 与 Python 仪器接口的目录 ZIP 和单文件 EXE；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。构建与验收状态以发行附件 `release-manifest.json` 为准。具体文件、数据迁移、实机驱动及编译方法见 [发行版使用与构建说明](release/README.md)和[0.7.15 发行说明](release/NOTES-0.7.15.md)。
 
 软件图标以波形、采样点和旋转箭头表示信号源、采集与循环扫描。仓库根目录原有的 `Lab Control Center.exe` 是供源码运行的小型启动器，依赖目标电脑的 64 位 Python 3.10+ / PyQt6；它不是上述发行附件。开发者可继续使用它或 `run_app.cmd`。
 
@@ -69,7 +69,7 @@
 
 ### 使用便携发行版
 
-0.7.15 本轮仅在本地构建，目标目录为 `dist/release/`，尚未上传 GitHub Release。生成与验收状态以本版 `release-manifest.json` 为准。此前已发布版本可从 [GitHub Releases](https://github.com/Rechoncy/Rigol_Generator_GUI/releases) 下载。本版目标文件为：
+从 [v0.7.15 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.15) 下载便携文件和校验清单。正式发行由版本标签对应的提交构建，生成与验收状态以同组附件 `release-manifest.json` 为准。本地保存的正式发行附件位于 `dist/published/v0.7.15/`；自行构建的输出目录为 `dist/release/`。本版文件为：
 
 - `Lab-Control-Center-0.7.15-windows-x64-portable.zip`：完整解压后运行 `Lab Control Center.exe`，保留 `_internal/`。
 - `Lab-Control-Center-0.7.15-windows-x64.exe`：单文件启动，内置运行时临时解压，持久化配置保存在 EXE 旁 `data/`。
@@ -142,7 +142,7 @@ python -m rigol_control --data-dir .\runtime-data
 
 ## Vaunix LMS/BLX 实机配置
 
-1. 使用发行清单确认内置 DLL 的 0.7.15 本地便携 ZIP 或单文件 EXE 时，直接使用内置 SDK 1.15 DLL。源码运行可将 Windows x64 `vnx_fmsynth.dll` 放在项目主目录，或保留仓库 SDK 目录；也可通过 `VAUNIX_LMS_DLL` 指定 DLL。
+1. 使用发行清单确认内置 DLL 的 0.7.15 便携 ZIP 或单文件 EXE 时，直接使用内置 SDK 1.15 DLL。源码运行可将 Windows x64 `vnx_fmsynth.dll` 放在项目主目录，或保留仓库 SDK 目录；也可通过 `VAUNIX_LMS_DLL` 指定 DLL。
 2. 插入 Vaunix Lab Brick 后，在首页添加 `Vaunix LMS/BLX`；资源下拉框会显示型号、序列号和 `VAUNIX::LMS::<序列号>`。资源身份使用序列号，不依赖 DLL 每次枚举得到的临时设备句柄。首页后台探测只枚举设备，不调用 `fnLMS_InitDevice` 或 `fnLMS_CloseDevice`，不会抢占或关闭正式控制会话。
 3. 连接后先在“总览”核对型号、序列号、SDK 版本、频率/功率范围以及 BLX 序列、快速脉冲、Chirp 能力；不支持的功能按钮会被禁用。
 4. “射频输出”使用 Hz/GHz 与绝对 dBm；DLL 功率参数以 0.25 dB 为编码单位，但仪器实际功率分辨率为 0.5 dB，软件会拒绝不在 0.5 dB 网格上的输出、序列和扫描值。先保持 RF 关闭，应用低风险参数后再开 RF。
@@ -189,7 +189,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1
 
 0.7.15 修复高频小步长点表的有效数字丢失，DG 幅度下发明确使用 VPP 单位，基本波频率按已知型号与波形校验，相位/PSK 限定 0–360°。触发布防时检查一次耦合并读取 CH1/CH2 实际波形，频率点按该快照校验，不增加逐点查询。DG 自动重连发现型号或序列号变化时拒绝旧设置；Vaunix 输出、扫频和完整序列在调用 SDK 前完成输入与编码校验。另修复虚拟设备状态锁冲突及后台任务派发失败后的界面状态。此前各版的触发顺序、停止重试和资源占用保护保留，未新增实机性能结论。详见[流程核对](docs/DG4000_TRIGGER_AUDIT_CN.md)及[本版说明](release/NOTES-0.7.15.md)。
 
-本版源码完整自动回归 404 项通过（55.931 秒），源码自检通过。冻结包构建与运行检查须以本版发行清单中的实际结果为准；尚未进行实体仪器验收。
+本版源码完整自动回归 406 项通过，源码自检通过。冻结包构建与运行检查以本版发行清单中的实际结果为准；尚未进行实体仪器验收。
 
 ## 测试
 

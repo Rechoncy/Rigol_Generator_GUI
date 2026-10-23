@@ -1,7 +1,7 @@
 # Lab Control Center 0.7.15 发行说明
 
 日期：2026-10-23；平台：Windows 10/11 x64。  
-本轮仅在本地构建，未上传 GitHub Release；未进行实体仪器验收。
+正式发行：GitHub Release `v0.7.15`；未进行实体仪器验收。
 
 本版修复点表与 DG 命令的有效数字丢失，明确 DG 幅度单位和型号/波形频率范围，补齐恢复连接身份核对、Vaunix 整批输入预检和后台任务派发失败处理。0.7.12 的触发优化、0.7.13 的停止重试及 0.7.14 的任务交接、别名占用与日志规则继续保留。
 
@@ -25,7 +25,7 @@
 | PULSE / USER | 15 | 25 | 40 | 50 |
 | HARMONIC | 30 | 50 | 80 | 100 |
 
-噪声带宽不作为 `FREQ` 上限，未知型号不具备完整规格校验保证。资料来源与原 CHM 核对范围见[专项核对](../docs/DG4000_TRIGGER_AUDIT_CN.md)。
+噪声带宽不作为 `FREQ` 上限，未知型号不具备完整规格校验保证。资料来源与原 CHM 核对范围见[专项核对](https://github.com/Rechoncy/Rigol_Generator_GUI/blob/v0.7.15/docs/DG4000_TRIGGER_AUDIT_CN.md)。
 
 每次 `prepare_trigger` 在 NI 计数开始前执行一次总耦合查询，并对 CH1/CH2 各读取一次 `FUNC?`。输出频率点按型号与该实际波形快照校验；点内仍零查询、一次 SCPI 写入，不提前下发 P0。面板或其他软件更改波形/耦合后须停止、核对并重新布防。连接重建后旧任务写入器及快照失效，不恢复旧积压。
 
@@ -57,6 +57,6 @@ DG 手动操作自动恢复连接后，型号或序列号变化会阻止继续�
 
 ## 升级
 
-先确认旧任务停止并退出旧程序，完整解压本地 ZIP，复制原 `data/` 或导入配置，核对窗口标题 `v0.7.15`、设备资源和身份。原配置及任务格式保持兼容；点表可能显示更多小数，以保留原浮点值。VISA、NI-DAQmx 等系统硬件驱动仍按设备安装。
+先确认旧任务停止并退出旧程序，从本版 GitHub Release 下载并完整解压 ZIP，复制原 `data/` 或导入配置，核对窗口标题 `v0.7.15`、设备资源和身份。原配置及任务格式保持兼容；点表可能显示更多小数，以保留原浮点值。VISA、NI-DAQmx 等系统硬件驱动仍按设备安装。
 
-详见[用户手册](../docs/USER_MANUAL_CN.md)、[开发日志](../docs/DEVELOPMENT_LOG_CN.md)与[便携运行说明](README.md)。
+详见[用户手册](https://github.com/Rechoncy/Rigol_Generator_GUI/blob/v0.7.15/docs/USER_MANUAL_CN.md)、[开发日志](https://github.com/Rechoncy/Rigol_Generator_GUI/blob/v0.7.15/docs/DEVELOPMENT_LOG_CN.md)与[便携运行说明](https://github.com/Rechoncy/Rigol_Generator_GUI/blob/v0.7.15/release/README.md)。

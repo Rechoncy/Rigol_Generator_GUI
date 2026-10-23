@@ -15,7 +15,7 @@
 | `Lab-Control-Center-0.7.15-windows-x64-source.zip` | 本次构建使用的源码与文档快照 | 维护、依赖许可要求及问题复现 |
 | `RELEASE-NOTES.md` | 查看本版改动和验证范围 | 升级前阅读 |
 
-项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。0.7.15 本轮仅在本地构建，尚未上传 GitHub Release，目标目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以本版 `release-manifest.json` 为准。此前已发布版本可从 [GitHub Releases](https://github.com/Rechoncy/Rigol_Generator_GUI/releases) 下载。
+项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。正式发行文件从 [v0.7.15 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.15) 下载，由版本标签对应的提交构建。发布附件的本地副本位于 `dist/published/v0.7.15/`，自行构建的输出目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以同组附件的 `release-manifest.json` 为准，完整性可用 `SHA256SUMS.txt` 核对。
 
 仓库根目录原有的小型 `Lab Control Center.exe` 是源码启动器，仍需外部 Python/PyQt6；它与上述编译产物不同。使用免 Python 版本时，应下载发行附件或按第 7 节构建。
 
@@ -99,7 +99,7 @@ $env:RIGOL_GUI_DATA_DIR = "D:\LabData\ControlCenter"
 | DG4000、SIGLENT SSG、通用 SCPI | PyVISA | 支持设备的 x64 VISA 实现，例如 NI-VISA；按 USB/LAN 配置通信 |
 | NI 计数与模拟输入 | nidaqmx Python 接口 | NI-DAQmx 系统驱动及正确识别的 NI 设备 |
 | Newport SMC100CC / PR50CC | pyserial | 设备所用 USB 转串口驱动、可用 COM 端口 |
-| Vaunix LMS/BLX | Python SDK 绑定；0.7.15 本地包内置 SDK 1.15 的 Windows x64 `vnx_fmsynth.dll` | 设备要求的 Windows USB/系统驱动 |
+| Vaunix LMS/BLX | Python SDK 绑定；0.7.15 发行包内置 SDK 1.15 的 Windows x64 `vnx_fmsynth.dll` | 设备要求的 Windows USB/系统驱动 |
 
 0.7.15 构建脚本将主目录提供的 Vaunix SDK DLL 内置到便携 ZIP 和单文件 EXE，构建后须在清单中确认 `vaunix_dll_bundled=true`。目录包的位置为 `_internal/vendor/vaunix/vnx_fmsynth.dll`；单文件 EXE 启动时将它随内置运行时解压到临时目录的 `vendor/vaunix/`。清单确认携带后，无需安装 SDK、复制外置 DLL 或设置环境变量，迁移时保留完整目录包或单文件 EXE 即可携带。
 
