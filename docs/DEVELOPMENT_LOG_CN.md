@@ -450,6 +450,7 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 - 新增 `.github/workflows/ci.yml`，主分支推送、PR 和手动运行均在 Windows x64 / 官方 Python 3.13 下安装锁定依赖，执行完整回归和源码虚拟设备自检。测试失败仍执行自检并上传日志，取消已被新提交替代的旧检查。
 - 普通 CI 不运行完整 PyInstaller 构建；现有标签发布流程继续独立构建和验收两种便携格式。新增自动检查说明，后续只对可复现的问题和有依据的优化提交修复，保留硬件未验收边界。
 - 首次远端执行发现 GitHub 不允许在 job 级 env 中引用 runner 上下文，导致校验阶段失败且未启动测试；改为首个步骤读取 RUNNER_TEMP 并通过 GITHUB_ENV 传递目录，诊断收集也保留初始化失败的兜底。
+- 修正后 GitHub Windows 回归 406 项及源码虚拟自检通过。针对远端 Node.js 20 弃用注解，核对官方稳定发行和迁移说明后同步升级 CI/发布工作流的 checkout、setup-python、artifact 组件至原生 Node.js 24 版本；保留现有压缩包上传与按名称下载行为。
 
 ### 0.7.15：数值精度、DG 参数语义与整批输入校验 — 2026-10-23
 

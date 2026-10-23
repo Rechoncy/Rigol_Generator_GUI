@@ -34,9 +34,9 @@ jobs:
           "CI_DIAGNOSTICS_DIR=$diagnosticsDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RIGOL_GUI_DATA_DIR=$dataDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           architecture: x64
@@ -105,7 +105,7 @@ jobs:
 
       - name: Upload failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-x64-check-diagnostics-${{ github.run_attempt }}
           path: ${{ runner.temp }}/rigol-gui-ci/
