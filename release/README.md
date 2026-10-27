@@ -1,6 +1,6 @@
 # Windows 便携发行版使用与构建说明
 
-正式下载与当前源码版本：0.7.18；目标平台：Windows 10/11 x64。
+正式下载版本：0.7.18；当前源码与本地开发构建：0.7.19（未发布 GitHub Release）；目标平台：Windows 10/11 x64。
 
 发行版包含运行程序所需的 Python、Qt、PyVISA、pyserial 和 nidaqmx。目标电脑无需安装 Python、pip 或创建虚拟环境，首次启动也无需联网下载 Python 组件。内置运行时只供本软件使用，不修改系统 Python。
 
@@ -17,7 +17,7 @@
 
 项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。正式发行文件从 [v0.7.18 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.18) 下载，由版本标签对应的提交构建。发布附件的本地副本位于 `dist/published/v0.7.18/`，自行构建的输出目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以同组附件的 `release-manifest.json` 为准，完整性可用 `SHA256SUMS.txt` 核对。
 
-本文下载文件名和运行示例使用正式版 0.7.18。第 7 节从当前源码构建也生成 0.7.18 文件，但本地构建本身不会创建标签或 Release。正式附件、`dist/local/v0.7.18/` 开发构建及 `dist/published/v0.7.15/` 历史附件分别保存，不互相覆盖。0.7.18 的 SSG/Vaunix 回读功能与验证状态见[发行说明](NOTES-0.7.18.md)；DG4000 回读和 NI 模拟采集修复历史分别见[0.7.17 说明](NOTES-0.7.17.md)与[0.7.16 说明](NOTES-0.7.16.md)。
+本文下载文件名和运行示例使用正式版 0.7.18。第 7 节从当前源码构建会生成 0.7.19 文件，本地构建本身不会创建标签或 Release。`dist/local/v0.7.19/` 新开发构建、`dist/published/v0.7.18/` 正式附件及既有开发包和历史附件分别保存，不互相覆盖。0.7.19 的 DG4000 重连快照修复见[本地开发构建说明](NOTES-0.7.19.md)；0.7.18 的 SSG/Vaunix 回读见[发行说明](NOTES-0.7.18.md)，DG4000 回读和 NI 模拟采集修复历史分别见[0.7.17 说明](NOTES-0.7.17.md)与[0.7.16 说明](NOTES-0.7.16.md)。
 
 仓库根目录原有的小型 `Lab Control Center.exe` 是源码启动器，仍需外部 Python/PyQt6；它与上述编译产物不同。使用免 Python 版本时，应下载发行附件或按第 7 节构建。
 
@@ -196,9 +196,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1 -V
 
 ```text
 dist/release/
-├─ Lab-Control-Center-0.7.18-windows-x64-portable.zip
-├─ Lab-Control-Center-0.7.18-windows-x64.exe
-├─ Lab-Control-Center-0.7.18-windows-x64-source.zip
+├─ Lab-Control-Center-0.7.19-windows-x64-portable.zip
+├─ Lab-Control-Center-0.7.19-windows-x64.exe
+├─ Lab-Control-Center-0.7.19-windows-x64-source.zip
 ├─ RELEASE-NOTES.md
 ├─ SHA256SUMS.txt
 └─ release-manifest.json
@@ -216,6 +216,6 @@ dist/release/
 
 ## 8. 本版记录
 
-正式发行的变更范围和验证见 [0.7.18 发行说明](NOTES-0.7.18.md)，此前公开版本记录见 [0.7.15 发行说明](NOTES-0.7.15.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
+正式发行的变更范围和验证见 [0.7.18 发行说明](NOTES-0.7.18.md)，当前本地开发构建见 [0.7.19 说明](NOTES-0.7.19.md)，此前公开版本记录见 [0.7.15 发行说明](NOTES-0.7.15.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
 
 0.7.16 源码完整回归 444 项、0.7.17 源码完整回归 465 项及各版源码虚拟自检通过，作为历史记录保留。0.7.18 回读与冻结产物的逐项验收以本版说明、`release-manifest.json` 及 `dist/verification/0.7.18/` 为准，不能用旧版结果替代。上述版本均未实机验收。

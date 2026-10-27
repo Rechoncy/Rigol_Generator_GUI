@@ -522,6 +522,51 @@ def _bundle_self_test(report_path: Path) -> int:
             "query_only": True, "editors_unchanged": True, "failed_snapshot_invalidated": True,
             "bad_reply_visible": True, "retry_without_reconnect": True, "hardware_access": False,
         }
+        # A complete cached read must expire even if the connection timer misses
+        # the disconnected interval. Conversely, it must retain a new request
+        # that already targets the replacement connection.
+        home.connection_manager.disconnect(dg.record)
+        home.connection_manager.connect(dg.record)
+        generator.commands.clear()
+        dg.sync_connection_state()
+        if (any(value.text() != "未知" for values in dg.output_readback_values.values()
+                for value in values.values())
+                or "回读时间" in dg.output_readback_status.text()
+                or generator.commands):
+            raise AssertionError("DG completed snapshot survived a quick reconnect, or status sync performed I/O")
+        home.connection_manager.disconnect(dg.record)
+        home.connection_manager.connect(dg.record)
+        generator.commands.clear()
+        read_entered, release_read = threading.Event(), threading.Event()
+        original_dg_read = dg.driver.read_output_parameters
+
+        def delayed_new_connection_read():
+            read_entered.set()
+            if not release_read.wait(3):
+                raise TimeoutError("DG readback generation probe was not released")
+            return original_dg_read()
+
+        dg.driver.read_output_parameters = delayed_new_connection_read
+        try:
+            dg.output_readback_button.click()
+            if not read_entered.wait(2):
+                raise AssertionError("DG fresh read did not start after reconnect")
+            sync_started = time.monotonic()
+            dg.sync_connection_state()
+            if time.monotonic() - sync_started > .5 or generator.commands:
+                raise AssertionError("DG connection sync waited for the read transaction or performed I/O")
+            release_read.set()
+            wait_idle(require_connected=True)
+        finally:
+            release_read.set()
+            dg.driver.read_output_parameters = original_dg_read
+        if ("回读时间" not in dg.output_readback_status.text()
+                or dg.output_readback_values[2]["amplitude"].text() == "未知"):
+            raise AssertionError("DG connection sync discarded a fresh result from the current connection")
+        report["dg_readback_connection_generation"] = {
+            "completed_snapshot_invalidated": True, "no_io_during_sync": True,
+            "fresh_read_survives_sync": True, "hardware_access": False,
+        }
         from rigol_control.scan import ScanPoint
         vaunix = next(w for w in home.open_windows.values() if type(w).__name__ == "VaunixLmsWindow")
         device = vaunix.device

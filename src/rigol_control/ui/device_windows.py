@@ -671,6 +671,7 @@ class DG4000Window(BaseDeviceWindow):
         self._ui_connected = False
         self._output_readback_pending = False
         self._output_readback_token = 0
+        self._output_readback_generation: int | None = None
         self.output_readback_values: dict[int, dict[str, QLabel]] = {}
         self._ni_source_signature: tuple[tuple[str, str, str, bool], ...] = ()
         self._frequency_capabilities = dg4000_capabilities("")
@@ -753,6 +754,13 @@ class DG4000Window(BaseDeviceWindow):
             self._connected(self.connection_manager.info(self.record))
         elif not connected and self._ui_connected:
             self._disconnected()
+        elif (connected and self._output_readback_generation is not None
+              and self.driver.session.connection_generation != self._output_readback_generation):
+            # A shared session can disconnect and reconnect between UI ticks.
+            # Its cached state must not keep a snapshot from that old lifetime.
+            self._invalidate_output_readback("连接已变化 · 回读值未知，请重新回读")
+            self._set_output_metrics(None)
+            self._update_output_readback_buttons()
 
     def _overview_page(self) -> QWidget:
         page, layout = page_shell("DG4000 设备总览", "管理连接、输出状态与最近的联动任务。")
@@ -1105,6 +1113,7 @@ class DG4000Window(BaseDeviceWindow):
 
     def _invalidate_output_readback(self, message: str) -> None:
         self._output_readback_token += 1
+        self._output_readback_generation = None
         for values in self.output_readback_values.values():
             for value in values.values():
                 value.setText("未知")
@@ -1121,6 +1130,9 @@ class DG4000Window(BaseDeviceWindow):
         self._invalidate_output_readback("正在回读 CH1 / CH2…")
         token = self._output_readback_token
         generation = self.driver.session.connection_generation
+        # The new request already belongs to this connection; the status timer
+        # must preserve it even if a fast reconnect has not yet been observed.
+        self._output_readback_generation = generation
         self._output_readback_pending = True
         self._update_output_readback_buttons()
 

@@ -214,6 +214,60 @@ class DgReadbackUiTests(unittest.TestCase):
         self.assertFalse(self.window.output_readback_button.isEnabled())
         self.assertFalse(self.window.overview_readback_button.isEnabled())
 
+    def test_completed_snapshot_is_cleared_after_quick_reconnect_without_querying(self):
+        self.refresh()
+        editors = self.window._device_parameter_snapshot()
+        old_generation = self.window.driver.session.connection_generation
+        self.manager.disconnect(self.record)
+        self.manager.connect(self.record)
+        self.assertNotEqual(self.window.driver.session.connection_generation, old_generation)
+        self.generator.channels[1].update(frequency_hz=321000000, amplitude_vpp=0.25, output=False)
+        self.manager.acquire_devices("readback-test", [self.record.id])
+        self.generator.commands.clear()
+
+        self.window.sync_connection_state()
+
+        self.assert_unknown()
+        self.assertEqual(self.window.overview_metrics["channel_1"].text(), "未知")
+        self.assertEqual(self.window.overview_metrics["channel_2"].text(), "未知")
+        self.assertIn("连接已变化", self.window.output_readback_status.text())
+        self.assertNotIn("回读时间", self.window.output_readback_status.text())
+        self.assertEqual(list(self.generator.commands), [])
+        self.assertEqual(self.window._device_parameter_snapshot(), editors)
+        self.assertEqual(self.manager.lease_owner(self.record.id), "readback-test")
+
+    def test_new_connection_read_survives_sync_while_transaction_is_busy(self):
+        self.refresh()
+        self.manager.disconnect(self.record)
+        self.manager.connect(self.record)
+        self.generator.channels[1]["frequency_hz"] = 3456789
+        entered, release = Event(), Event()
+        original = self.window.driver.read_output_parameters
+
+        def slow_read():
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("test read not released")
+            return original()
+
+        watchdog = Timer(2, release.set)
+        watchdog.start()
+        try:
+            with patch.object(self.window.driver, "read_output_parameters", side_effect=slow_read):
+                self.window.output_readback_button.click()
+                self.assertTrue(entered.wait(1))
+                started = time.monotonic()
+                self.window.sync_connection_state()
+                self.assertLess(time.monotonic() - started, 0.5, "Connection sync waited for the I/O transaction")
+                self.assertTrue(self.window._output_readback_pending)
+                release.set()
+                self.assertTrue(self.wait(lambda: not self.window._call_tasks))
+            self.assertEqual(self.window.output_readback_values[1]["frequency"].text(), "3456789 Hz")
+            self.assertIn("回读时间", self.window.output_readback_status.text())
+        finally:
+            release.set()
+            watchdog.cancel()
+
 
 if __name__ == "__main__":
     unittest.main()
