@@ -2,9 +2,9 @@
 
 这是一个面向 RIGOL DG4000、鼎阳 SIGLENT SSG、Vaunix Lab Brick LMS/BLX 信号源、Newport SMC100CC / PR50CC 旋转台与 NI DAQ 的多设备桌面控制程序。首页用于保存和管理多台设备；点击设备卡片后，会打开独立的设备设置窗口，多台设备窗口可同时存在。
 
-**Windows 便携版：** [v0.7.18](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.18) 提供内置 Python/Qt 与 Python 仪器接口的目录 ZIP 和单文件 EXE；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。构建与验收状态以发行附件 `release-manifest.json` 为准。具体文件、数据迁移、实机驱动及编译方法见 [发行版使用与构建说明](release/README.md)和[0.7.18 发行说明](release/NOTES-0.7.18.md)。
+**Windows 便携版：** [v0.7.20](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.20) 提供内置 Python/Qt 与 Python 仪器接口的目录 ZIP 和单文件 EXE；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。构建与验收状态以发行附件 `release-manifest.json` 为准。具体文件、数据迁移、实机驱动及编译方法见 [发行版使用与构建说明](release/README.md)和[0.7.20 发行说明](release/NOTES-0.7.20.md)。
 
-当前源码为 **0.7.20 本地开发构建**，完善 Newport 波片架的状态说明、手动恢复使能、归零拒绝后的回读与停止清理，修复后台任务未启动时窗口无法关闭的问题；保留 DG4000 快速重连后旧快照失效规则。变更及实际验证见 [0.7.20 说明](release/NOTES-0.7.20.md)，DG 缓存修复保留在 [0.7.19 记录](release/NOTES-0.7.19.md)。正式下载仍为上面的 **v0.7.18**，未创建 v0.7.20 标签或 GitHub Release，原有发行附件保留。
+当前源码与正式发行版本为 **0.7.20**，完善 Newport 波片架的状态说明、手动恢复使能、归零拒绝后的回读与停止清理，修复后台任务未启动时窗口无法关闭的问题；保留 DG4000 快速重连后旧快照失效规则。按用户要求通过 `v0.7.20` 标签构建和发布，变更及验证范围见 [0.7.20 发行说明](release/NOTES-0.7.20.md)，DG 缓存修复的阶段记录保留在 [0.7.19 说明](release/NOTES-0.7.19.md)。
 
 软件图标以波形、采样点和旋转箭头表示信号源、采集与循环扫描。仓库根目录原有的 `Lab Control Center.exe` 是供源码运行的小型启动器，依赖目标电脑的 64 位 Python 3.10+ / PyQt6；它不是上述发行附件。开发者可继续使用它或 `run_app.cmd`。
 
@@ -73,10 +73,10 @@
 
 ### 使用便携发行版
 
-从 [v0.7.18 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.18) 下载便携文件和校验清单。正式发行由版本标签对应的提交构建，生成与验收状态以同组附件 `release-manifest.json` 为准。本地保存的正式发行附件位于 `dist/published/v0.7.18/`；自行构建的输出目录为 `dist/release/`。本版文件为：
+从 [v0.7.20 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.20) 下载便携文件和校验清单。正式发行由版本标签对应的提交构建，生成与验收状态以同组附件 `release-manifest.json` 为准。本地保存的正式发行附件位于 `dist/published/v0.7.20/`；自行构建的输出目录为 `dist/release/`。本版文件为：
 
-- `Lab-Control-Center-0.7.18-windows-x64-portable.zip`：完整解压后运行 `Lab Control Center.exe`，保留 `_internal/`。
-- `Lab-Control-Center-0.7.18-windows-x64.exe`：单文件启动，内置运行时临时解压，持久化配置保存在 EXE 旁 `data/`。
+- `Lab-Control-Center-0.7.20-windows-x64-portable.zip`：完整解压后运行 `Lab Control Center.exe`，保留 `_internal/`。
+- `Lab-Control-Center-0.7.20-windows-x64.exe`：单文件启动，内置运行时临时解压，持久化配置保存在 EXE 旁 `data/`。
 
 两种格式默认使用 EXE 旁的 `data/`；`--data-dir` 和 `RIGOL_GUI_DATA_DIR` 可以覆盖。迁移时复制程序与 `data/`，用户另选位置的采集文件需一并迁移。旧源码版 AppData 配置不会自动迁移，可用首页“导出配置 / 导入配置”。详见[便携迁移与升级](release/README.md#3-保存迁移与升级)。
 
@@ -146,7 +146,7 @@ python -m rigol_control --data-dir .\runtime-data
 
 ## Vaunix LMS/BLX 实机配置
 
-1. 使用发行清单确认内置 DLL 的 0.7.18 便携 ZIP 或单文件 EXE 时，直接使用内置 SDK 1.15 DLL。源码运行可将 Windows x64 `vnx_fmsynth.dll` 放在项目主目录，或保留仓库 SDK 目录；也可通过 `VAUNIX_LMS_DLL` 指定 DLL。
+1. 使用发行清单确认内置 DLL 的 0.7.20 便携 ZIP 或单文件 EXE 时，直接使用内置 SDK 1.15 DLL。源码运行可将 Windows x64 `vnx_fmsynth.dll` 放在项目主目录，或保留仓库 SDK 目录；也可通过 `VAUNIX_LMS_DLL` 指定 DLL。
 2. 插入 Vaunix Lab Brick 后，在首页添加 `Vaunix LMS/BLX`；资源下拉框会显示型号、序列号和 `VAUNIX::LMS::<序列号>`。资源身份使用序列号，不依赖 DLL 每次枚举得到的临时设备句柄。首页后台探测只枚举设备，不调用 `fnLMS_InitDevice` 或 `fnLMS_CloseDevice`，不会抢占或关闭正式控制会话。
 3. 连接后先在“总览”核对型号、序列号、SDK 版本、频率/功率范围以及 BLX 序列、快速脉冲、Chirp 能力；不支持的功能按钮会被禁用。
 4. “射频输出”使用 Hz/GHz 与绝对 dBm；DLL 功率参数以 0.25 dB 为编码单位，但仪器实际功率分辨率为 0.5 dB，软件会拒绝不在 0.5 dB 网格上的输出、序列和扫描值。先保持 RF 关闭，应用低风险参数后再开 RF。

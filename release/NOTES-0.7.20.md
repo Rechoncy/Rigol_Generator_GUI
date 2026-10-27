@@ -1,7 +1,15 @@
-# Lab Control Center 0.7.20
+# Lab Control Center 0.7.20 发行说明
 
-日期：2026-10-27。
-状态：本地开发构建；未创建 v0.7.20 标签或 GitHub Release。正式下载仍为 [v0.7.18](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.18)，原开发包、正式附件与验证记录保留。
+日期：2026-10-27；平台：Windows 10/11 x64。
+正式发行：GitHub Release `v0.7.20`；未进行实体仪器验收。
+
+本版完善 Newport SMC100CC / PR50CC 波片架的状态说明和手动恢复，保留 DG4000 快速重连后旧回读快照失效修复。便携 ZIP 和单文件 EXE 由标签对应提交构建，内置 Python、Qt、Python 仪器接口及 Vaunix Windows x64 SDK DLL，目标电脑无需安装 Python。
+
+## 相对上一正式版 v0.7.18
+
+- 带入 0.7.19 的 DG4000 缓存修复：共享连接快速断开和重连，即使中间断开状态未被界面观察到，也会清空原连接已经显示的频率、幅度、输出及回读时间；新连接上的有效请求不会被误清除。此检查不增加仪器查询或参数写入。
+- 新增本版 Newport 中文状态与操作建议、显式恢复使能、归零状态拒绝后的正确回读，以及停止失败保留占用和显式清理。未开始的后台任务提交失败也能恢复完成标志，不再因空任务阻止关闭。
+- 保留 v0.7.18 的 DG4000、SSG、Vaunix 参数回读、NI 记录及清理修复。原配置和任务格式、首触发点、有序积压、通道隔离及原生扫描恢复规则保持兼容。
 
 ## Newport 波片架状态与恢复
 
@@ -35,10 +43,14 @@
 
 完整源码回归 **529 项通过（本次日志耗时 1502.036 秒）**。新增状态驱动回归 18 项、Newport 窗口回归 26 项通过，窗口测试包含原有 12 项和新增 14 项，本版总共新增 32 项回归。源码虚拟自检通过；默认 1180×760 窗口的 READY、NOT REFERENCED 和 DISABLE 三种状态截图确认状态说明、按钮和提示可读。测试耗时仅为本次运行记录，不用于推断实机运动、查询或触发性能。
 
-本轮完整 unittest、源码虚拟自检与针对性复现日志保存在 `dist/verification/0.7.20/`。目录包、单文件 EXE 和 ZIP 解压后的冻结运行结果须按本版 `release-manifest.json` 逐项核对，不以源码测试成功代替冻结产物验收。
+发布前完整 unittest、源码虚拟自检与针对性复现日志保存在 `dist/verification/0.7.20/`；对应 GitHub Windows CI 的 529 项回归亦已通过（该次 56.047 秒）。本地目录包、单文件 EXE 和 ZIP 解压后的冻结检查通过，作为开发阶段验收记录保留。各次耗时均不构成跨机器性能比较或实机结论。
+
+正式标签流程会从对应提交重新构建目录包、单文件 EXE 和 ZIP，执行冻结自检与完整回归，全部成功后才发布附件；正式构建的实际结果、依赖和源提交须按同组 `release-manifest.json` 逐项核对，不以先前开发包的验收代替正式标签构建。
 
 冻结自检新增 `newport_manual_recovery`，检查状态拒绝后仍可控制、DISABLE 显式恢复且不寻原点、未启动任务提交失败的完成标志、停止失败保留占用、显式重试完成、不自动重放运动，以及未参考状态停止不破坏后续寻原点（`unreferenced_stop_preserves_homing`）。本轮源码自检实际执行上述七项，全部为 true，`hardware_access=false`；三种冻结产物复用同一组检查，其实际结果由构建清单记录。
 
-本地交付使用 `dist/local/v0.7.20/`，保存便携 ZIP、单文件 EXE、源码快照、`RELEASE-NOTES.md`、`release-manifest.json` 和 `SHA256SUMS.txt`。原 `dist/local/v0.7.19/`、`dist/published/v0.7.18/` 及其他历史附件保留；源码和包均使用同一实现，不创建新标签或 Release。
+正式发行附件为 `Lab-Control-Center-0.7.20-windows-x64-portable.zip`、`Lab-Control-Center-0.7.20-windows-x64.exe`、`Lab-Control-Center-0.7.20-windows-x64-source.zip`、`RELEASE-NOTES.md`、`release-manifest.json` 和 `SHA256SUMS.txt`。正式发布附件的本地副本保存在 `dist/published/v0.7.20/`，原 `dist/local/v0.7.20/` 开发包、`dist/local/v0.7.19/`、`dist/published/v0.7.18/` 及其他历史附件保留，不覆盖已有文件。
 
-协议依据为 [Newport SMC100CC/PP 用户手册 EDH0206En2060（02/25）](https://www.newport.com/medias/sys_master/resources/hb8/he4/9966292729886/SMC100CC%20and%20SMC100PP%20-%20User%20Manual/SMC100CC-and-SMC100PP-User-Manual.pdf)的 MM（印刷 52）、OR（54）、ST（72）和 TS（79）及控制器状态机。完整操作见[Newport 使用说明](../docs/NEWPORT_ROTATION_CN.md#状态与手动恢复0720)、[总使用说明](../docs/USER_MANUAL_CN.md)与[开发日志](../docs/DEVELOPMENT_LOG_CN.md)。
+升级前先停止任务并退出旧程序，完整解压本版 ZIP，再复制原 `data/` 或使用配置导入。确认窗口标题为 `v0.7.20`、设备地址及控制器身份；硬件驱动仍需按实际设备安装。本轮未进行实体仪器操作，不能据此确认用户此前的现场状态或机械恢复结果。
+
+协议依据为 [Newport SMC100CC/PP 用户手册 EDH0206En2060（02/25）](https://www.newport.com/medias/sys_master/resources/hb8/he4/9966292729886/SMC100CC%20and%20SMC100PP%20-%20User%20Manual/SMC100CC-and-SMC100PP-User-Manual.pdf)的 MM（印刷 52）、OR（54）、ST（72）和 TS（79）及控制器状态机。完整操作见[Newport 使用说明](https://github.com/Rechoncy/Rigol_Generator_GUI/blob/v0.7.20/docs/NEWPORT_ROTATION_CN.md#状态与手动恢复0720)、[总使用说明](https://github.com/Rechoncy/Rigol_Generator_GUI/blob/v0.7.20/docs/USER_MANUAL_CN.md)、[便携运行说明](https://github.com/Rechoncy/Rigol_Generator_GUI/blob/v0.7.20/release/README.md)与[开发日志](https://github.com/Rechoncy/Rigol_Generator_GUI/blob/v0.7.20/docs/DEVELOPMENT_LOG_CN.md)。DG 快速重连修复的阶段验证见[0.7.19 说明](https://github.com/Rechoncy/Rigol_Generator_GUI/blob/v0.7.20/release/NOTES-0.7.19.md)。
