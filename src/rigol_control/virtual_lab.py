@@ -192,13 +192,27 @@ class VirtualGenerator:
         suffix = source_match.group(2)
         if suffix in {"VOLT:UNIT", "VOLTAGE:UNIT"}:
             return self.amplitude_units[int(source_match.group(1))]
+        if suffix in {"VOLT", "VOLTAGE", "VOLTAGE:LEVEL:IMMEDIATE:AMPLITUDE"}:
+            unit = self.amplitude_units[int(source_match.group(1))]
+            amplitude = float(channel["amplitude_vpp"])
+            if unit == "VPP":
+                return str(amplitude)
+            # The virtual source models a sine-wave RMS conversion only.
+            # Do not invent RMS/power for arbitrary/noise/PWM waveforms.
+            if channel["function"] not in {"SIN", "SINE", "SINUSOID"}:
+                raise ValueError("虚拟 DG 尚未模拟非正弦波的 VRMS/dBm 幅度换算")
+            rms = amplitude / (2 * math.sqrt(2))
+            if unit == "VRMS":
+                return str(rms)
+            load = channel["load_ohms"]
+            if load is None or rms <= 0:
+                raise ValueError("虚拟 DG 的 dBm 回读需要有效负载及非零正弦幅度")
+            return str(10 * math.log10(rms * rms / float(load) / .001))
         mapping = {
             "FUNC": "function",
             "FUNCTION": "function",
             "FREQ": "frequency_hz",
             "FREQUENCY": "frequency_hz",
-            "VOLT": "amplitude_vpp",
-            "VOLTAGE": "amplitude_vpp",
             "VOLT:OFFS": "offset_v",
             "VOLTAGE:OFFSET": "offset_v",
             "PHAS": "phase_deg",
@@ -281,21 +295,25 @@ class VirtualScpiSession:
 
     @property
     def connection_generation(self) -> int:
-        with self._lock:
+        with self._status_lock:
             return self._connection_generation
+
+    def _advance_connection_generation(self) -> None:
+        with self._status_lock:
+            self._connection_generation += 1
 
     def connect(self) -> str:
         with self._lock:
             previously_connected = self._generator.connected
             if not previously_connected:
-                self._connection_generation += 1
+                self._advance_connection_generation()
             self._generator.connected = True
             try:
                 self._identity = self._generator.query("*IDN?")
             except Exception:
                 if not previously_connected:
                     self._generator.connected = False
-                    self._connection_generation += 1
+                    self._advance_connection_generation()
                     self._identity = ""
                     self._publish_status(False)
                 raise
@@ -305,7 +323,7 @@ class VirtualScpiSession:
     def disconnect(self) -> None:
         with self._lock:
             if self._generator.connected:
-                self._connection_generation += 1
+                self._advance_connection_generation()
             self._generator.connected = False
             self._identity = ""
             self._publish_status(False)

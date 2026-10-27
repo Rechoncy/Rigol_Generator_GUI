@@ -599,12 +599,16 @@ class UiSmokeTests(unittest.TestCase):
         points = dg_window._sequence_points()
         self.assertEqual([item.value for item in points[1].values], [200, 0.75])
         self.assertEqual(dg_window.step_table.item(0, 3).text(), "起始点（第一个触发）")
+        # The result callback can arrive before CallTask.finished. Wait for
+        # the pending manual operation to release its startup guard as well.
+        self.assertTrue(self._wait_for(lambda: not dg_window._call_tasks))
         dg_window._start_trigger()
         self.assertTrue(
             self._wait_for(
                 lambda: dg_window.controller is not None
                 and dg_window.controller.snapshot().state.value == "running"
-            )
+            ),
+            dg_window.statusBar().currentMessage(),
         )
         ni_window._emit_virtual_triggers(6)
         self.assertTrue(

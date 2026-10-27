@@ -175,6 +175,22 @@ class BasicWaveform:
     phase_deg: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class DG4000OutputReadback:
+    """Instrument basic-waveform settings, not a physical output measurement.
+
+    ``amplitude`` is expressed in the returned instrument ``amplitude_unit``;
+    it must not be treated as Vpp when the instrument reports VRMS or DBM.
+    """
+
+    channel: int
+    frequency_hz: float
+    amplitude: float
+    amplitude_unit: str
+    output_enabled: bool
+    connection_generation: int
+
+
 def validate_channel(channel: int) -> None:
     if channel not in (1, 2):
         raise ValueError("DG4000 通道只能是 1 或 2")
@@ -391,6 +407,77 @@ class DG4000Driver:
 
     def output_states(self) -> tuple[bool, bool]:
         return (self.output_enabled(1), self.output_enabled(2))
+
+    def read_output_parameters(self, channels=(1, 2)) -> tuple[DG4000OutputReadback, ...]:
+        """Read a complete channel group without writes or automatic recovery.
+
+        All queries share a transaction with parameter stepping. A unit change
+        between the bracketing queries rejects the group rather than labeling
+        an amplitude with an uncertain unit. The returned frequency is the
+        basic-waveform setting; sweep/modulation instantaneous values are not
+        measured by these commands.
+        """
+        selected = tuple(channels)
+        if not selected or len(selected) != len(set(selected)):
+            raise ValueError("回读通道不能为空或重复")
+        for channel in selected:
+            if isinstance(channel, bool) or not isinstance(channel, int):
+                raise ValueError("DG4000 回读通道只能是整数 1 或 2")
+            validate_channel(channel)
+
+        def query(command: str) -> str:
+            try:
+                return self.session.query(command, recover=False)
+            except Exception as exc:
+                raise RuntimeError(f"DG4000 回读失败 [{command}]：{exc}") from exc
+
+        def number(command: str, *, non_negative: bool = False) -> float:
+            raw = query(command)
+            try:
+                value = float(raw.strip())
+                if not math.isfinite(value) or (non_negative and value < 0):
+                    raise ValueError()
+            except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"DG4000 数值回读无效 [{command}]：{raw!r}") from exc
+            return value
+
+        def unit(command: str) -> tuple[str, str]:
+            raw = query(command)
+            value = raw.strip().strip('"').upper() if isinstance(raw, str) else ""
+            if value not in {"VPP", "VRMS", "DBM"}:
+                raise ValueError(f"DG4000 幅度单位回读无效 [{command}]：{raw!r}")
+            return value, raw
+
+        results = []
+        with self.session.transaction():
+            generation = self.session.connection_generation
+            for channel in selected:
+                unit_command = f":SOUR{channel}:VOLT:UNIT?"
+                before_unit, before_raw = unit(unit_command)
+                frequency_command = f":SOUR{channel}:FREQ?"
+                frequency = number(frequency_command, non_negative=True)
+                amplitude_command = f":SOUR{channel}:VOLT?"
+                amplitude = number(amplitude_command, non_negative=before_unit != "DBM")
+                output_command = f":OUTP{channel}?"
+                output_raw = query(output_command)
+                try:
+                    enabled = parse_output_state(output_raw)
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise ValueError(f"DG4000 输出状态回读无效 [{output_command}]：{output_raw!r}") from exc
+                after_unit, after_raw = unit(unit_command)
+                if before_unit != after_unit:
+                    raise ValueError(
+                        f"DG4000 回读期间幅度单位变化 [{unit_command}]："
+                        f"{before_raw!r} -> {after_raw!r}；请重试回读"
+                    )
+                results.append(DG4000OutputReadback(
+                    channel=channel, frequency_hz=frequency,
+                    amplitude=amplitude, amplitude_unit=before_unit,
+                    output_enabled=enabled, connection_generation=generation,
+                ))
+            if self.session.connection_generation != generation:
+                raise RuntimeError("DG4000 回读期间连接已变化，本组回读结果已丢弃")
+        return tuple(results)
 
     def set_output_load(self, channel: int, load_ohms: int | None) -> None:
         validate_channel(channel)

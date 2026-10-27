@@ -22,9 +22,11 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QLayout,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QScrollArea,
     QPushButton,
     QSpinBox,
     QStackedWidget,
@@ -667,6 +669,9 @@ class DG4000Window(BaseDeviceWindow):
         self.trigger_bridge.updated.connect(self._trigger_updated)
         self._last_trigger_error: str | None = None
         self._ui_connected = False
+        self._output_readback_pending = False
+        self._output_readback_token = 0
+        self.output_readback_values: dict[int, dict[str, QLabel]] = {}
         self._ni_source_signature: tuple[tuple[str, str, str, bool], ...] = ()
         self._frequency_capabilities = dg4000_capabilities("")
         self.frequency_limit_controls: list[UnitValueWidget] = []
@@ -785,9 +790,13 @@ class DG4000Window(BaseDeviceWindow):
         self.self_test_button = QPushButton("执行自检")
         self.self_test_button.setEnabled(False)
         self.self_test_button.clicked.connect(lambda: self._execute_scpi("*TST?"))
+        self.overview_readback_button = QPushButton("回读频率 / 幅度")
+        self.overview_readback_button.setEnabled(False)
+        self.overview_readback_button.clicked.connect(self._show_output_readback)
         buttons.addWidget(self.connect_button)
         buttons.addWidget(self.disconnect_button)
         buttons.addWidget(self.self_test_button)
+        buttons.addWidget(self.overview_readback_button)
         buttons.addStretch()
         connection_layout.addLayout(buttons)
         layout.addWidget(connection)
@@ -865,6 +874,8 @@ class DG4000Window(BaseDeviceWindow):
         self.driver_status.style().polish(self.driver_status)
         self._ui_connected = True
         self.overview_metrics["connection"].setText("已连接")
+        self._invalidate_output_readback("已连接 · 点击回读频率 / 幅度")
+        self._update_output_readback_buttons()
         self.statusBar().showMessage(
             f"DG4000 VISA 会话已连接；{capability_note}",
             8000,
@@ -964,6 +975,8 @@ class DG4000Window(BaseDeviceWindow):
         self._ui_connected = False
         self.overview_metrics["connection"].setText("未连接")
         self._set_output_metrics(None)
+        self._invalidate_output_readback("未连接 · 回读值未知")
+        self._update_output_readback_buttons()
         self.statusBar().showMessage("DG4000 已断开", 5000)
 
     def _require_connection(self) -> bool:
@@ -1029,7 +1042,133 @@ class DG4000Window(BaseDeviceWindow):
             tab_layout.addStretch()
             tabs.addTab(tab, f"CH{channel}")
         layout.addWidget(tabs)
-        return page
+        layout.addWidget(self._output_readback_panel())
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(page)
+        return scroll
+
+    def _output_readback_panel(self) -> QWidget:
+        monitor, monitor_layout = panel("仪器频率与幅度回读 · 手动快照")
+        self.output_readback_widget = monitor
+        actions = QHBoxLayout()
+        self.output_readback_button = QPushButton("回读频率 / 幅度")
+        self.output_readback_button.setEnabled(False)
+        self.output_readback_button.clicked.connect(self._refresh_output_readback)
+        self.output_readback_status = QLabel("未读取 · 请先连接设备")
+        self.output_readback_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.output_readback_status.setWordWrap(True)
+        self.output_readback_status.setObjectName("Muted")
+        actions.addWidget(self.output_readback_button)
+        actions.addWidget(self.output_readback_status, 1)
+        monitor_layout.addLayout(actions)
+        channels = QHBoxLayout()
+        for channel in (1, 2):
+            card, card_layout = panel(f"CH{channel}")
+            form = QFormLayout()
+            values = {}
+            for name, caption in (("frequency", "频率"), ("amplitude", "幅度"), ("output", "通道输出")):
+                value = QLabel("未知")
+                value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                if name != "output":
+                    value.setStyleSheet("font-size:16px; font-weight:600;")
+                value.setMinimumHeight(value.fontMetrics().height() + 4)
+                form.addRow(caption, value)
+                values[name] = value
+            self.output_readback_values[channel] = values
+            card_layout.addLayout(form)
+            channels.addWidget(card)
+        monitor_layout.addLayout(channels)
+        note = QLabel(
+            "回读仪器参数，不覆盖上方编辑值。幅度按仪器当前 Vpp / Vrms / dBm 单位显示；"
+            "输出关闭时数值仅为配置。扫频或调制时的瞬时信号须由测量设备确认。"
+        )
+        note.setWordWrap(True)
+        note.setObjectName("Muted")
+        monitor_layout.addWidget(note)
+        return monitor
+
+    def _show_output_readback(self) -> None:
+        self._select_page(1)
+        page = self.pages.widget(1)
+        if isinstance(page, QScrollArea):
+            page.ensureWidgetVisible(self.output_readback_widget, 20, 20)
+        self._refresh_output_readback()
+
+    def _update_output_readback_buttons(self) -> None:
+        enabled = self.driver.is_connected and not self._output_readback_pending
+        for button in (self.overview_readback_button, self.output_readback_button):
+            button.setEnabled(enabled)
+            button.setText("回读中…" if self._output_readback_pending else "回读频率 / 幅度")
+
+    def _invalidate_output_readback(self, message: str) -> None:
+        self._output_readback_token += 1
+        for values in self.output_readback_values.values():
+            for value in values.values():
+                value.setText("未知")
+                value.setToolTip("")
+        self.output_readback_status.setText(message)
+
+    def _refresh_output_readback(self) -> None:
+        if self._output_readback_pending:
+            return
+        if not self.driver.is_connected:
+            self._invalidate_output_readback("未连接 · 回读值未知")
+            self._update_output_readback_buttons()
+            return
+        self._invalidate_output_readback("正在回读 CH1 / CH2…")
+        token = self._output_readback_token
+        generation = self.driver.session.connection_generation
+        self._output_readback_pending = True
+        self._update_output_readback_buttons()
+
+        def read_parameters():
+            with self.driver.session.transaction():
+                if not self.driver.is_connected or self.driver.session.connection_generation != generation:
+                    raise RuntimeError("连接已变化，已取消旧连接的回读，请重新回读")
+                readings = self.driver.read_output_parameters()
+                return readings, datetime.now().astimezone()
+
+        def completed(result):
+            self._output_readback_pending = False
+            self._update_output_readback_buttons()
+            readings, read_at = result
+            if token != self._output_readback_token:
+                return
+            if (not self.driver.is_connected or self.driver.session.connection_generation != generation
+                    or any(item.connection_generation != generation for item in readings)):
+                self._invalidate_output_readback("连接已变化 · 回读值未知，请重新回读")
+                self._set_output_metrics(None)
+                return
+            for item in readings:
+                values = self.output_readback_values[item.channel]
+                frequency = f"{roundtrip_number(item.frequency_hz)} Hz"
+                amplitude_unit = {"VPP": "Vpp", "VRMS": "Vrms", "DBM": "dBm"}[item.amplitude_unit]
+                amplitude = f"{roundtrip_number(item.amplitude)} {amplitude_unit}"
+                values["frequency"].setText(frequency)
+                values["amplitude"].setText(amplitude)
+                values["output"].setText("开启" if item.output_enabled else "关闭（未输出）")
+                values["frequency"].setToolTip(f"仪器基本波频率参数：{frequency}；不是扫频/调制瞬时实测值")
+                values["amplitude"].setToolTip(f"仪器当前幅度参数：{amplitude}；未切换单位或负载")
+            self._set_output_metrics(tuple(item.output_enabled for item in readings))
+            self.output_readback_status.setText(
+                f"回读时间：{read_at:%Y-%m-%d %H:%M:%S}（本地） · 点击可刷新"
+            )
+
+        def failed(message: str) -> None:
+            self._output_readback_pending = False
+            self._update_output_readback_buttons()
+            if token != self._output_readback_token:
+                return
+            self._invalidate_output_readback(f"回读失败 · 频率、幅度和输出状态未知：{message}")
+            self._set_output_metrics(None)
+            self.statusBar().showMessage(f"DG4000 参数回读失败：{message}", 10000)
+
+        # This fixed, query-only operation can share the session with a running
+        # trigger task. It never reconnects or enters the per-trigger write path.
+        self.submit(read_parameters, on_success=completed, on_error=failed, allow_during_scan=True)
 
     def _legacy_persistent_controls(self) -> dict[str, QWidget]:
         bindings = super()._legacy_persistent_controls()

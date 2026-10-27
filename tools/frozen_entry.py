@@ -477,6 +477,51 @@ def _bundle_self_test(report_path: Path) -> int:
                                           "quiescent_after_stop": True, "ordered_snapshot_revisions": True,
                                           "reconnected_writer_blocked_without_io": True,
                                           "high_resolution_poll_wait": _WINDOWS_HIGH_RESOLUTION_SLEEP}
+        # Check the shipped readback button and failure presentation, using
+        # distinct virtual channels and the instrument's existing Vrms unit.
+        readback_before = generator.snapshot().channels
+        editors_before = dg._device_parameter_snapshot()
+        generation_before = dg.driver.session.connection_generation
+        generator.commands.clear()
+        dg._show_output_readback()
+        wait_idle(require_connected=True)
+        if (dg.pages.currentIndex() != 1
+                or not dg.output_readback_values[2]["amplitude"].text().endswith(" Vrms")
+                or "回读时间" not in dg.output_readback_status.text()):
+            raise AssertionError("DG readback did not display native units and a completion time")
+        if (generator.snapshot().channels != readback_before
+                or dg._device_parameter_snapshot() != editors_before
+                or len(generator.commands) != 10
+                or not all(command.endswith("?") for command in generator.commands)):
+            raise AssertionError("DG readback changed settings or did not remain query-only")
+        original_dg_query = dg.driver.session.query
+
+        def malformed_dg_amplitude(command, **kwargs):
+            if command == ":SOUR2:VOLT?":
+                return "BUNDLE_BAD_DG_AMPLITUDE"
+            return original_dg_query(command, **kwargs)
+
+        dg.driver.session.query = malformed_dg_amplitude
+        try:
+            dg.output_readback_button.click()
+            wait_idle(require_connected=True)
+            if (any(value.text() != "未知" for values in dg.output_readback_values.values()
+                    for value in values.values())
+                    or "BUNDLE_BAD_DG_AMPLITUDE" not in dg.output_readback_status.text()):
+                raise AssertionError("DG failed readback retained stale values or hid the bad reply")
+        finally:
+            dg.driver.session.query = original_dg_query
+        dg.output_readback_button.click()
+        wait_idle(require_connected=True)
+        if ("回读时间" not in dg.output_readback_status.text()
+                or dg.driver.session.connection_generation != generation_before
+                or generator.snapshot().channels != readback_before):
+            raise AssertionError("DG readback retry reconnected or changed output parameters")
+        report["dg_output_readback"] = {
+            "both_channels_displayed": True, "native_amplitude_unit_displayed": True,
+            "query_only": True, "editors_unchanged": True, "failed_snapshot_invalidated": True,
+            "bad_reply_visible": True, "retry_without_reconnect": True, "hardware_access": False,
+        }
         from rigol_control.scan import ScanPoint
         vaunix = next(w for w in home.open_windows.values() if type(w).__name__ == "VaunixLmsWindow")
         device = vaunix.device
