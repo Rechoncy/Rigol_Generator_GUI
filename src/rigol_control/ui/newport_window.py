@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpi
 
 from ..analog import AnalogAcquisitionController
 from ..connections import DeviceConnectionManager
-from ..drivers.newport_smc100 import MotionError
+from ..drivers.newport_smc100 import MotionError, MotionStateError, MotionStatus
 from ..drivers.ni_analog import AnalogInputBlock, AnalogInputConfig, TERMINAL_MODES
 from ..models import DeviceKind
 from ..repository import default_data_dir
@@ -32,6 +32,14 @@ PHASE_LABELS = {"preparing": "准备中", "holding": "保持 / 等待触发", "m
                 "settling": "稳定等待", "stopped": "已停止", "error": "错误停止"}
 
 
+@dataclass(frozen=True)
+class _ManualReadback:
+    position: float
+    status: MotionStatus
+    velocity: float
+    notice: str = ""
+
+
 class NewportWindow(BaseDeviceWindow):
     def __init__(self, record, all_devices, connection_manager=None, *,
                  device_provider=None, parameter_repository=None):
@@ -43,6 +51,9 @@ class NewportWindow(BaseDeviceWindow):
         self.controller = None
         self.analog = None
         self._manual_busy = False
+        self._manual_cleanup_pending = False
+        self._last_manual_error = ""
+        self._last_motion_status = None
         self._scan_stop_pending = False
         self._cancel_manual = Event()
         self._manual_done = Event()
@@ -99,10 +110,19 @@ class NewportWindow(BaseDeviceWindow):
         page, layout = page_shell("SMC100CC / PR50CC 运动控制", "连接与参数恢复不会归零或移动。使用厂商正确配置的 PR50CC 角度单位。")
         self.connection_label = QLabel("未连接")
         self.position_label = QLabel("当前位置：未知")
-        self.operation_label = QLabel("先连接并读取位置；未归零时可执行归零。")
+        self.status_label = QLabel("控制器状态：未知 · 点击读取位置与状态")
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.status_label.setWordWrap(True)
+        self.state_guidance = QLabel("先连接并读取状态。寻机械原点、回到 0° 与恢复使能是不同操作。")
+        self.state_guidance.setTextFormat(Qt.TextFormat.PlainText)
+        self.state_guidance.setWordWrap(True)
+        self.operation_label = QLabel("先连接并读取位置；未建立参考时才执行寻机械原点。")
         self.operation_label.setWordWrap(True)
+        self.operation_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.connection_label)
         layout.addWidget(self.position_label)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.state_guidance)
         layout.addWidget(self.operation_label)
         actions = QHBoxLayout()
         self.connect_button = QPushButton("连接")
@@ -110,7 +130,7 @@ class NewportWindow(BaseDeviceWindow):
         self.refresh_button = QPushButton("读取位置与状态")
         for button in (self.connect_button, self.disconnect_button, self.refresh_button):
             actions.addWidget(button)
-        self.connect_button.clicked.connect(lambda: self._manual(lambda: self.connection_manager.connect(self.record)))
+        self.connect_button.clicked.connect(self._connect_device)
         self.disconnect_button.clicked.connect(lambda: self._disconnect())
         self.refresh_button.clicked.connect(lambda: self._manual(lambda: None))
         layout.addLayout(actions)
@@ -126,14 +146,19 @@ class NewportWindow(BaseDeviceWindow):
         self.move_button = QPushButton("绝对定位")
         self.minus_button = QPushButton("− 微动")
         self.plus_button = QPushButton("＋ 微动")
-        self.home_button = QPushButton("归零")
+        self.home_button = QPushButton("寻机械原点")
         self.velocity_button = QPushButton("应用速度")
+        self.enable_button = QPushButton("恢复使能（电机励磁）")
+        self.enable_button.setToolTip("仅在 DISABLE 状态发送 MM1，使电机励磁并恢复闭环；可能产生位置校正。"
+                                      "不会自动复位、寻原点或下发定位目标。")
         self.move_button.clicked.connect(lambda: self._move(self.manual_angle.value()))
         self.minus_button.clicked.connect(lambda: self._jog(-self.manual_step.value()))
         self.plus_button.clicked.connect(lambda: self._jog(self.manual_step.value()))
         self.home_button.clicked.connect(lambda: self._manual(self.device.home, wait_motion=True))
         self.velocity_button.clicked.connect(self._set_velocity)
-        self.motion_buttons = [self.move_button, self.minus_button, self.plus_button, self.home_button, self.velocity_button]
+        self.enable_button.clicked.connect(lambda: self._manual(self.device.enable_motor, wait_motion=True))
+        self.motion_buttons = [self.move_button, self.minus_button, self.plus_button, self.home_button,
+                               self.velocity_button, self.enable_button]
         for button in self.motion_buttons:
             actions.addWidget(button)
         layout.addLayout(actions)
@@ -407,9 +432,32 @@ class NewportWindow(BaseDeviceWindow):
         self._tick()
 
     def _busy(self):
-        return self._manual_busy or self._scan_stop_pending or (self.controller is not None and self.controller.is_running)
+        return (self._manual_busy or self._manual_cleanup_pending or self._scan_stop_pending
+                or (self.controller is not None and self.controller.is_running))
 
-    def _manual(self, operation, *, wait_motion=False, capture_initial=False):
+    def _connect_device(self):
+        self._manual(lambda: None, connect=True)
+
+    def _manual_snapshot(self, notice=""):
+        return _ManualReadback(self.device.position(), self.device.status(), self.device.velocity(), notice)
+
+    def _submit_manual(self, work, on_success):
+        started = Event()
+
+        def run():
+            started.set()
+            return work()
+
+        def failed(message):
+            # No worker means there is no operation that can eventually set
+            # this event. A retained cleanup lease remains protected by its flag.
+            if not started.is_set():
+                self._manual_done.set()
+            self._manual_error(message)
+
+        self.submit(run, on_success=on_success, on_error=failed)
+
+    def _manual(self, operation, *, wait_motion=False, capture_initial=False, connect=False):
         if self._busy():
             return
         self._manual_busy = True
@@ -420,64 +468,108 @@ class NewportWindow(BaseDeviceWindow):
 
         def work():
             leased = False
+            motion_uncertain = False
+            stop_attempted = False
+
+            def stop_once():
+                nonlocal stop_attempted, motion_uncertain
+                stop_attempted = True
+                self._manual_cleanup_pending = True
+                self._stop_manual_motion()
+                self._manual_cleanup_pending = False
+                motion_uncertain = False
+
             try:
+                if connect:
+                    self.connection_manager.connect(self.record, owner=self._manual_owner)
                 self.connection_manager.acquire_devices(self._manual_owner, [self.record.id])
                 leased = True
                 if self._cancel_manual.is_set():
                     return None
-                operation()
+                motion_uncertain = wait_motion
+                try:
+                    operation()
+                except MotionStateError as exc:
+                    # The driver guarantees no command was issued for this
+                    # typed refusal. Report the actual state without a STOP.
+                    motion_uncertain = False
+                    return self._manual_snapshot(str(exc))
                 if wait_motion:
                     deadline = time.monotonic() + 120
                     while not self._cancel_manual.is_set():
                         state = self.device.status()
                         if state.ready:
+                            motion_uncertain = False
                             break
                         if not state.moving:
                             raise MotionError(f"控制器未就绪：0x{state.state:02X}")
                         if time.monotonic() >= deadline:
                             raise MotionError("手动运动/归零超时")
                         self._cancel_manual.wait(0.02)
-                    if self._cancel_manual.is_set():
-                        self._stop_manual_motion()
+                    if self._cancel_manual.is_set() and motion_uncertain:
+                        stop_once()
                 if self.device.is_connected:
-                    return self.device.position(), self.device.status(), self.device.velocity()
+                    return self._manual_snapshot()
                 return None
-            except Exception:
-                if wait_motion:
+            except Exception as exc:
+                if motion_uncertain and not stop_attempted:
                     try:
-                        self._stop_manual_motion()
+                        stop_once()
                     except Exception as stop_error:
-                        raise MotionError(f"运动失败且停止未确认：{stop_error}")
+                        raise MotionError(f"运动失败：{exc}；停止未确认：{stop_error}") from exc
                 raise
             finally:
-                if leased:
+                if leased and not self._manual_cleanup_pending:
                     self.connection_manager.release_devices(self._manual_owner)
                 self._manual_done.set()
 
-        self.submit(work, on_success=lambda result: self._manual_result(result, capture_initial=capture_initial),
-                    on_error=self._manual_error)
+        self._submit_manual(work, lambda result: self._manual_result(result, capture_initial=capture_initial))
+
+    def _set_motion_status(self, state):
+        self._last_motion_status = state
+        self.status_label.setText(f"控制器状态：{state.description}" if state is not None
+                                  else "控制器状态：未知 · 请读取位置与状态")
+        self.state_guidance.setText(state.guidance if state is not None
+                                   else "状态尚未确认，先读取位置与状态；不要根据当前位置数值推断已建立机械参考。")
 
     def _manual_result(self, result, *, capture_initial=False):
         self._manual_busy = False
         self._display_run = False
         self._scan_message = ""
+        notice = ""
         if result is not None:
-            position, state, velocity = result
+            if isinstance(result, _ManualReadback):
+                position, state, velocity, notice = result.position, result.status, result.velocity, result.notice
+            else:
+                position, state, velocity = result
             self._last_position, self._last_velocity = position, velocity
+            self._set_motion_status(state)
             self.position_label.setText(f"当前位置：{position:.6f}° · 状态 0x{state.state:02X} · 速度 {velocity:g}°/s")
             if capture_initial and not self._cancel_manual.is_set():
                 self.initial_angle.setValue(position)
                 self.initial_mode.setCurrentIndex(self.initial_mode.findData("specified"))
-        self.operation_label.setText("操作完成" if not self._cancel_manual.is_set() else "已请求停止")
+        if notice:
+            self._last_manual_error = notice
+        message = "操作完成" if not self._cancel_manual.is_set() else "已请求停止"
+        if self._last_manual_error:
+            message += f"；最近错误记录：{self._last_manual_error}"
+        self.operation_label.setText(notice or message)
         self._tick()
 
     def _manual_error(self, message):
         self._manual_busy = False
         self._last_position = self._last_velocity = None
+        self._set_motion_status(None)
         self._display_run = False
         self._scan_message = f"位置未确认：{message}"
         self.position_label.setText("当前位置：未知 · 读取失败")
-        self.operation_label.setText(message)
+        self._last_manual_error = message
+        self.operation_label.setText(message + ("；停止未确认，设备占用继续保留，请点击停止重试。"
+                                               if self._manual_cleanup_pending else ""))
+        if self._manual_cleanup_pending:
+            self.status_label.setText("控制器状态：停止未确认 · 未知")
+            self.state_guidance.setText("先点击“重试停止 / 清理”；连接中断时由原任务重连并确认停止。"
+                                        "确认前不能定位、寻原点、使能、断开或关闭窗口。")
         self._tick()
 
     def _disconnect(self):
@@ -491,18 +583,96 @@ class NewportWindow(BaseDeviceWindow):
                 self.connection_manager.disconnect(self.record)
             finally:
                 self._manual_done.set()
-        self.submit(work, on_success=self._manual_result, on_error=self._manual_error)
+        self._submit_manual(work, self._manual_result)
 
     def _move(self, angle):
         self._manual(lambda: self.device.move_absolute(angle), wait_motion=True)
 
     def _stop_manual_motion(self):
-        self.device.stop()
+        initial_error = None
+        try:
+            initial = self.device.status()
+            initial.check()
+            # ST is not permitted in these known stationary modes. Sending it
+            # would turn an unreferenced stage into a false cleanup dead end.
+            if initial.can_home or initial.state == 0x14:
+                return initial
+        except Exception as exc:
+            # A faulted/failed first TS is still evidence that must be retained.
+            # Try the single safety STOP, without treating a cleared error
+            # buffer in the following TS as proof the original fault vanished.
+            initial_error = exc
+        try:
+            self.device.stop()
+        except Exception as exc:
+            if initial_error is not None:
+                raise MotionError(f"停止前状态读取失败：{initial_error}；停止指令失败：{exc}") from exc
+            raise
         deadline = time.monotonic() + 2.0
-        while self.device.status().moving:
+        while True:
+            try:
+                state = self.device.status()
+                state.check()
+            except Exception as exc:
+                if initial_error is not None:
+                    raise MotionError(f"停止前状态读取失败：{initial_error}；停止后状态读取失败：{exc}") from exc
+                raise
+            if not state.moving:
+                if state.ready or state.can_home or state.disabled or state.state == 0x14:
+                    if initial_error is not None:
+                        raise MotionError(f"停止前状态读取失败：{initial_error}；停止后回读{state.description}，"
+                                          "原错误仍保留，请显式重试停止确认") from initial_error
+                    return state
+                raise MotionError(f"停止后状态未知 0x{state.state:02X}，不能确认运动已停止")
             if time.monotonic() >= deadline:
                 raise MotionError("停止后仍在运动；停止未确认")
             time.sleep(0.01)
+
+    def _retry_manual_stop(self):
+        if self._manual_busy:
+            self._cancel_manual.set()
+            return
+        pending = self._manual_cleanup_pending
+        if not pending and not self.device.is_connected:
+            return
+        self._manual_busy = True
+        self._manual_done.clear()
+        self.operation_label.setText("正在确认停止；不会重放寻原点、恢复使能或定位命令…")
+        self._tick()
+
+        def work():
+            leased = False
+            try:
+                if pending:
+                    if self.connection_manager.lease_owner(self.record.id) != self._manual_owner:
+                        raise MotionError("手动清理的设备占用已变化，不能借其他任务的连接执行停止")
+                    leased = True
+                    if not self.device.is_connected:
+                        self.connection_manager.connect(self.record, owner=self._manual_owner)
+                else:
+                    self.connection_manager.acquire_devices(self._manual_owner, [self.record.id])
+                    leased = True
+                self._manual_cleanup_pending = True
+                state = self._stop_manual_motion()
+                self._manual_cleanup_pending = False
+                return state
+            finally:
+                if leased and not self._manual_cleanup_pending:
+                    self.connection_manager.release_devices(self._manual_owner)
+                self._manual_done.set()
+
+        def completed(state):
+            self._manual_busy = False
+            self._last_position = self._last_velocity = None
+            self._display_run = False
+            self._run_position_valid = False
+            self._set_motion_status(state)
+            self.position_label.setText("当前位置：未知 · 停止已确认，请读取位置")
+            self.operation_label.setText("停止已确认，设备占用已释放；请读取位置与状态。" +
+                                         (f"最近错误记录：{self._last_manual_error}" if self._last_manual_error else ""))
+            self._tick()
+
+        self._submit_manual(work, completed)
 
     def _jog(self, delta):
         self._manual(lambda: self.device.move_absolute(self.device.position() + delta), wait_motion=True)
@@ -602,8 +772,8 @@ class NewportWindow(BaseDeviceWindow):
             self.submit(stop_or_recover, on_success=completed, on_error=failed)
         elif self._manual_busy:
             self._cancel_manual.set()
-        elif self.device.is_connected:
-            self._manual(self._stop_manual_motion)
+        elif self.device.is_connected or self._manual_cleanup_pending:
+            self._retry_manual_stop()
 
     def _inject(self):
         ni = next((d for d in self.ni_devices if d.id == self.ni_combo.currentData()), None)
@@ -737,6 +907,8 @@ class NewportWindow(BaseDeviceWindow):
         external_busy = self.connection_manager.lease_owner(self.record.id) not in {None, self._manual_owner,
                             self.controller.owner if self.controller is not None else None}
         self.connection_label.setText(self.device.identity if connected else "未连接")
+        if not connected and self._last_motion_status is not None:
+            self._set_motion_status(None)
         self.driver_status.setText("● 已连接" if connected else "● 未连接")
         self.driver_status.setStyleSheet("color:#55d9cc" if connected else "color:#f0b95d")
         self.connect_button.setEnabled(not connected and not busy and not external_busy)
@@ -745,21 +917,34 @@ class NewportWindow(BaseDeviceWindow):
         self.scan_refresh_button.setEnabled(connected and not busy and not external_busy)
         self.use_current_button.setEnabled(connected and not busy and not external_busy)
         self.move_initial_button.setEnabled(connected and not busy and not external_busy
-                                            and self._specified_initial() is not None)
+                                            and self._specified_initial() is not None
+                                            and (self._last_motion_status is None or self._last_motion_status.ready))
         for button in self.motion_buttons:
             button.setEnabled(connected and not busy and not external_busy)
+        if self._last_motion_status is not None:
+            available = connected and not busy and not external_busy
+            for button in (self.move_button, self.minus_button, self.plus_button, self.velocity_button):
+                button.setEnabled(available and self._last_motion_status.ready)
+            self.home_button.setEnabled(available and self._last_motion_status.can_home)
+            self.enable_button.setEnabled(available and self._last_motion_status.disabled)
         for widget in [*self.scan_controls, *self.ai_controls]:
             widget.setEnabled(not busy)
         self.initial_angle.setEnabled(not busy and self._specified_initial() is not None)
-        self.start_button.setEnabled(connected and not busy and not external_busy)
+        self.start_button.setEnabled(connected and not busy and not external_busy
+                                     and (self._last_motion_status is None or self._last_motion_status.ready))
         self.stop_button.setEnabled(self.controller is not None and self.controller.is_running and not self._scan_stop_pending)
         self.stop_button.setText("停止中…" if self._scan_stop_pending else
                                  "重连并停止 / 清理" if self.controller is not None and self.controller.cleanup_pending
                                  and not self.controller.is_worker_running and not connected else
                                  "重试停止 / 清理" if self.controller is not None and self.controller.cleanup_pending
                                  and self.controller.snapshot().phase == "error" else "停止扫描")
-        self.manual_stop.setEnabled(connected and not external_busy)
+        self.manual_stop.setEnabled((connected or self._manual_cleanup_pending) and not external_busy
+                                    and not self._scan_stop_pending)
         self.sidebar_stop.setEnabled((connected or busy) and not external_busy and not self._scan_stop_pending)
+        manual_stop_text = ("重连并停止 / 清理" if self._manual_cleanup_pending and not connected else
+                            "重试停止 / 清理" if self._manual_cleanup_pending else "停止运动 / 扫描")
+        self.manual_stop.setText(manual_stop_text)
+        self.sidebar_stop.setText(manual_stop_text if self._manual_cleanup_pending else "停止旋转 / 扫描")
         ni = next((d for d in self.ni_devices if d.id == self.ni_combo.currentData()), None)
         self.inject_button.setEnabled(ni is not None and is_virtual_resource(ni.resource)
                                       and self.controller is not None and self.controller.is_running)
@@ -778,6 +963,10 @@ class NewportWindow(BaseDeviceWindow):
 
     def closeEvent(self, event):
         self._cancel_manual.set()
+        if self._manual_cleanup_pending and not self._manual_busy:
+            self.operation_label.setText("手动运动停止未确认，设备占用仍保留；请点击停止重试确认后关闭。")
+            event.ignore()
+            return
         if self._busy() or self._call_tasks or not self._manual_done.is_set():
             self._stop()
             self.operation_label.setText("硬件操作或 NI 清理尚未结束，请确认停止后关闭；失败可重试停止。")

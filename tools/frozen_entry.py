@@ -897,6 +897,111 @@ def _bundle_self_test(report_path: Path) -> int:
         wait_idle(require_connected=True)
         report["siglent_scan_pages"] = {"separate_editors": True, "bottom_monitor": True,
                                          "matching_configuration_required": True, "list_start_stop": True}
+        # Exercise the packaged Newport recovery UI using only its in-memory
+        # stage. No serial resource, real controller or motion is accessed.
+        from rigol_control.drivers.newport_smc100 import MotionError
+        newport = next(w for w in home.open_windows.values() if type(w).__name__ == "NewportWindow")
+        stage = newport.device
+
+        def wait_newport_worker():
+            # A deliberate failed-stop probe remains busy until explicit
+            # cleanup; waiting for global idle there would conceal the lease.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                app.processEvents()
+                if dialog_errors:
+                    raise RuntimeError("\n".join(dialog_errors))
+                if not newport._manual_busy and not newport._call_tasks and newport._manual_done.is_set():
+                    return
+                time.sleep(.005)
+            raise TimeoutError("Newport virtual manual worker did not finish")
+
+        newport.refresh_button.click()
+        wait_newport_worker()
+        moves_before = tuple(stage.move_history)
+        stops_before, homes_before = stage.stop_count, stage.home_count
+        newport._manual(stage.home, wait_motion=True)
+        wait_newport_worker()
+        if (newport._last_position is None or not newport.move_button.isEnabled()
+                or "READY" not in newport.status_label.text()
+                or stage.stop_count != stops_before or stage.home_count != homes_before):
+            raise AssertionError("A rejected READY home lost the position, blocked controls, or issued STOP/HOME")
+        stage.set_virtual_state(0x3C)
+        newport.refresh_button.click()
+        wait_newport_worker()
+        if not newport.enable_button.isEnabled() or newport.move_button.isEnabled():
+            raise AssertionError("Newport DISABLE state lacks a guarded manual-enable action")
+        enables_before = stage.enable_count
+        newport.enable_button.click()
+        wait_newport_worker()
+        if (not stage.status().ready or stage.enable_count != enables_before + 1
+                or tuple(stage.move_history) != moves_before or stage.home_count != homes_before):
+            raise AssertionError("Newport explicit enable did not reach READY without a position or home command")
+        stage.set_virtual_state(0x0A)
+        newport.refresh_button.click()
+        wait_newport_worker()
+        stops_before_unref = stage.stop_count
+        newport.sidebar_stop.click()
+        wait_newport_worker()
+        if (newport._manual_cleanup_pending or not newport.home_button.isEnabled()
+                or home.connection_manager.lease_owner(newport.record.id) is not None
+                or stage.stop_count != stops_before_unref):
+            raise AssertionError("Stopping an already unreferenced stage issued illegal ST or locked out homing")
+        stage.set_virtual_state(0x33)
+        newport.refresh_button.click()
+        wait_newport_worker()
+        original_start = newport.thread_pool.start
+
+        def reject_newport_task(*_args, **_kwargs):
+            raise RuntimeError("BUNDLE_NEWPORT_DISPATCH_REJECTED")
+
+        newport.thread_pool.start = reject_newport_task
+        try:
+            newport.refresh_button.click()
+        finally:
+            newport.thread_pool.start = original_start
+        if (newport._manual_busy or not newport._manual_done.is_set() or newport._call_tasks
+                or home.connection_manager.lease_owner(newport.record.id) is not None):
+            raise AssertionError("Rejected Newport worker left pending work or an operation lease")
+        newport.refresh_button.click()
+        wait_newport_worker()
+        original_move, original_stop = stage.move_absolute, stage.stop
+        failed_moves, failed_stops = [], []
+
+        def ambiguous_newport_move(angle):
+            failed_moves.append(angle)
+            raise MotionError("BUNDLE_NEWPORT_MOVE_UNCERTAIN")
+
+        def unconfirmed_newport_stop():
+            failed_stops.append(True)
+            raise MotionError("BUNDLE_NEWPORT_STOP_UNCONFIRMED")
+
+        stage.move_absolute, stage.stop = ambiguous_newport_move, unconfirmed_newport_stop
+        try:
+            newport.manual_angle.setValue(.1)
+            newport.move_button.click()
+            wait_newport_worker()
+            if (not newport._manual_cleanup_pending
+                    or home.connection_manager.lease_owner(newport.record.id) != newport._manual_owner
+                    or newport.move_button.isEnabled() or newport.disconnect_button.isEnabled()
+                    or len(failed_moves) != 1 or len(failed_stops) != 1):
+                raise AssertionError("Newport unconfirmed STOP released ownership or replayed a command")
+        finally:
+            stage.move_absolute, stage.stop = original_move, original_stop
+        newport.sidebar_stop.click()
+        wait_newport_worker()
+        if (newport._manual_cleanup_pending or newport._busy()
+                or home.connection_manager.lease_owner(newport.record.id) is not None
+                or tuple(stage.move_history) != moves_before or stage.home_count != homes_before
+                or stage.enable_count != enables_before + 1):
+            raise AssertionError("Newport explicit cleanup retry did not finish without motion replay")
+        report["newport_manual_recovery"] = {
+            "state_rejection_preserves_controls": True, "disabled_enable_without_home": True,
+            "dispatch_failure_clears_pending": True, "failed_stop_retains_ownership": True,
+            "explicit_stop_retry_completes": True, "no_automatic_motion_replay": True,
+            "unreferenced_stop_preserves_homing": True,
+            "hardware_access": False,
+        }
         if home.connection_manager.active_leases():
             raise AssertionError("Virtual windows retained an unexpected device operation lease")
         if not home.close():

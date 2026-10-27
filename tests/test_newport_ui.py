@@ -361,6 +361,239 @@ class NewportUiTests(unittest.TestCase):
         restored = self.window()
         self.assertEqual(restored.ni_combo.currentData(), self.ni.id)
 
+    def test_manual_dispatch_rejection_restores_completion_and_allows_close(self):
+        w = self.window()
+        with patch.object(w.thread_pool, "start", side_effect=RuntimeError("REPRO_POOL_REJECTED")):
+            w.refresh_button.click()
+        self.assertFalse(w._manual_busy)
+        self.assertTrue(w._manual_done.is_set())
+        self.assertFalse(w._call_tasks)
+        self.assertIsNone(self.manager.lease_owner(self.stage.id))
+        self.assertTrue(w.close())
+
+    def test_disconnect_dispatch_rejection_does_not_leave_a_phantom_operation(self):
+        w = self.window()
+        with patch.object(w.thread_pool, "start", side_effect=RuntimeError("REPRO_DISCONNECT_REJECTED")):
+            w.disconnect_button.click()
+        self.assertFalse(w._manual_busy)
+        self.assertTrue(w._manual_done.is_set())
+        self.assertTrue(self.manager.is_connected(self.stage))
+        self.assertIsNone(self.manager.lease_owner(self.stage.id))
+
+    def test_window_connect_button_can_connect_an_initially_disconnected_stage(self):
+        self.manager.disconnect(self.stage)
+        w = self.window()
+        w.connect_button.click()
+        self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        self.assertTrue(self.manager.is_connected(self.stage), w.operation_label.text())
+        self.assertEqual(w.device.move_history, [])
+        self.assertEqual(w.device.stop_count, 0)
+        self.assertIsNone(self.manager.lease_owner(self.stage.id))
+
+    def test_ready_home_rejection_keeps_live_position_without_sending_stop(self):
+        w = self.window()
+        w.refresh_button.click()
+        self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        w._manual(w.device.home, wait_motion=True)
+        self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        self.assertEqual(w.device.stop_count, 0)
+        self.assertEqual(w.device.move_history, [])
+        self.assertEqual(w._last_position, 0)
+        self.assertNotIn("读取失败", w.position_label.text())
+        self.assertIn("0x33", w.status_label.text())
+        self.assertTrue(w.move_button.isEnabled())
+        self.assertIsNone(self.manager.lease_owner(self.stage.id))
+
+    def test_disable_recovery_is_explicit_and_does_not_home_or_move(self):
+        w = self.window()
+        w.device.set_virtual_state(0x3C)
+        w.refresh_button.click()
+        self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        self.assertIn("0x3C", w.status_label.text())
+        self.assertFalse(w.move_button.isEnabled())
+        self.assertTrue(w.enable_button.isEnabled())
+        self.assertEqual(w.device.enable_count, 0)
+        w.enable_button.click()
+        self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        self.assertTrue(w.device.status().ready)
+        self.assertEqual(w.device.enable_count, 1)
+        self.assertEqual(w.device.home_count, 0)
+        self.assertEqual(w.device.move_history, [])
+        self.assertTrue(w.move_button.isEnabled())
+        self.assertFalse(w.enable_button.isEnabled())
+
+    def test_uncertain_manual_stop_retains_lease_until_explicit_retry(self):
+        from rigol_control.drivers.newport_smc100 import MotionError
+        w = self.window()
+        with patch.object(w.device, "move_absolute", side_effect=MotionError("REPRO_UNCERTAIN_PA")) as move:
+            with patch.object(w.device, "stop", side_effect=MotionError("REPRO_STOP_FAILED")):
+                w._move(.1)
+                self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+            self.assertTrue(w._manual_cleanup_pending)
+            self.assertEqual(self.manager.lease_owner(self.stage.id), w._manual_owner)
+            self.assertFalse(w.move_button.isEnabled())
+            self.assertFalse(w.disconnect_button.isEnabled())
+            self.assertFalse(w.close())
+            self.assertEqual(move.call_count, 1)
+            w.sidebar_stop.click()
+            self.assertTrue(self.wait(lambda: not w._busy() and not w._call_tasks))
+            self.assertFalse(w._manual_cleanup_pending)
+            self.assertIsNone(self.manager.lease_owner(self.stage.id))
+            self.assertEqual(move.call_count, 1)
+
+    def test_disconnected_manual_stop_retry_reconnects_only_for_cleanup(self):
+        from rigol_control.drivers.newport_smc100 import MotionError
+        w = self.window()
+        def uncertain_stop():
+            w.device.disconnect()
+            raise MotionError("REPRO_USB_STOP_UNKNOWN")
+        with patch.object(w.device, "move_absolute", side_effect=MotionError("REPRO_PA_UNKNOWN")) as move:
+            with patch.object(w.device, "stop", side_effect=uncertain_stop):
+                w._move(.1)
+                self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+            self.assertFalse(w.device.is_connected)
+            self.assertTrue(w._manual_cleanup_pending)
+            self.assertEqual(self.manager.lease_owner(self.stage.id), w._manual_owner)
+            self.assertFalse(w.connect_button.isEnabled())
+            self.assertTrue(w.sidebar_stop.isEnabled())
+            w.sidebar_stop.click()
+            self.assertTrue(self.wait(lambda: not w._busy() and not w._call_tasks))
+            self.assertTrue(w.device.is_connected)
+            self.assertIsNone(self.manager.lease_owner(self.stage.id))
+            self.assertEqual(move.call_count, 1)
+            self.assertEqual(w.device.home_count, 0)
+
+    def test_rejected_cleanup_dispatch_preserves_pending_lease_and_completion(self):
+        from rigol_control.drivers.newport_smc100 import MotionError
+        w = self.window()
+        with patch.object(w.device, "move_absolute", side_effect=MotionError("REPRO_PA_UNKNOWN")), \
+                patch.object(w.device, "stop", side_effect=MotionError("REPRO_STOP_UNKNOWN")):
+            w._move(.1)
+            self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        with patch.object(w.thread_pool, "start", side_effect=RuntimeError("REPRO_CLEANUP_POOL_REJECTED")):
+            w.sidebar_stop.click()
+        self.assertTrue(w._manual_done.is_set())
+        self.assertTrue(w._manual_cleanup_pending)
+        self.assertFalse(w._manual_busy)
+        self.assertEqual(self.manager.lease_owner(self.stage.id), w._manual_owner)
+        w.sidebar_stop.click()
+        self.assertTrue(self.wait(lambda: not w._busy() and not w._call_tasks))
+
+    def test_cancelled_manual_motion_attempts_stop_once_then_waits_for_explicit_retry(self):
+        from rigol_control.drivers.newport_smc100 import MotionError
+        w = self.window()
+        def cancel_after_command(_angle):
+            w._cancel_manual.set()
+        with patch.object(w.device, "move_absolute", side_effect=cancel_after_command) as move:
+            with patch.object(w.device, "stop", side_effect=MotionError("REPRO_CANCEL_STOP_UNKNOWN")) as stop:
+                w._move(.1)
+                self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+                self.assertEqual(stop.call_count, 1)
+            self.assertTrue(w._manual_cleanup_pending)
+            self.assertEqual(self.manager.lease_owner(self.stage.id), w._manual_owner)
+            w.sidebar_stop.click()
+            self.assertTrue(self.wait(lambda: not w._busy() and not w._call_tasks))
+            self.assertEqual(move.call_count, 1)
+
+    def test_unknown_state_after_stop_does_not_release_the_manual_lease(self):
+        w = self.window()
+        with patch.object(w.device, "status", return_value=MotionStatus(0, 0x99)):
+            w.manual_stop.click()
+            self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        self.assertTrue(w._manual_cleanup_pending)
+        self.assertEqual(self.manager.lease_owner(self.stage.id), w._manual_owner)
+        self.assertIn("0x99", w.operation_label.text())
+        self.assertFalse(w.move_button.isEnabled())
+        w.sidebar_stop.click()
+        self.assertTrue(self.wait(lambda: not w._busy() and not w._call_tasks))
+
+    def _stationary_stop_without_illegal_st(self, state):
+        class RefusingStopSerial:
+            def __init__(self):
+                self.is_open = True
+                self.writes = []
+                self.state = state
+                self.error = "@"
+                self.refuse_stop = True
+
+            def reset_input_buffer(self):
+                pass
+
+            def write(self, payload):
+                self.writes.append(payload)
+                command = payload.decode("ascii").strip()[1:]
+                if command == "ST":
+                    self.error = "H" if self.refuse_stop else "@"
+                return len(payload)
+
+            def read_until(self, terminator, size):
+                command = self.writes[-1].decode("ascii").strip()[1:]
+                replies = {"VE": "SMC100CC V3.0", "ID?": "PR50CC", "TP": "0", "VA?": "20",
+                           "TS": f"0000{self.state:02X}", "TE": self.error}
+                return f"1{command[:2]}{replies[command]}\r\n".encode("ascii")
+
+            def close(self):
+                self.is_open = False
+
+        self.manager.disconnect(self.stage)
+        self.stage = DeviceRecord.create(kind=DeviceKind.NEWPORT_SMC100, name="Stationary PR50CC", resource="COM19::1")
+        self.records = [self.stage, self.ni]
+        serial = RefusingStopSerial()
+        device = Smc100Device(self.stage.resource, serial_factory=lambda **kw: serial)
+        with patch("rigol_control.connections.Smc100Device", return_value=device):
+            self.manager.connect(self.stage)
+        w = self.window()
+        w.refresh_button.click()
+        self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        serial.writes.clear()
+        try:
+            w.manual_stop.click()
+            self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+            self.assertFalse(w._manual_cleanup_pending, w.operation_label.text())
+            self.assertIsNone(self.manager.lease_owner(self.stage.id))
+            self.assertEqual(serial.writes, [b"1TS\r\n"])
+            self.assertEqual(w.home_button.isEnabled(), state == 0x0A)
+        finally:
+            # Let a failing implementation clean this disposable fake fixture.
+            if w._manual_cleanup_pending:
+                serial.state, serial.refuse_stop, serial.error = 0x33, False, "@"
+                w.sidebar_stop.click()
+                self.wait(lambda: not w._busy() and not w._call_tasks)
+
+    def test_stop_in_not_referenced_state_never_sends_illegal_st_or_blocks_homing(self):
+        self._stationary_stop_without_illegal_st(0x0A)
+
+    def test_stop_in_configuration_state_never_sends_illegal_st_or_retains_a_lease(self):
+        self._stationary_stop_without_illegal_st(0x14)
+
+    def test_fault_in_first_stop_status_still_attempts_one_stop_and_is_not_consumed(self):
+        from rigol_control.drivers.newport_smc100 import MotionError
+        w = self.window()
+        with patch.object(w.device, "status", side_effect=[MotionError("REPRO_FIRST_TS_HARDWARE_FAULT"), MotionStatus(0, 0x33)]):
+            w.manual_stop.click()
+            self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        self.assertEqual(w.device.stop_count, 1)
+        self.assertTrue(w._manual_cleanup_pending)
+        self.assertEqual(self.manager.lease_owner(self.stage.id), w._manual_owner)
+        self.assertIn("REPRO_FIRST_TS_HARDWARE_FAULT", w.operation_label.text())
+        w.sidebar_stop.click()
+        self.assertTrue(self.wait(lambda: not w._busy() and not w._call_tasks))
+        self.assertEqual(w.device.stop_count, 2)
+        self.assertIn("REPRO_FIRST_TS_HARDWARE_FAULT", w.operation_label.text())
+
+    def test_successful_status_refresh_keeps_the_consumed_hardware_error_visible(self):
+        from rigol_control.drivers.newport_smc100 import MotionError
+        w = self.window()
+        with patch.object(w.device, "status", side_effect=MotionError("SMC100 运动错误 0x0040；状态 0x0B")):
+            w.refresh_button.click()
+            self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        w.refresh_button.click()
+        self.assertTrue(self.wait(lambda: not w._manual_busy and not w._call_tasks))
+        self.assertIn("0x0040", w.operation_label.text())
+        self.assertIn("最近错误记录", w.operation_label.text())
+        self.assertIn("0x33", w.status_label.text())
+        self.assertTrue(w.move_button.isEnabled())
+
     def test_close_during_motion_stops_and_keeps_shared_connection(self):
         w = self.window()
         device = self.manager.newport_device_for(self.stage)

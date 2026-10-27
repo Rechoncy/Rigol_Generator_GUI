@@ -45,9 +45,74 @@ class MotionStatus:
     def moving(self) -> bool:
         return self.state in {0x1E, 0x1F, 0x28, 0x46, 0x47}
 
+    @property
+    def not_referenced(self) -> bool:
+        return self.error == 0 and 0x0A <= self.state <= 0x11
+
+    @property
+    def disabled(self) -> bool:
+        return self.error == 0 and self.state in {0x3C, 0x3D, 0x3E}
+
+    @property
+    def can_home(self) -> bool:
+        # 0x10 identifies an ESP stage/configuration error, even after a TS
+        # read has consumed its error bits. It is not permission to send OR.
+        return self.not_referenced and self.state != 0x10
+
+    @property
+    def description(self) -> str:
+        if self.state == 0x10:
+            label = "ESP 旋转台识别/配置错误"
+        elif 0x0A <= self.state <= 0x11:
+            label = "尚未建立机械参考（NOT REFERENCED）"
+        elif self.state in {0x32, 0x33, 0x34, 0x35}:
+            label = "已就绪（READY）"
+        elif self.state in {0x3C, 0x3D, 0x3E}:
+            label = "电机已禁用（DISABLE）"
+        elif self.state in {0x1E, 0x1F}:
+            label = "正在寻找机械原点（HOMING）"
+        elif self.state == 0x28:
+            label = "正在定位（MOVING）"
+        elif self.state in {0x46, 0x47}:
+            label = "正在连续微动（JOGGING）"
+        elif self.state == 0x14:
+            label = "控制器配置模式（CONFIGURATION）"
+        else:
+            label = "未识别的控制器状态"
+        result = f"{label} · 状态 0x{self.state:02X}"
+        return f"{result} · 硬件错误 0x{self.error:04X}" if self.error else result
+
+    @property
+    def guidance(self) -> str:
+        if self.error:
+            return "先核对控制器硬件错误；软件不会自动清除故障或重新执行运动。"
+        if self.state == 0x10:
+            return "请用厂商工具核对旋转台识别和配置，解决 ESP 错误后重新读取状态。"
+        if self.ready:
+            return "可以直接定位；若要转回 0°，将绝对目标设为 0°，无需再次寻找机械原点。"
+        if self.disabled:
+            return "可显式点击恢复使能；电机会重新励磁，随后回读 READY，再执行定位。"
+        if self.can_home:
+            return "先点击寻找机械原点，等完成并回读 READY 后再定位。"
+        if self.state in {0x46, 0x47}:
+            return "请按厂商流程用控制器面板或手持操作器退出连续微动（JOGGING），再读取状态；软件不会自动复位。"
+        if self.moving:
+            return "等待当前运动结束，或点击停止并确认停止后再操作。"
+        if self.state == 0x14:
+            return "请用厂商工具核对并退出配置模式，再重新读取状态；软件不会自动复位。"
+        return "请重新读取状态，并根据控制器手册核对当前模式。"
+
     def check(self) -> None:
         if self.error:
             raise MotionError(f"SMC100 运动错误 0x{self.error:04X}；状态 0x{self.state:02X}")
+
+
+class MotionStateError(MotionError):
+    """A local state precondition refused an action before its command write."""
+
+    def __init__(self, message: str, status: MotionStatus) -> None:
+        self.status = status
+        super().__init__(f"{message}：{status.description}。{status.guidance}")
 
 
 class Smc100Device:
@@ -174,8 +239,9 @@ class Smc100Device:
     def move_absolute(self, angle: float) -> None:
         angle = finite(angle)
         with self._lock:
-            if not self.status().ready:
-                raise MotionError("移动要求 READY 状态；请先完成归零")
+            state = self.status()
+            if not state.ready:
+                raise MotionStateError("定位要求 READY 状态", state)
             low, high = self.limits()
             if not low <= angle <= high:
                 raise MotionError(f"目标 {angle}° 超出软件限位 [{low}, {high}]°")
@@ -186,16 +252,37 @@ class Smc100Device:
         if not 0 < value <= 20:
             raise ValueError("PR50CC 速度必须大于 0 且不超过 20°/s")
         with self._lock:
-            if not self.status().ready:
-                raise MotionError("请在归零完成且 READY 后设置速度")
+            state = self.status()
+            if not state.ready:
+                raise MotionStateError("设置速度要求 READY 状态", state)
             self._command(f"VA{value:.9f}")
 
     def home(self) -> None:
         with self._lock:
             state = self.status()
-            if not 0x0A <= state.state <= 0x11:
-                raise MotionError("归零仅允许在 NOT REFERENCED 状态执行；不会自动复位控制器")
+            if not state.can_home:
+                raise MotionStateError("当前状态不允许寻找机械原点", state)
             self._command("OR")
+
+    def enable_motor(self) -> MotionStatus:
+        """Explicitly leave DISABLE using addressed MM1; never reset or home.
+
+        SMC100CC/PP manual EDH0206En2060, MM section (printed page 52): MM1
+        sets the set point to the current position and energizes the motor.
+        No retry is safe after an uncertain write. TS must confirm READY.
+        """
+        with self._lock:
+            state = self.status()
+            if state.ready:
+                return state
+            if not state.disabled:
+                raise MotionStateError("恢复使能仅允许在 DISABLE 状态执行", state)
+            self._command("MM1")
+            result = self.status()
+            if not result.ready:
+                # A command was sent; this is not a local precondition failure.
+                raise MotionError(f"恢复使能命令已发送，但未确认 READY：{result.description}。{result.guidance}")
+            return result
 
     def stop(self) -> None:
         with self._lock:
@@ -217,6 +304,11 @@ class VirtualSmc100Device:
         self._velocity = 20.0
         self.move_history: list[float] = []
         self.stop_count = 0
+        self.enable_count = 0
+        self.home_count = 0
+        self.state = 0x33
+        self._motion_state = 0x28
+        self._completed_state = 0x33
         self.error = 0
 
     def connect(self) -> str:
@@ -238,12 +330,13 @@ class VirtualSmc100Device:
                 self._position = self._origin + fraction * (self._target - self._origin)
                 if fraction == 1:
                     self._duration = 0.0
+                    self.state = self._completed_state
             return self._position
 
     def status(self) -> MotionStatus:
         with self._lock:
             self.position()
-            result = MotionStatus(self.error, 0x28 if self._duration else 0x33)
+            result = MotionStatus(self.error, self._motion_state if self._duration else self.state)
             result.check()
             return result
 
@@ -257,26 +350,82 @@ class VirtualSmc100Device:
 
     def set_velocity(self, value: float) -> None:
         value = finite(value)
-        if not 0 < value <= 20 or not self.status().ready:
-            raise MotionError("无效速度或设备未就绪")
-        self._velocity = value
+        if not 0 < value <= 20:
+            raise MotionError("无效速度")
+        with self._lock:
+            state = self.status()
+            if not state.ready:
+                raise MotionStateError("设置速度要求 READY 状态", state)
+            self._velocity = value
 
     def move_absolute(self, angle: float) -> None:
         with self._lock:
             angle = finite(angle)
-            if not self.status().ready or not -360 <= angle <= 360:
-                raise MotionError("设备未就绪或目标超限")
+            state = self.status()
+            if not state.ready:
+                raise MotionStateError("定位要求 READY 状态", state)
+            if not -360 <= angle <= 360:
+                raise MotionError("目标超限")
             self._origin = self.position()
             self._target = angle
             self._started = time.monotonic()
             self._duration = abs(angle - self._origin) / self._velocity + 0.02
+            self._motion_state = 0x28
+            self._completed_state = 0x33
             self.move_history.append(angle)
 
     def home(self) -> None:
-        self.move_absolute(0.0)
+        with self._lock:
+            state = self.status()
+            if not state.can_home:
+                raise MotionStateError("当前状态不允许寻找机械原点", state)
+            self._origin = self.position()
+            self._target = 0.0
+            self._started = time.monotonic()
+            self._duration = abs(self._origin) / self._velocity + 0.02
+            self._motion_state = 0x1E
+            self._completed_state = 0x32
+            self.home_count += 1
+
+    def enable_motor(self) -> MotionStatus:
+        with self._lock:
+            state = self.status()
+            if state.ready:
+                return state
+            if not state.disabled:
+                raise MotionStateError("恢复使能仅允许在 DISABLE 状态执行", state)
+            self.state = 0x34
+            self.enable_count += 1
+            return self.status()
+
+    def set_virtual_state(self, state: int, *, error: int = 0) -> None:
+        """Inject a controller state for simulation; never sends hardware I/O."""
+        if not isinstance(state, int) or not 0 <= state <= 0xFF:
+            raise ValueError("虚拟状态必须为 0x00–0xFF")
+        if not isinstance(error, int) or not 0 <= error <= 0xFFFF:
+            raise ValueError("虚拟错误必须为 0x0000–0xFFFF")
+        with self._lock:
+            if self.is_connected:
+                self.position()
+            self._duration = 0.0
+            self.state, self.error = state, error
 
     def stop(self) -> None:
         with self._lock:
+            self._check()
+            state = self._motion_state if self._duration else self.state
+            if 0x0A <= state <= 0x11 or state == 0x14 or state in {0x46, 0x47}:
+                # Match the controller's ST command restrictions. An idle,
+                # unreferenced/configuration state can instead be confirmed
+                # with TS; pretending ST succeeded would hide a recovery loop.
+                MotionStatus(self.error, state).check()
+                code = "H" if 0x0A <= state <= 0x11 else "I" if state == 0x14 else "D"
+                raise MotionError(f"虚拟 SMC100 拒绝 ST：命令错误 {code}；状态 0x{state:02X}")
             self._position = self.position()
+            state = self._motion_state if self._duration else self.state
             self._duration = 0.0
+            if state in {0x1E, 0x1F}:
+                self.state = 0x0B
+            elif state == 0x28:
+                self.state = 0x33
             self.stop_count += 1
