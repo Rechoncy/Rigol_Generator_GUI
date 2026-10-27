@@ -1,6 +1,6 @@
 # Windows 便携发行版使用与构建说明
 
-正式下载版本：0.7.15；当前源码与本地开发构建：0.7.17（未发布 GitHub Release）；目标平台：Windows 10/11 x64。
+正式下载版本：0.7.15；当前源码与本地开发构建：0.7.18（未发布 GitHub Release）；目标平台：Windows 10/11 x64。
 
 发行版包含运行程序所需的 Python、Qt、PyVISA、pyserial 和 nidaqmx。目标电脑无需安装 Python、pip 或创建虚拟环境，首次启动也无需联网下载 Python 组件。内置运行时只供本软件使用，不修改系统 Python。
 
@@ -17,7 +17,7 @@
 
 项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。正式发行文件从 [v0.7.15 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.15) 下载，由版本标签对应的提交构建。发布附件的本地副本位于 `dist/published/v0.7.15/`，自行构建的输出目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以同组附件的 `release-manifest.json` 为准，完整性可用 `SHA256SUMS.txt` 核对。
 
-本文下载文件名和运行示例使用正式版 0.7.15。第 7 节从当前源码构建会生成 0.7.17 文件，不会覆盖 `dist/published/v0.7.15/` 中的已发布附件，也不会自动创建标签或 Release。0.7.17 的 DG4000 回读功能与验证状态见[本地开发构建说明](NOTES-0.7.17.md)；此前 NI 模拟采集修复记录见[0.7.16 说明](NOTES-0.7.16.md)。
+本文下载文件名和运行示例使用正式版 0.7.15。第 7 节从当前源码构建会生成 0.7.18 文件，不会覆盖 `dist/published/v0.7.15/` 中的已发布附件，也不会自动创建标签或 Release。0.7.18 的 SSG/Vaunix 回读功能与验证状态见[本地开发构建说明](NOTES-0.7.18.md)；DG4000 回读和 NI 模拟采集修复历史分别见[0.7.17 说明](NOTES-0.7.17.md)与[0.7.16 说明](NOTES-0.7.16.md)。
 
 仓库根目录原有的小型 `Lab Control Center.exe` 是源码启动器，仍需外部 Python/PyQt6；它与上述编译产物不同。使用免 Python 版本时，应下载发行附件或按第 7 节构建。
 
@@ -94,6 +94,8 @@ $env:RIGOL_GUI_DATA_DIR = "D:\LabData\ControlCenter"
 0.7.16 本地开发构建继续保留配置与任务格式。NI 独立模拟采集停止改为后台执行，读取线程或 NI/文件清理未完成时保留窗口、控制器和占用，失败后可重试停止。独立计数与 Newport 联动的 NI 清理失败也保留任务和租约供重试。连续文本的保存点数仅计入成功写入并刷新完成的数据块；写盘失败后保留文件供核查，不会自动重放失败块。详细恢复步骤见[使用说明第 8 节](../docs/USER_MANUAL_CN.md#87-停止异常与恢复)。
 
 0.7.17 继续使用相同配置与任务格式，新增 DG4000 “通道与波形”页底部的只读回读区。回读频率、幅度、当前幅度单位和输出开关，不替换已保存的待应用编辑值；幅度单位沿用仪器的 Vpp/Vrms/dBm，不通过设置单位或负载来换算。具体操作与回读边界见[使用说明第 7 节](../docs/USER_MANUAL_CN.md#72-通道与波形)。
+
+0.7.18 同样保留配置格式，在 SSG“连接与射频”和 Vaunix“射频输出”页底部增加独立的 Hz、dBm 与 RF 开关回读区。便携版本和源码均使用同一实现；回读结果不作为待应用参数保存。各设备支持范围与操作见[使用说明](../docs/USER_MANUAL_CN.md#13-各类设备的回读范围)。
 
 NI-DAQmx 关闭报错且原生句柄已丢失时，显示“原生清理未确认”，软件不会把第二次无实际动作的关闭当成功，也不恢复旧句柄。此类状态无法在当前进程内用普通停止重试确认，需结束本次实验，在 NI MAX/驱动层核对资源后重新启动软件；原任务及占用持续保留。
 
@@ -194,9 +196,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1 -V
 
 ```text
 dist/release/
-├─ Lab-Control-Center-0.7.17-windows-x64-portable.zip
-├─ Lab-Control-Center-0.7.17-windows-x64.exe
-├─ Lab-Control-Center-0.7.17-windows-x64-source.zip
+├─ Lab-Control-Center-0.7.18-windows-x64-portable.zip
+├─ Lab-Control-Center-0.7.18-windows-x64.exe
+├─ Lab-Control-Center-0.7.18-windows-x64-source.zip
 ├─ RELEASE-NOTES.md
 ├─ SHA256SUMS.txt
 └─ release-manifest.json
@@ -214,6 +216,6 @@ dist/release/
 
 ## 8. 本版记录
 
-正式发行的变更范围和验证见 [0.7.15 发行说明](NOTES-0.7.15.md)，当前本地开发构建见 [0.7.17 说明](NOTES-0.7.17.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
+正式发行的变更范围和验证见 [0.7.15 发行说明](NOTES-0.7.15.md)，当前本地开发构建见 [0.7.18 说明](NOTES-0.7.18.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
 
-0.7.16 源码完整回归 444 项及源码虚拟自检通过，作为历史记录保留。0.7.17 源码完整回归 465 项及源码虚拟自检通过；回读与冻结产物的逐项验收以本版说明、`release-manifest.json` 及 `dist/verification/0.7.17/` 为准，不能用旧版结果替代。上述版本均未实机验收。
+0.7.16 源码完整回归 444 项、0.7.17 源码完整回归 465 项及各版源码虚拟自检通过，作为历史记录保留。0.7.18 回读与冻结产物的逐项验收以本版说明、`release-manifest.json` 及 `dist/verification/0.7.18/` 为准，不能用旧版结果替代。上述版本均未实机验收。

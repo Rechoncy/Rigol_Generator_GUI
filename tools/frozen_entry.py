@@ -564,6 +564,62 @@ def _bundle_self_test(report_path: Path) -> int:
             "frequency_power_order_preserved": True, "quiescent_after_stop": True,
             "reconnected_writer_blocked_without_io": True, "rf_remained_off": True,
         }
+        # Read the source through the shipped UI while forbidding every basic
+        # output setter. Inject an invalid native value through the virtual
+        # backend so the packaged validator and error callback are exercised.
+        vaunix_before = (device.frequency_hz, device.power_dbm, device.rf_on,
+                         device.internal_reference, device.sweep_active)
+        vaunix_editors = vaunix._device_parameter_snapshot()
+        vaunix_generation = device.connection_generation
+        setters = {name: getattr(device, name) for name in (
+            "set_frequency_hz", "set_power_dbm", "set_rf_on", "set_internal_reference",
+        )}
+
+        def forbidden_readback_write(*_args, **_kwargs):
+            raise AssertionError("A readback attempted to write Vaunix output parameters")
+
+        try:
+            for name in setters:
+                setattr(device, name, forbidden_readback_write)
+            vaunix.overview_readback_button.click()
+            wait_idle(require_connected=True)
+            if (vaunix.pages.currentIndex() != 1
+                    or vaunix.output_readback_values["frequency"].text() != "5000000000 Hz"
+                    or vaunix.output_readback_values["amplitude"].text() != "-10 dBm"
+                    or vaunix.output_readback_values["output"].text() != "关闭（未输出）"
+                    or "回读时间" not in vaunix.output_readback_status.text()):
+                raise AssertionError(
+                    "Vaunix readback did not display frequency, absolute power and RF state: "
+                    f"page={vaunix.pages.currentIndex()}, "
+                    f"values={ {key: value.text() for key, value in vaunix.output_readback_values.items()} }, "
+                    f"status={vaunix.output_readback_status.text()!r}"
+                )
+            device.power_dbm = float("nan")
+            try:
+                vaunix.output_readback_button.click()
+                wait_idle(require_connected=True)
+                if (any(value.text() != "未知" for value in vaunix.output_readback_values.values())
+                        or "fnLMS_GetAbsPowerLevel" not in vaunix.output_readback_status.text()
+                        or "nan" not in vaunix.output_readback_status.text()):
+                    raise AssertionError("Vaunix failed readback retained stale values or hid the bad native value")
+            finally:
+                device.power_dbm = vaunix_before[1]
+            vaunix.output_readback_button.click()
+            wait_idle(require_connected=True)
+        finally:
+            for name, setter in setters.items():
+                setattr(device, name, setter)
+        if ("回读时间" not in vaunix.output_readback_status.text()
+                or device.connection_generation != vaunix_generation
+                or vaunix._device_parameter_snapshot() != vaunix_editors
+                or (device.frequency_hz, device.power_dbm, device.rf_on,
+                    device.internal_reference, device.sweep_active) != vaunix_before):
+            raise AssertionError("Vaunix readback changed settings, editors or the connection")
+        report["vaunix_output_readback"] = {
+            "frequency_amplitude_output_displayed": True, "query_only": True,
+            "editors_unchanged": True, "failed_snapshot_invalidated": True,
+            "bad_reply_visible": True, "retry_without_reconnect": True, "hardware_access": False,
+        }
         # Exercise the actual SSG connect button and its GUI completion callback,
         # including an invalid numeric reply. Merely opening the window misses it.
         ssg = next(window for window in home.open_windows.values() if type(window).__name__ == "SiglentWindow")
@@ -599,6 +655,53 @@ def _bundle_self_test(report_path: Path) -> int:
         report["siglent_connect_button"] = {
             "malformed_power_contained": True, "raw_response_recorded": True,
             "diagnostic_saved": True, "retry_readback_passed": True, "rf_remained_off": True,
+        }
+        # The dedicated RF readback must remain independent of all optional
+        # modulation/current-point queries and must never overwrite drafts.
+        ssg_backend = ssg.session._backend
+        ssg_before = dict(ssg_backend.values)
+        ssg_editors = ssg._device_parameter_snapshot()
+        ssg_generation = ssg.session.connection_generation
+        ssg_backend.commands.clear()
+        ssg.output_readback_button.click()
+        wait_idle(require_connected=True)
+        if (ssg.output_readback_values["frequency"].text() != "1000000000 Hz"
+                or ssg.output_readback_values["amplitude"].text() != "-20 dBm"
+                or ssg.output_readback_values["output"].text() != "关闭（未输出）"
+                or "回读时间" not in ssg.output_readback_status.text()
+                or ssg_backend.commands != [":FREQuency?", ":POWer?", ":OUTPut?"]):
+            raise AssertionError(
+                "SSG dedicated readback did not use only the three basic RF queries: "
+                f"values={ {key: value.text() for key, value in ssg.output_readback_values.items()} }, "
+                f"status={ssg.output_readback_status.text()!r}, commands={ssg_backend.commands!r}"
+            )
+
+        def malformed_ssg_readback(command, **kwargs):
+            if command == ":POWer?":
+                return "BUNDLE_BAD_SSG_POWER"
+            return original_query(command, **kwargs)
+
+        ssg.session.query = malformed_ssg_readback
+        try:
+            ssg.output_readback_button.click()
+            wait_idle(require_connected=True)
+            if (any(value.text() != "未知" for value in ssg.output_readback_values.values())
+                    or "BUNDLE_BAD_SSG_POWER" not in ssg.output_readback_status.text()):
+                raise AssertionError("SSG dedicated readback retained stale values or hid the bad reply")
+        finally:
+            ssg.session.query = original_query
+        ssg.output_readback_button.click()
+        wait_idle(require_connected=True)
+        if ("回读时间" not in ssg.output_readback_status.text()
+                or ssg.session.connection_generation != ssg_generation
+                or ssg._device_parameter_snapshot() != ssg_editors
+                or ssg_backend.values != ssg_before
+                or any(not command.endswith("?") for command in ssg_backend.commands)):
+            raise AssertionError("SSG dedicated readback changed settings, editors or the connection")
+        report["siglent_output_readback"] = {
+            "frequency_amplitude_output_displayed": True, "query_only": True,
+            "editors_unchanged": True, "failed_snapshot_invalidated": True,
+            "bad_reply_visible": True, "retry_without_reconnect": True, "hardware_access": False,
         }
         query_calls = []
         def ordinary_ssg_query(command, **kwargs):

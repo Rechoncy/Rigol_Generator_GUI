@@ -15,11 +15,11 @@ from PyQt6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QVB
 
 from ..connections import DeviceConnectionManager
 from .. import __version__
-from ..units import from_base, to_base, unit_specs
+from ..units import from_base, roundtrip_number, to_base, unit_specs
 from ..drivers.scpi import ScpiError
 from ..drivers.siglent_ssg import (SiglentSsgDriver, SsgModulation, SsgPoint, SsgSweep,
                                   SsgCommandError, VIRTUAL_SSG_RESOURCE, capabilities)
-from .device_windows import BaseDeviceWindow, UnitValueWidget, page_shell, value_spin
+from .device_windows import BaseDeviceWindow, UnitValueWidget, page_shell, panel, value_spin
 from .widgets import metric_card
 
 
@@ -67,6 +67,10 @@ class SiglentWindow(BaseDeviceWindow):
         self._busy = False
         self._pending_safety = []
         self._current_scan_preview = None
+        self._output_readback_pending = False
+        self._output_readback_token = 0
+        self._output_readback_generation = None
+        self.output_readback_values = {}
         self._selected_sweep_kind = "STEP"
         self._scan_layouts = {}
         self.controls = {}
@@ -165,8 +169,107 @@ class SiglentWindow(BaseDeviceWindow):
         self.rf_status = QLabel("射频状态：尚未回读")
         self.rf_status.setWordWrap(True)
         layout.addWidget(self.rf_status)
+        layout.addWidget(self._output_readback_panel())
         layout.addStretch()
-        return page
+        return self._scroll(page)
+
+    def _output_readback_panel(self):
+        monitor, monitor_layout = panel("仪器频率与幅度回读 · 手动快照")
+        self.output_readback_widget = monitor
+        row = QHBoxLayout()
+        self.output_readback_button = QPushButton("回读频率 / 幅度")
+        self.output_readback_button.clicked.connect(self._refresh_output_readback)
+        self.output_readback_status = QLabel("未读取 · 请先连接设备")
+        self.output_readback_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.output_readback_status.setWordWrap(True)
+        row.addWidget(self.output_readback_button)
+        row.addWidget(self.output_readback_status, 1)
+        monitor_layout.addLayout(row)
+        cards = QHBoxLayout()
+        for key, caption in (("frequency", "载波频率"), ("amplitude", "幅度"), ("output", "RF 输出")):
+            card, value = metric_card(caption, "未知")
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            value.setMinimumHeight(value.fontMetrics().height() + 4)
+            self.output_readback_values[key] = value
+            cards.addWidget(card)
+        monitor_layout.addLayout(cards)
+        note = QLabel("按需查询仪器参数，不覆盖上方编辑值。幅度回读单位为 dBm；RF 关闭时数值仅为配置。"
+                      "原生扫描和调制期间的瞬时输出仍需测量设备确认，触发接收和积压计数未知。")
+        note.setWordWrap(True)
+        note.setObjectName("Muted")
+        monitor_layout.addWidget(note)
+        return monitor
+
+    def _invalidate_output_readback(self, message):
+        self._output_readback_token += 1
+        for value in self.output_readback_values.values():
+            value.setText("未知")
+            value.setToolTip("")
+        self.output_readback_status.setText(message)
+
+    def _sync_output_readback_connection(self):
+        generation = self.session.connection_generation
+        if not self.session.is_connected:
+            self._invalidate_output_readback("未连接 · 回读值未知")
+        elif self._output_readback_generation is not None and generation != self._output_readback_generation:
+            self._invalidate_output_readback("连接已变化 · 请重新回读")
+            self._output_readback_generation = None
+
+    def _refresh_output_readback(self):
+        if self._busy or self._output_readback_pending:
+            return
+        if not self.session.is_connected or not self.driver.caps.known:
+            self._invalidate_output_readback("请先连接并识别支持的仪器 · 回读值未知")
+            self._update_buttons()
+            return
+        self._invalidate_output_readback("正在回读仪器频率、幅度与 RF 输出…")
+        token = self._output_readback_token
+        generation = self.session.connection_generation
+        self._output_readback_generation = generation
+        self._output_readback_pending = True
+        self._busy = True
+        self._update_buttons()
+
+        def work():
+            with self.session.transaction():
+                if not self.session.is_connected or self.session.connection_generation != generation:
+                    raise SsgCommandError("连接已变化，旧连接的回读已取消")
+                return self.driver.read_output_parameters(), datetime.now().astimezone()
+
+        def completed(result):
+            try:
+                if token != self._output_readback_token:
+                    return
+                reading, read_at = result
+                if (not self.session.is_connected or self.session.connection_generation != generation
+                        or reading.connection_generation != generation):
+                    self._invalidate_output_readback("连接已变化 · 回读值未知，请重新回读")
+                    return
+                self.output_readback_values["frequency"].setText(f"{roundtrip_number(reading.frequency_hz)} Hz")
+                self.output_readback_values["amplitude"].setText(f"{roundtrip_number(reading.power_dbm)} dBm")
+                self.output_readback_values["output"].setText("开启" if reading.output_enabled else "关闭（未输出）")
+                self.output_readback_status.setText(f"回读时间：{read_at:%Y-%m-%d %H:%M:%S}（本地） · 点击可刷新")
+            except Exception as exc:
+                self._invalidate_output_readback(f"回读显示失败 · 本次结果已丢弃：{exc}")
+                self._error(f"SSG 参数回读显示失败：{exc}")
+            finally:
+                finish()
+
+        def failed(message):
+            try:
+                if token == self._output_readback_token:
+                    self._invalidate_output_readback(f"回读失败 · 频率、幅度和 RF 状态未知：{message}")
+                    self._error(f"SSG 参数回读失败：{message}")
+            finally:
+                finish()
+
+        def finish():
+            self._output_readback_pending = False
+            # A read does not acquire/release the native scan's lease and never
+            # changes scan_may_be_active, reconnects, or restarts the instrument.
+            self._finished()
+
+        self.submit(work, on_success=completed, on_error=failed)
 
     def _sweep_page(self, kind):
         is_step = kind == "STEP"
@@ -489,6 +592,7 @@ class SiglentWindow(BaseDeviceWindow):
         self._run(lambda: self.driver.raw(command), callback=lambda result: self.log.appendPlainText(f"> {command}\n{result}"))
 
     def connect_device(self):
+        self._invalidate_output_readback("正在连接 · 请连接完成后重新回读")
         self.scan_preview_auto.setChecked(False)
         self._clear_scan_preview("重新连接后需重新读取当前扫描值。")
         def operation():
@@ -503,6 +607,7 @@ class SiglentWindow(BaseDeviceWindow):
             self._error("请先停止扫描并确认状态，再断开连接")
             return
         self.connection_manager.disconnect(self.record)
+        self._invalidate_output_readback("已断开 · 回读值未知")
         self.scan_preview_auto.setChecked(False)
         self._clear_scan_preview("已断开，当前扫描值未知。")
         self.driver.prepared = None
@@ -514,6 +619,7 @@ class SiglentWindow(BaseDeviceWindow):
         self._run(lambda: None)
 
     def _poll(self):
+        self._sync_output_readback_connection()
         if self.session.is_connected and not self._busy and self.driver.state == "enabled":
             self._run(lambda: None, read_current_point=self.scan_preview_auto.isChecked())
 
@@ -630,6 +736,7 @@ class SiglentWindow(BaseDeviceWindow):
                     self.connection_manager.release_devices(self.owner)
                 self._finished()
         def failure(message):
+            self._invalidate_output_readback("通信失败 · 回读值未知")
             self.scan_preview_auto.setChecked(False)
             self._clear_scan_preview("通信失败，当前值未知；自动刷新已停止。")
             self._show_identity()
@@ -756,6 +863,8 @@ class SiglentWindow(BaseDeviceWindow):
         enabled = self.session.is_connected and self.driver.caps.known and not self._busy
         for button in self.write_buttons:
             button.setEnabled(enabled)
+        self.output_readback_button.setEnabled(enabled and not self._output_readback_pending)
+        self.output_readback_button.setText("回读中…" if self._output_readback_pending else "回读频率 / 幅度")
         for name in ("fm", "pm"):
             self.controls["mod." + name].setEnabled(self.driver.caps.fm_pm)
         self._update_pulse_controls()
@@ -773,6 +882,7 @@ class SiglentWindow(BaseDeviceWindow):
         self.controls["mod.gate_polarity"].setEnabled(internal and trigger.currentData() == "EGATE")
 
     def sync_connection_state(self):
+        self._sync_output_readback_connection()
         if not self.session.is_connected:
             self.driver_status.setText("● 未连接 · 硬件状态未确认")
             self.live_status.setText("扫描：未连接 / 状态未知")

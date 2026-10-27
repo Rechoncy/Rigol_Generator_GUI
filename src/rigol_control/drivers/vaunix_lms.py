@@ -106,6 +106,15 @@ class VaunixOutputSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class VaunixOutputReadback:
+    frequency_hz: float
+    power_dbm: float
+    rf_on: bool
+    device_status: int
+    connection_generation: int
+
+
+@dataclass(frozen=True, slots=True)
 class VaunixSnapshot:
     connected: bool
     identity: str
@@ -362,8 +371,12 @@ class VaunixLmsDevice:
 
     @property
     def connection_generation(self) -> int:
-        with self._lock:
+        with self._status_lock:
             return self._connection_generation
+
+    def _advance_connection_generation(self) -> None:
+        with self._status_lock:
+            self._connection_generation += 1
 
     @property
     def is_connected(self) -> bool:
@@ -404,7 +417,7 @@ class VaunixLmsDevice:
                 )
             self._api = api
             self._device_id = descriptor.device_id
-            self._connection_generation += 1
+            self._advance_connection_generation()
             self._descriptor = descriptor
             try:
                 minimum_frequency = self._get_frequency("fnLMS_GetMinFreqEx")
@@ -447,7 +460,7 @@ class VaunixLmsDevice:
                 self._clear_connection()
 
     def _clear_connection(self) -> None:
-        self._connection_generation += 1
+        self._advance_connection_generation()
         self._api = None
         self._device_id = None
         self._descriptor = None
@@ -729,6 +742,43 @@ class VaunixLmsDevice:
                 device_status=status,
             )
 
+    def read_output_parameters(self) -> VaunixOutputReadback:
+        """Read SDK settings without writes, retries, or connection recovery.
+
+        SDK manual section 3.6 uses 10 Hz unsigned frequency units and 0.25 dB
+        absolute power units. GetPowerLevel instead returns relative attenuation.
+        The DLL updates its settings while sweeping; this is not an RF measurement.
+        """
+        with self._lock:
+            api, device_id = self._require()
+            generation = self._connection_generation
+
+            def read_int(name: str) -> int:
+                value = getattr(api.dll, name)(device_id)
+                if not isinstance(value, int):
+                    raise VaunixLmsError(f"{name} 返回无效整数 {value!r}")
+                _raise_get_error(name, value)
+                return value
+
+            with api._lock:
+                status = read_int("fnLMS_GetDeviceStatus")
+                if status & (DEV_CONNECTED | DEV_OPENED) != (DEV_CONNECTED | DEV_OPENED):
+                    raise VaunixLmsError("fnLMS_GetDeviceStatus 表示 USB 已断开或句柄失效，请重新连接")
+                frequency = read_int("fnLMS_GetFrequencyEx")
+                if not 0 <= frequency <= 0xFFFFFFFF:
+                    raise VaunixLmsError(f"fnLMS_GetFrequencyEx 返回无效无符号整数 {frequency!r}")
+                power = read_int("fnLMS_GetAbsPowerLevel")
+                rf = read_int("fnLMS_GetRF_On")
+                final_status = read_int("fnLMS_GetDeviceStatus")
+            if final_status & (DEV_CONNECTED | DEV_OPENED) != (DEV_CONNECTED | DEV_OPENED):
+                raise VaunixLmsError("fnLMS_GetDeviceStatus 表示回读期间 USB 已断开，请重新连接")
+            if generation != self._connection_generation:
+                raise VaunixLmsError("Vaunix 连接已变化，请重新回读")
+            return _validated_output_readback(
+                frequency * 10.0, power * POWER_ENCODING_DB, rf,
+                final_status, generation, self.capabilities,
+            )
+
     def snapshot(self) -> VaunixSnapshot:
         with self._lock:
             self._require()
@@ -896,6 +946,7 @@ class VirtualVaunixLmsDevice:
         self._connected = False
         self._lock = RLock()
         self._connection_generation = 0
+        self._status_lock = Lock()
         self._caps = VaunixCapabilities(
             model="BLX-403-VIRTUAL",
             serial_number=4030001,
@@ -957,14 +1008,14 @@ class VirtualVaunixLmsDevice:
     def connect(self) -> str:
         with self._lock:
             if not self._connected:
-                self._connection_generation += 1
+                self._advance_connection_generation()
             self._connected = True
             return self.identity
 
     def disconnect(self) -> None:
         with self._lock:
             if self._connected:
-                self._connection_generation += 1
+                self._advance_connection_generation()
             self._connected = False
 
     @contextmanager
@@ -974,8 +1025,12 @@ class VirtualVaunixLmsDevice:
 
     @property
     def connection_generation(self) -> int:
-        with self._lock:
+        with self._status_lock:
             return self._connection_generation
+
+    def _advance_connection_generation(self) -> None:
+        with self._status_lock:
+            self._connection_generation += 1
 
     def _delay(self) -> None:
         if not self._connected:
@@ -1191,6 +1246,17 @@ class VirtualVaunixLmsDevice:
                 device_status=snapshot.device_status,
             )
 
+    def read_output_parameters(self) -> VaunixOutputReadback:
+        with self._lock:
+            self._delay()
+            status = DEV_CONNECTED | DEV_OPENED | PLL_LOCKED
+            if self.sweep_active:
+                status |= SWP_ACTIVE
+            return _validated_output_readback(
+                self.frequency_hz, self.power_dbm, self.rf_on,
+                status, self._connection_generation, self.capabilities,
+            )
+
     def snapshot(self) -> VaunixSnapshot:
         status = DEV_CONNECTED | PLL_LOCKED
         if self._connected:
@@ -1324,6 +1390,23 @@ def format_dll_version(value: int) -> str:
 
     encoded = int(value) & 0xFFFF
     return f"{encoded >> 8}.{encoded & 0xFF}"
+
+
+def _validated_output_readback(
+    frequency_hz: float, power_dbm: float, rf_on: int | bool,
+    device_status: int, generation: int, caps: VaunixCapabilities,
+) -> VaunixOutputReadback:
+    if (not math.isfinite(frequency_hz)
+            or not caps.minimum_frequency_hz <= frequency_hz <= caps.maximum_frequency_hz):
+        raise VaunixLmsError(f"fnLMS_GetFrequencyEx 返回无效频率 {frequency_hz!r} Hz")
+    if (not math.isfinite(power_dbm)
+            or not caps.minimum_power_dbm <= power_dbm <= caps.maximum_power_dbm):
+        raise VaunixLmsError(f"fnLMS_GetAbsPowerLevel 返回无效功率 {power_dbm!r} dBm")
+    if rf_on not in (0, 1):
+        raise VaunixLmsError(f"fnLMS_GetRF_On 返回无效开关状态 {rf_on!r}")
+    return VaunixOutputReadback(
+        frequency_hz, power_dbm, bool(rf_on), device_status, generation,
+    )
 
 
 def _finite(value: float, label: str) -> float:

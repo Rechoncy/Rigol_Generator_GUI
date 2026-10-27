@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from itertools import product
 from typing import Any, Callable
 
@@ -91,6 +92,10 @@ class VaunixLmsWindow(BaseDeviceWindow):
             )
         )
         self._ui_connected = False
+        self._ui_connection_generation: int | None = None
+        self._output_readback_pending = False
+        self._output_readback_token = 0
+        self.output_readback_values: dict[str, QLabel] = {}
         self._ni_signature: tuple[tuple[str, str, str, bool], ...] = ()
         self._lease_owner = f"vaunix-trigger:{record.id}"
         self.controller: TriggerStepController | None = None
@@ -183,9 +188,13 @@ class VaunixLmsWindow(BaseDeviceWindow):
         self.connect_button.clicked.connect(self._connect)
         self.disconnect_button.clicked.connect(self._disconnect)
         self.read_all_button.clicked.connect(self._refresh_all)
+        self.overview_readback_button = QPushButton("回读频率 / 幅度")
+        self.overview_readback_button.setEnabled(False)
+        self.overview_readback_button.clicked.connect(self._show_output_readback)
         actions.addWidget(self.connect_button)
         actions.addWidget(self.disconnect_button)
         actions.addWidget(self.read_all_button)
+        actions.addWidget(self.overview_readback_button)
         actions.addStretch()
         connection_layout.addLayout(actions)
         layout.addWidget(connection)
@@ -235,8 +244,135 @@ class VaunixLmsWindow(BaseDeviceWindow):
         note.setWordWrap(True)
         output_layout.addWidget(note)
         layout.addWidget(output)
+        layout.addWidget(self._output_readback_panel())
         layout.addStretch()
-        return page
+        scroll = QScrollArea()
+        scroll.setObjectName("VaunixOutputScroll")
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
+
+    def _output_readback_panel(self) -> QWidget:
+        monitor, monitor_layout = panel("仪器频率与幅度回读 · 手动快照")
+        self.output_readback_widget = monitor
+        actions = QHBoxLayout()
+        self.output_readback_button = QPushButton("回读频率 / 幅度")
+        self.output_readback_button.setEnabled(False)
+        self.output_readback_button.clicked.connect(self._refresh_output_readback)
+        self.output_readback_status = QLabel("未读取 · 请先连接设备")
+        self.output_readback_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.output_readback_status.setWordWrap(True)
+        self.output_readback_status.setObjectName("Muted")
+        actions.addWidget(self.output_readback_button)
+        actions.addWidget(self.output_readback_status, 1)
+        monitor_layout.addLayout(actions)
+        cards = QHBoxLayout()
+        for name, caption, color in (
+            ("frequency", "频率", "#55d9cc"),
+            ("amplitude", "幅度 / 功率", "#f08ab8"),
+            ("output", "RF 输出", "#8f7cff"),
+        ):
+            card, value = metric_card(caption, "未知", color)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            value.setMinimumHeight(value.fontMetrics().height() + 4)
+            self.output_readback_values[name] = value
+            cards.addWidget(card)
+        monitor_layout.addLayout(cards)
+        note = QLabel(
+            "回读 DLL 的频率、绝对 dBm 功率与 RF 开关，不覆盖上方编辑值。"
+            "原生扫频时频率可随设备更新；各值为顺序查询快照，非同步电气测量。"
+            "RF 关闭时数值仅为配置。"
+        )
+        note.setWordWrap(True)
+        note.setObjectName("Muted")
+        monitor_layout.addWidget(note)
+        return monitor
+
+    def _show_output_readback(self) -> None:
+        self._select_page(1)
+        page = self.pages.widget(1)
+        if isinstance(page, QScrollArea):
+            page.ensureWidgetVisible(self.output_readback_widget, 20, 20)
+        self._refresh_output_readback()
+
+    def _update_output_readback_buttons(self) -> None:
+        enabled = self.device.is_connected and not self._output_readback_pending
+        for button in (self.overview_readback_button, self.output_readback_button):
+            button.setEnabled(enabled)
+            button.setText("回读中…" if self._output_readback_pending else "回读频率 / 幅度")
+
+    def _invalidate_output_readback(self, message: str) -> None:
+        self._output_readback_token += 1
+        for value in self.output_readback_values.values():
+            value.setText("未知")
+            value.setToolTip("")
+        self.output_readback_status.setText(message)
+
+    def _clear_output_metrics(self) -> None:
+        for name in ("frequency", "power", "rf"):
+            self.overview_metrics[name].setText("未知")
+
+    def _refresh_output_readback(self) -> None:
+        if self._output_readback_pending:
+            return
+        if not self.device.is_connected:
+            self._invalidate_output_readback("未连接 · 回读值未知")
+            self._clear_output_metrics()
+            self._update_output_readback_buttons()
+            return
+        self._invalidate_output_readback("正在回读频率、幅度与 RF 状态…")
+        token = self._output_readback_token
+        generation = self.device.connection_generation
+        # This request already targets the current connection. A main-window
+        # timer observing that same generation must not invalidate the new read
+        # merely because it has not yet observed an external reconnect itself.
+        self._ui_connection_generation = generation
+        self._output_readback_pending = True
+        self._update_output_readback_buttons()
+
+        def read_parameters():
+            with self.device.transaction():
+                if not self.device.is_connected or self.device.connection_generation != generation:
+                    raise RuntimeError("连接已变化，已取消旧连接的回读，请重新回读")
+                return self.device.read_output_parameters(), datetime.now().astimezone()
+
+        def completed(result):
+            self._output_readback_pending = False
+            self._update_output_readback_buttons()
+            reading, read_at = result
+            if token != self._output_readback_token:
+                return
+            if (not self.device.is_connected or self.device.connection_generation != generation
+                    or reading.connection_generation != generation):
+                self._invalidate_output_readback("连接已变化 · 回读值未知，请重新回读")
+                self._clear_output_metrics()
+                return
+            frequency = f"{roundtrip_number(reading.frequency_hz)} Hz"
+            amplitude = f"{roundtrip_number(reading.power_dbm)} dBm"
+            self.output_readback_values["frequency"].setText(frequency)
+            self.output_readback_values["amplitude"].setText(amplitude)
+            self.output_readback_values["output"].setText("开启" if reading.rf_on else "关闭（未输出）")
+            self.output_readback_values["frequency"].setToolTip("DLL 当前频率设置；非瞬时电气实测值")
+            self.output_readback_values["amplitude"].setToolTip("DLL 当前绝对功率设置（GetAbsPowerLevel），未切换单位或修改参数")
+            self.overview_metrics["frequency"].setText(frequency)
+            self.overview_metrics["power"].setText(amplitude)
+            self.overview_metrics["rf"].setText("已打开" if reading.rf_on else "关闭")
+            self.output_readback_status.setText(
+                f"回读时间：{read_at:%Y-%m-%d %H:%M:%S}（本地） · 点击可刷新"
+            )
+
+        def failed(message: str) -> None:
+            self._output_readback_pending = False
+            self._update_output_readback_buttons()
+            if token != self._output_readback_token:
+                return
+            self._invalidate_output_readback(f"回读失败 · 频率、幅度和输出状态未知：{message}")
+            self._clear_output_metrics()
+            self.statusBar().showMessage(f"Vaunix 参数回读失败：{message}", 10000)
+
+        self.submit(read_parameters, on_success=completed, on_error=failed, allow_during_scan=True)
 
     def _sweep_page(self) -> QWidget:
         page, layout = page_shell(
@@ -599,6 +735,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
     def _connected(self, result: Any) -> None:
         identity = getattr(result, "identity", None) or str(result)
         self._ui_connected = True
+        self._ui_connection_generation = self.device.connection_generation
         self.identity_label.setText(identity)
         self.driver_status.setObjectName("StatusOnline")
         self.driver_status.setText("● Vaunix DLL 已连接")
@@ -610,6 +747,8 @@ class VaunixLmsWindow(BaseDeviceWindow):
         self.disconnect_button.setEnabled(True)
         self.read_all_button.setEnabled(True)
         self._apply_capabilities(self.device.capabilities)
+        self._invalidate_output_readback("已连接 · 点击回读频率 / 幅度")
+        self._update_output_readback_buttons()
         self._refresh_metrics_only()
 
     def _disconnect(self) -> None:
@@ -625,6 +764,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
 
     def _disconnected(self, _result: Any = None) -> None:
         self._ui_connected = False
+        self._ui_connection_generation = None
         self.overview_metrics["connection"].setText("未连接")
         self.overview_metrics["frequency"].setText("—")
         self.overview_metrics["power"].setText("—")
@@ -637,6 +777,8 @@ class VaunixLmsWindow(BaseDeviceWindow):
         self.driver_status.setText("● 驱动尚未连接")
         self.driver_status.style().unpolish(self.driver_status)
         self.driver_status.style().polish(self.driver_status)
+        self._invalidate_output_readback("未连接 · 回读值未知")
+        self._update_output_readback_buttons()
 
     def sync_connection_state(self) -> None:
         if self.connection_manager is None:
@@ -646,6 +788,11 @@ class VaunixLmsWindow(BaseDeviceWindow):
             self._connected(self.connection_manager.info(self.record))
         elif not connected and self._ui_connected:
             self._disconnected()
+        elif connected and self.device.connection_generation != self._ui_connection_generation:
+            self._ui_connection_generation = self.device.connection_generation
+            self._invalidate_output_readback("连接已变化 · 回读值未知，请重新回读")
+            self._clear_output_metrics()
+            self._update_output_readback_buttons()
 
     def _apply_capabilities(self, caps: VaunixCapabilities) -> None:
         self.capability_label.setText(

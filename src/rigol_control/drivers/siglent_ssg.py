@@ -73,6 +73,16 @@ def capabilities(identity: str) -> SsgCapabilities:
 
 
 @dataclass(frozen=True)
+class SsgOutputReadback:
+    """Sequential RF configuration queries, not an electrical measurement."""
+
+    frequency_hz: float
+    power_dbm: float
+    output_enabled: bool
+    connection_generation: int
+
+
+@dataclass(frozen=True)
 class SsgPoint:
     frequency_hz: float
     power_dbm: float
@@ -176,6 +186,44 @@ class SiglentSsgDriver:
         self.caps = capabilities(self.session.query("*IDN?"))
         self.prepared = None
         return self.caps
+
+    def read_output_parameters(self) -> SsgOutputReadback:
+        """Read RF parameters without changing scan state or recovering a session.
+
+        SSG3000X C01A 3.4.3.2/3.4.4.2/3.3.1 define Hz, dBm and 1|0.
+        These common headers are also used by the supported SSG6000 variants.
+        No modulation, sweep-current, ESR or optional queries are appended.
+        """
+        self._known()
+
+        def query(command):
+            try:
+                return self.session.query(command, recover=False)
+            except Exception as exc:
+                raise SsgCommandError(f"SSG 参数回读失败 [{command}]：{exc}") from exc
+
+        def number(command, *, positive=False):
+            raw = query(command)
+            try:
+                value = float(raw)
+                if not math.isfinite(value) or (positive and value <= 0):
+                    raise ValueError("无效数值")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise SsgCommandError(f"SSG 数值回读无效 [{command}]：{raw!r}") from exc
+            return value
+
+        with self.session.transaction():
+            generation = self.session.connection_generation
+            frequency = number(":FREQuency?", positive=True)
+            power = number(":POWer?")
+            output = query(":OUTPut?")
+            try:
+                enabled = _on(output)
+            except (AttributeError, ScpiError) as exc:
+                raise SsgCommandError(f"SSG 输出状态回读无效 [:OUTPut?]：{output!r}") from exc
+            if self.session.connection_generation != generation:
+                raise SsgCommandError("SSG 回读期间连接已变化，本次结果已丢弃")
+            return SsgOutputReadback(frequency, power, enabled, generation)
 
     def _known(self):
         if not self.caps.known:

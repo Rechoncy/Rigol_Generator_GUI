@@ -1,8 +1,8 @@
 # 鼎阳 SIGLENT SSG 开发说明与变更记录
 
-更新日期：2026-09-28
+更新日期：2026-10-27
 
-对应源码：0.7.10（全局输入滚轮保护；保留 STEP/LIST 页面与查询等待修复）
+对应源码：0.7.18（独立的频率、功率与 RF 状态只读回读；保留原生 STEP/LIST 与恢复规则）
 
 用户操作见[详细使用说明](SIGLENT_SSG_CN.md)，全项目历史见[开发日志](DEVELOPMENT_LOG_CN.md)。
 
@@ -77,6 +77,7 @@
 | `set_frequency(hz)` | `:FREQuency`，校验当前功率 |
 | `set_power(value, unit="dBm")` | mV/mVpp 换算为 dBm 后发 `:POWer`，校验当前频率 |
 | `set_output(enabled)` | `:OUTPut`，独立于扫描与调制 |
+| `read_output_parameters()` | 事务内只查询 `:FREQuency?`、`:POWer?`、`:OUTPut?`，返回 Hz、dBm、RF 与连接代次；不自动恢复连接 |
 | `prepare_sweep(config)` | 下表参数、完整回读，扫描须为 OFF |
 | `start()` | 重新准备，再写 `:SWEep:STATe FREQUENCY/LEVEL/LEV_FREQ` |
 | `execute_single()` | 核对已启用且 SINGLE，再发 `:SWEep:EXECute` |
@@ -199,6 +200,20 @@ UI 的 `_run()` 串行提交工作。`SsgCommandError` 表示收到明确的错�
 
 `scan_monitor` 诊断字段中的 `trigger_received`、`trigger_backlog` 均为 null，界面为“未知”。C01A 未提供对应查询，不从采样次数、设定点表或值变化推算。`current_values` 为上述缓存或 null，另保存 `auto_refresh`、`status`；这不是硬件触发时间戳或逐点记录。
 
+### 7.3 专用参数回读（0.7.18）
+
+`read_output_parameters()` 返回不可变的 `SsgOutputReadback`。在一个会话事务内，使用 `recover=False` 依次执行 `:FREQuency?`、`:POWer?`、`:OUTPut?`；验证正有限频率、有限功率与明确 RF 布尔值，保留失败命令和原始回复。读取前后核对连接代次，不调用完整 `snapshot()`、ESR、调制或扫描状态查询，不改变 `prepared`、`state` 或 `scan_may_be_active`。
+
+| 已有型号的依据 | `:OUTPut?` | `:FREQuency?` | `:POWer?` |
+|---|---|---|---|
+| 用户提供普通 `SSG3000X_ProgrammingGuide_C01A.pdf` | 3.3.1，印刷 30 / PDF 34 页，0/1 | 3.4.3.2，印刷 32 / PDF 36 页，Hz | 3.4.4.2，印刷 34 / PDF 38 页，dBm |
+| [官方 SSG6080A 手册](https://www.siglent.com/wp-content/uploads/2024/09/SSG6080A_ProgrammingGuide_C01B.pdf) | 3.3.1，印刷 29 / PDF 33 页，0/1 | 3.4.3.2，印刷 31 / PDF 35 页，Hz | 3.4.4.2，印刷 32 / PDF 36 页，dBm |
+| [官方 SSG6082A-V EN01A](https://siglentna.com/wp-content/uploads/dlm_uploads/2025/04/SSG6082A-V_ProgrammingGuide_EN01A.pdf) | 3.3.1，印刷 33 / PDF 37 页，0/1 | 3.4.3.2，印刷 35 / PDF 39 页，Hz | 3.4.4.2，印刷 37 / PDF 41 页，dBm |
+
+上述三种基础查询共用命令头，型号能力表不因此扩展。回读始终标 dBm，不依据编辑框单位假设返回 mV，也不发送单位设置。原生 STEP/LIST 当前值预览继续使用 `SWEep:CURRent:FREQuency?` / `LEVel?`，不把载波配置误作扫描当前点。
+
+UI 在“连接与射频”页底部显示独立的频率、功率及 RF 卡片，只有用户点击时请求，不覆盖编辑控件或保存参数。请求在后台去重；连接代次变化、断连或异常使整组值和时间失效，迟到结果不覆盖新连接。这个专用只读路径不重新获取或释放原生扫描租约，不触发自动恢复或参数重放。它与既有原生扫描监视/停止共用串行访问，因此一次手动读取可能延后排队操作。时间为本机完成时间，顺序参数回读不构成瞬时电气测量。
+
 ## 8. 持久化与日志边界
 
 0.7.5 在主窗口与所有基础设备窗口标题使用 `rigol_control.__version__`，移除主窗口写死的 v0.6.0 文案。SSG 诊断页、初始日志及错误 JSON 记录实际版本；JSON 增加 `executable`、`module_path`、`frozen`，从当前进程获取，不从目录名猜测版本。冻结自检校验 7 个窗口标题和错误报告的运行身份。
@@ -248,10 +263,11 @@ SSG3021X 专项后端禁止矢量命令，并检查脉冲模式相关写入和�
 | `test_siglent_ssg.py` | 能力范围、STEP/LIST、两级触发、单次、调制保留、回读、错误与非重试 |
 | `test_ssg3021x_compatibility.py` | 不发 -V 命令；条件脉冲参数；枚举别名；BUS 成功、忽略、ESR 拒绝、面板更改和触发失联 |
 | `test_siglent_ui.py` | 窗口、参数恢复、配置归档、脉冲控件、BUS 按钮、失败后的占用与恢复 |
+| `test_siglent_readback.py` | 14 项：三项纯查询、各型号共用基础命令头、非法回复、整组失效、慢调用、连接代次、原生扫描租约保留与排队停止边界 |
 | `test_ui_smoke.py` | 六台虚拟设备集成入口 |
 | 全项目回归 | 既有 DG/Vaunix/Newport/NI、配置迁移和启动器 |
 
-最近一次功能回归（脉冲 BUS 加入后）：**201 项测试通过，22.401 s，git diff --check 通过**。这是自动测试记录，不是实机验收。本文档整理本身不增加功能测试数。
+历史脉冲 BUS 加入阶段：201 项测试通过，22.401 s，git diff --check 通过。本轮 0.7.18 的实际回归及自检另见[本版说明](../release/NOTES-0.7.18.md)，不使用历史计数代替本版验收。上述自动测试均不等于实机验收。
 
 在仓库根目录用项目所用的 Python 环境运行：
 

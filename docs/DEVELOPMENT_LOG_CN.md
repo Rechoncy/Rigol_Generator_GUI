@@ -1,8 +1,8 @@
 # DG4000 + SIGLENT SSG + Vaunix + Newport + NI 多设备联动控制：开发日志与维护指南
 
-文档版本：1.5
+文档版本：1.6
 
-对应软件版本：0.7.17（本地开发构建：DG4000 双通道频率与幅度回读；正式下载为 0.7.15；阶段记录见第 12 节）
+对应软件版本：0.7.18（本地开发构建：SSG/Vaunix 频率、功率与 RF 回读；保留 DG4000 双通道回读；正式下载为 0.7.15；阶段记录见第 12 节）
 
 最后更新：2026-10-27
 适用仓库：`Rigol_Generator_GUI`
@@ -382,19 +382,21 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 | 虚拟实验室 | DG/Vaunix/Newport 状态、触发、四通道采集、默认 50 Ω | `test_virtual_lab.py`、`test_vaunix.py`、`test_newport.py` |
 | UI 端到端 | 六台虚拟设备、动态范围、DG/Vaunix 联动、Newport 身份与运动状态 | `test_ui_smoke.py`、`test_newport_ui.py` |
 | 鼎阳 SSG | 原生扫描、两级触发、型号约束、脉冲 BUS、配置保存、失联租约 | `test_siglent_ssg.py`、`test_ssg3021x_compatibility.py`、`test_siglent_ui.py` |
+| 信号源只读回读 | 类型化查询/Getter、原生单位、整组失效、UI 后台响应、连接代次与任务期间访问 | `test_dg_readback.py`、`test_dg_readback_ui.py`、`test_siglent_readback.py`、`test_vaunix_readback.py` |
 | 旋转点表 | 未知起点、负步长、回跳/停止状态、10000 点刷新 | `test_rotation_table.py` |
 | 配置迁移 | 往返、备份、损坏包、写入失败/中断恢复、连接恢复和运行互斥 | `test_config_archive.py`、`test_config_archive_ui.py` |
 | Windows 源码入口 | 目录迁移、特殊字符路径、解释器回退、失败日志 | `test_windows_launcher.py` |
 | 便携发行 | 冻结路径、数据目录优先级、权限错误、厂商 DLL 定位、打包文件选择 | `test_runtime.py`、`test_release_build.py` |
 | 编译产物自检 | 依赖来自包内、Qt 插件/图标、六台虚拟设备和窗口、普通 GUI 启动 | `tools/frozen_entry.py`、`tools/build_release.py` |
 
-当前回归重点为 0.7.16 的连续文本写入/刷新/关闭失败、保存计数、读取线程超时、NI 清理重试以及 UI 后台停止与租约保留。历史 .12–.15 的结果保留在第 12 节，不作为本版全量或冻结产物检查结果。验证范围与实际结果见[本地开发构建说明](../release/NOTES-0.7.16.md)，未进行本版实机验收。
+当前回归重点为 SSG/Vaunix 纯查询回读、单位/SDK 错误解析、连接代次保护、慢调用时界面响应、结果与编辑分离，以及此前 DG 回读、NI 清理和任务租约保护。历史版本结果保留在第 12 节，不作为本版全量或冻结产物检查结果。验证范围与实际结果见[本地开发构建说明](../release/NOTES-0.7.18.md)，未进行本版实机验收。
 
 关键回归契约：
 
 - SSG 准备扫描保持 OFF、不改变 RF/MOD；列表完整回读后才能启用。
 - SSG3021X 不收到 -V 专用命令；BUS 被拒绝或忽略时不启用脉冲、不回退 AUTO、不发送触发。
 - SSG 触发失败不重发；已知型号状态未知时保留占用，重连后确认停止再释放。
+- DG/SSG/Vaunix 专用回读不调用设置、不覆盖编辑，不轮询或按点查询；坏回复整组失效，连接更换后拒绝迟到快照，慢会话不阻塞 Qt 主线程。普通手动写入继续受运行租约保护。
 
 - 启动任务前 DG 不应自动收到 P0。
 - DG/Vaunix 第一个触发应用 P0，点表结束后循环回 P0。
@@ -447,6 +449,17 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 实体输出测试必须由实验负责人确认幅度、偏置、负载、端接方式、PFI 电平、接地和被测电路耐压。自动测试不能替代这些电气检查。
 
 ## 12. 版本开发日志
+
+### 0.7.18：SSG 与 Vaunix 频率、功率及 RF 回读 — 2026-10-27
+
+- 核对项目全部六类设备：DG4000、SSG 和 Vaunix 是本次频率/幅度回读的适用信号源；NI 在项目中只实现采集/计数，Newport 已有位置/运动回读，通用 SCPI 无固定型号语义，不猜测其命令。用户说明增加范围对照表。
+- 将独立的手动回读显示扩展到 SSG 和 Vaunix，读取频率、绝对功率及 RF 开关并显示本机完成时间。结果与待应用编辑和持久化参数分开，失败或断连使旧显示失效；不以读取失败触发参数重放。
+- SSG 按普通 C01A 的 `:FREQuency?`（Hz）、`:POWer?`（固定 dBm）、`:OUTPut?`（0/1）实现纯三查询，6000A/-V 官方手册复核相同基础头；不追加 ESR、扫描或调制查询，不改变扫描风险证据。命令页码见[SSG 开发说明](SIGLENT_SSG_DEVELOPMENT_CN.md#73-专用参数回读0718)。
+- Vaunix 使用 SDK `GetFrequencyEx` 的 10 Hz 编码和 `GetAbsPowerLevel` 的 0.25 dB 编码读取绝对功率，并读 `GetRF_On` 及句柄状态；明确区分 `GetPowerLevel` 的相对衰减。新路径不调用 setter、连接恢复或查询重试，SDK/设备锁保证整组不穿插本程序点写入。
+- 源码虚拟自检复现并修复 Vaunix 重连后首次点击的竞态：设备连接代次已更新、界面定时同步尚未执行时，新请求若仍保留旧的界面观察代次，会被随后的状态同步误判为旧结果。开始新请求时同步观察代次，同时保留真正旧请求的失效检查；新增最小回归先失败后通过，诊断保存在 `build/vaunix-readback-reconnect-repro-0718.log`。
+- 三类信号源均将回读放在后台、与实际写入串行，不增加每点查询或自动轮询。按需查询会占用通信时间，保持 DG/Vaunix 首触发 P0、有序积压、停止失败保留占用、CH2 隔离以及 SSG 自身原生扫描与恢复规则。
+- 完整源码回归 495 项通过（69.579 秒）；新增 30 项专用回读回归（SSG 14、Vaunix 16），覆盖纯查询、原生单位、异常整组失效、连接更换/迟到结果、慢调用、任务占用及排队停止边界。源码虚拟自检通过，新增 `siglent_output_readback` 与 `vaunix_output_readback` 的六项检查全部为 true，`hardware_access=false`；1180×760 默认窗口截图确认两个回读区的三张状态卡片可读。冻结构建的逐项实际运行结果以本版发行清单为准。
+- 版本为 0.7.18 本地开发构建，实际测试、源码自检和冻结产物的证据保存在本版说明、发行清单与 `dist/verification/0.7.18/`；公开 Release 仍为 v0.7.15，保留历史产物，不自动创建标签或 Release，未操作实体仪器。详见[本版说明](../release/NOTES-0.7.18.md)。
 
 ### 0.7.17：DG4000 双通道频率与幅度回读 — 2026-10-27
 
