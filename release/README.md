@@ -1,6 +1,6 @@
 # Windows 便携发行版使用与构建说明
 
-正式下载版本：0.7.15；当前源码与本地开发构建：0.7.18（未发布 GitHub Release）；目标平台：Windows 10/11 x64。
+正式下载与当前源码版本：0.7.18；目标平台：Windows 10/11 x64。
 
 发行版包含运行程序所需的 Python、Qt、PyVISA、pyserial 和 nidaqmx。目标电脑无需安装 Python、pip 或创建虚拟环境，首次启动也无需联网下载 Python 组件。内置运行时只供本软件使用，不修改系统 Python。
 
@@ -8,20 +8,20 @@
 
 | 文件 | 用法 | 适合场景 |
 |---|---|---|
-| `Lab-Control-Center-0.7.15-windows-x64-portable.zip` | 完整解压后运行目录内的 `Lab Control Center.exe` | 日常使用、实验室迁移、与文档一起保存 |
-| `Lab-Control-Center-0.7.15-windows-x64.exe` | 放在可写目录，直接双击 | 只希望分发一个程序文件 |
+| `Lab-Control-Center-0.7.18-windows-x64-portable.zip` | 完整解压后运行目录内的 `Lab Control Center.exe` | 日常使用、实验室迁移、与文档一起保存 |
+| `Lab-Control-Center-0.7.18-windows-x64.exe` | 放在可写目录，直接双击 | 只希望分发一个程序文件 |
 | `SHA256SUMS.txt` | 对照下载文件的 SHA-256 | 核对下载是否完整 |
 | `release-manifest.json` | 查看版本、构建、依赖与验证信息 | 维护、问题报告和版本追踪 |
-| `Lab-Control-Center-0.7.15-windows-x64-source.zip` | 本次构建使用的源码与文档快照 | 维护、依赖许可要求及问题复现 |
+| `Lab-Control-Center-0.7.18-windows-x64-source.zip` | 本次构建使用的源码与文档快照 | 维护、依赖许可要求及问题复现 |
 | `RELEASE-NOTES.md` | 查看本版改动和验证范围 | 升级前阅读 |
 
-项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。正式发行文件从 [v0.7.15 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.15) 下载，由版本标签对应的提交构建。发布附件的本地副本位于 `dist/published/v0.7.15/`，自行构建的输出目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以同组附件的 `release-manifest.json` 为准，完整性可用 `SHA256SUMS.txt` 核对。
+项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。正式发行文件从 [v0.7.18 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.18) 下载，由版本标签对应的提交构建。发布附件的本地副本位于 `dist/published/v0.7.18/`，自行构建的输出目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以同组附件的 `release-manifest.json` 为准，完整性可用 `SHA256SUMS.txt` 核对。
 
-本文下载文件名和运行示例使用正式版 0.7.15。第 7 节从当前源码构建会生成 0.7.18 文件，不会覆盖 `dist/published/v0.7.15/` 中的已发布附件，也不会自动创建标签或 Release。0.7.18 的 SSG/Vaunix 回读功能与验证状态见[本地开发构建说明](NOTES-0.7.18.md)；DG4000 回读和 NI 模拟采集修复历史分别见[0.7.17 说明](NOTES-0.7.17.md)与[0.7.16 说明](NOTES-0.7.16.md)。
+本文下载文件名和运行示例使用正式版 0.7.18。第 7 节从当前源码构建也生成 0.7.18 文件，但本地构建本身不会创建标签或 Release。正式附件、`dist/local/v0.7.18/` 开发构建及 `dist/published/v0.7.15/` 历史附件分别保存，不互相覆盖。0.7.18 的 SSG/Vaunix 回读功能与验证状态见[发行说明](NOTES-0.7.18.md)；DG4000 回读和 NI 模拟采集修复历史分别见[0.7.17 说明](NOTES-0.7.17.md)与[0.7.16 说明](NOTES-0.7.16.md)。
 
 仓库根目录原有的小型 `Lab Control Center.exe` 是源码启动器，仍需外部 Python/PyQt6；它与上述编译产物不同。使用免 Python 版本时，应下载发行附件或按第 7 节构建。
 
-从 0.7.5 起，主窗口和每个设备窗口标题均显示真实运行版本（例如 `v0.7.15`）。SSG 的“状态与诊断”页显示可复制的运行程序、模块路径，诊断 JSON 也保存这些信息。压缩包或文件夹的名称不能代替运行版本；升级后请核对标题。
+从 0.7.5 起，主窗口和每个设备窗口标题均显示真实运行版本（例如 `v0.7.18`）。SSG 的“状态与诊断”页显示可复制的运行程序、模块路径，诊断 JSON 也保存这些信息。压缩包或文件夹的名称不能代替运行版本；升级后请核对标题。
 
 ## 2. 解压与首次启动
 
@@ -34,7 +34,7 @@
 目录包主要结构：
 
 ```text
-Lab-Control-Center-0.7.15-windows-x64-portable/
+Lab-Control-Center-0.7.18-windows-x64-portable/
 ├─ Lab Control Center.exe
 ├─ _internal/              内置 Python、Qt、Python 依赖与资源，须完整保留
 ├─ docs/                   操作和开发说明
@@ -67,7 +67,7 @@ Lab-Control-Center-0.7.15-windows-x64-portable/
 单文件版本同样支持：
 
 ```powershell
-& ".\Lab-Control-Center-0.7.15-windows-x64.exe" --data-dir "D:\LabData\ControlCenter"
+& ".\Lab-Control-Center-0.7.18-windows-x64.exe" --data-dir "D:\LabData\ControlCenter"
 ```
 
 也可为当前 PowerShell 会话设置环境变量后启动：
@@ -109,7 +109,7 @@ NI-DAQmx 关闭报错且原生句柄已丢失时，显示“原生清理未确�
 | DG4000、SIGLENT SSG、通用 SCPI | PyVISA | 支持设备的 x64 VISA 实现，例如 NI-VISA；按 USB/LAN 配置通信 |
 | NI 计数与模拟输入 | nidaqmx Python 接口 | NI-DAQmx 系统驱动及正确识别的 NI 设备 |
 | Newport SMC100CC / PR50CC | pyserial | 设备所用 USB 转串口驱动、可用 COM 端口 |
-| Vaunix LMS/BLX | Python SDK 绑定；0.7.15 发行包内置 SDK 1.15 的 Windows x64 `vnx_fmsynth.dll` | 设备要求的 Windows USB/系统驱动 |
+| Vaunix LMS/BLX | Python SDK 绑定；0.7.18 发行包内置 SDK 1.15 的 Windows x64 `vnx_fmsynth.dll` | 设备要求的 Windows USB/系统驱动 |
 
 0.7.15 构建脚本将主目录提供的 Vaunix SDK DLL 内置到便携 ZIP 和单文件 EXE，构建后须在清单中确认 `vaunix_dll_bundled=true`。目录包的位置为 `_internal/vendor/vaunix/vnx_fmsynth.dll`；单文件 EXE 启动时将它随内置运行时解压到临时目录的 `vendor/vaunix/`。清单确认携带后，无需安装 SDK、复制外置 DLL 或设置环境变量，迁移时保留完整目录包或单文件 EXE 即可携带。
 
@@ -167,8 +167,8 @@ Get-Content ".\bundle-report.json"
 校验示例：
 
 ```powershell
-Get-FileHash ".\Lab-Control-Center-0.7.15-windows-x64-portable.zip" -Algorithm SHA256
-Get-FileHash ".\Lab-Control-Center-0.7.15-windows-x64.exe" -Algorithm SHA256
+Get-FileHash ".\Lab-Control-Center-0.7.18-windows-x64-portable.zip" -Algorithm SHA256
+Get-FileHash ".\Lab-Control-Center-0.7.18-windows-x64.exe" -Algorithm SHA256
 ```
 
 ## 7. 开发者构建
@@ -216,6 +216,6 @@ dist/release/
 
 ## 8. 本版记录
 
-正式发行的变更范围和验证见 [0.7.15 发行说明](NOTES-0.7.15.md)，当前本地开发构建见 [0.7.18 说明](NOTES-0.7.18.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
+正式发行的变更范围和验证见 [0.7.18 发行说明](NOTES-0.7.18.md)，此前公开版本记录见 [0.7.15 发行说明](NOTES-0.7.15.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
 
 0.7.16 源码完整回归 444 项、0.7.17 源码完整回归 465 项及各版源码虚拟自检通过，作为历史记录保留。0.7.18 回读与冻结产物的逐项验收以本版说明、`release-manifest.json` 及 `dist/verification/0.7.18/` 为准，不能用旧版结果替代。上述版本均未实机验收。
