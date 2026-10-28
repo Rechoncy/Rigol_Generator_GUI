@@ -12,11 +12,12 @@ from PyQt6.QtWidgets import QApplication
 
 from rigol_control import app as app_module
 from rigol_control.app import create_application
-from rigol_control.ui.update_panel import UpdatePanel
+from rigol_control.ui.update_panel import UpdatePanel, preferred_update_package
 from rigol_control.ui.main_window import DeviceCenterWindow
 from rigol_control.repository import DeviceRepository
-from rigol_control.update_settings import load_update_preference, save_update_preference
-from rigol_control.updates import ReleaseInfo
+from rigol_control.update_settings import (UpdatePreferences, load_update_preference, save_update_preference,
+                                          load_update_preferences, save_update_preferences)
+from rigol_control.updates import ReleaseAsset, ReleaseInfo
 
 
 class FakeChecker(QObject):
@@ -53,6 +54,40 @@ class FakeChecker(QObject):
         signal.emit(result)
 
 
+class FakeDownloader(QObject):
+    downloading_changed = pyqtSignal(bool)
+    progress = pyqtSignal(object, object)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.downloading = False
+        self.calls = []
+        self.cancels = 0
+        self.closed = False
+
+    def start(self, asset, directory):
+        self.calls.append((asset, directory))
+        self.downloading = True
+        self.downloading_changed.emit(True)
+        return True
+
+    def cancel(self):
+        self.cancels += 1
+        self.downloading = False
+        self.downloading_changed.emit(False)
+
+    def close(self):
+        self.closed = True
+        self.cancel()
+
+    def finish(self, signal, value):
+        self.downloading = False
+        self.downloading_changed.emit(False)
+        signal.emit(value)
+
+
 class UpdatePreferenceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -85,6 +120,27 @@ class UpdatePreferenceTests(unittest.TestCase):
                 save_update_preference(self.root, True)
         self.assertEqual(load_update_preference(self.root), (False, ""))
         self.assertEqual([p.name for p in self.root.iterdir()], ["update_settings.json"])
+
+    def test_old_setting_adds_download_default_and_preserves_separate_choices(self):
+        (self.root / "update_settings.json").write_text(
+            '{"schema_version":1,"automatic_check":false}', encoding="utf-8")
+        self.assertEqual(load_update_preferences(self.root), (UpdatePreferences(False, True), ""))
+        save_update_preferences(self.root, UpdatePreferences(True, False))
+        save_update_preference(self.root, False)
+        self.assertEqual(load_update_preferences(self.root), (UpdatePreferences(False, False), ""))
+
+    def test_malformed_download_setting_disables_both_automatic_options(self):
+        (self.root / "update_settings.json").write_text(
+            '{"schema_version":1,"automatic_check":true,"automatic_download":"yes"}', encoding="utf-8")
+        preferences, error = load_update_preferences(self.root)
+        self.assertEqual(preferences, UpdatePreferences(False, False))
+        self.assertIn("读取失败", error)
+
+    def test_deeply_nested_settings_cannot_abort_application_startup(self):
+        (self.root / "update_settings.json").write_text("[" * 1500 + "]" * 1500, encoding="utf-8")
+        preferences, error = load_update_preferences(self.root)
+        self.assertEqual(preferences, UpdatePreferences(False, False))
+        self.assertIn("读取失败", error)
 
 
 class UpdatePanelTests(unittest.TestCase):
@@ -170,7 +226,7 @@ class UpdatePanelTests(unittest.TestCase):
 
     def test_save_failure_visible_and_close_cancels_timers(self):
         self.panel.start_automatic_checks()
-        with patch("rigol_control.ui.update_panel.save_update_preference", side_effect=OSError("denied")):
+        with patch("rigol_control.ui.update_panel.save_update_preferences", side_effect=OSError("denied")):
             self.panel.automatic.setChecked(False)
         self.assertIn("保存失败", self.panel.status.text())
         self.panel.check()
@@ -239,3 +295,101 @@ class AppUpdateStartupTests(unittest.TestCase):
                         window.return_value.update_panel.start_automatic_checks.assert_not_called()
                     else:
                         window.return_value.update_panel.start_automatic_checks.assert_called_once()
+
+
+class UpdateDownloadPanelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or create_application(["download-panel-test"])
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.checker, self.downloader = FakeChecker(), FakeDownloader()
+        self.panel = UpdatePanel(self.root, checker=self.checker, downloader=self.downloader)
+        self.asset = ReleaseAsset("Lab-Control-Center-99.0.0-windows-x64-portable.zip",
+                                 "https://github.com/Rechoncy/Rigol_Generator_GUI/releases/download/v99.0.0/"
+                                 "Lab-Control-Center-99.0.0-windows-x64-portable.zip", 100, "0" * 64)
+        self.release = ReleaseInfo("99.0.0", "v99.0.0",
+                                  "https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v99.0.0",
+                                  (self.asset,))
+        self.panel.show()
+
+    def tearDown(self):
+        self.panel.stop()
+        self.panel.close()
+        self.panel.deleteLater()
+        self.app.processEvents()
+        self.temporary.cleanup()
+
+    def test_automatic_download_starts_with_compatible_asset_and_separate_folder(self):
+        self.checker.update_available.emit(self.release)
+        self.assertEqual(self.downloader.calls, [(self.asset, self.root / "updates/v99.0.0")])
+        self.assertEqual(self.panel.download_button.text(), "取消下载")
+        self.downloader.progress.emit(50, 100)
+        self.assertEqual(self.panel.download_progress.value(), 500)
+        self.assertIn("正在下载", self.panel.download_status.text())
+        self.assertTrue(self.panel.check_button.isEnabled())
+
+    def test_verified_completion_only_opens_folder_on_explicit_click(self):
+        self.checker.update_available.emit(self.release)
+        path = self.root / "updates/v99.0.0" / self.asset.name
+        with patch("rigol_control.ui.update_panel.QDesktopServices.openUrl", return_value=True) as browser:
+            self.downloader.finish(self.downloader.finished, path)
+            self.assertIn("通过校验", self.panel.download_status.text())
+            browser.assert_not_called()
+            self.panel.open_folder_button.click()
+            self.assertEqual(Path(browser.call_args.args[0].toLocalFile()), path.parent)
+            self.assertNotEqual(Path(browser.call_args.args[0].toLocalFile()), path)
+
+    def test_cancel_keeps_new_version_notice_and_allows_manual_retry(self):
+        self.checker.update_available.emit(self.release)
+        self.panel.download_button.click()
+        self.assertEqual(self.downloader.cancels, 1)
+        self.assertIn("取消", self.panel.download_status.text())
+        self.assertIn("发现新版本", self.panel.status.text())
+        self.panel.download_button.click()
+        self.assertEqual(len(self.downloader.calls), 2)
+        self.downloader.finish(self.downloader.failed, "SHA-256 不匹配")
+        self.assertIn("SHA-256", self.panel.download_status.text())
+        self.assertTrue(self.panel.open_folder_button.isHidden())
+        self.assertTrue(self.panel.download_button.isEnabled())
+
+    def test_automatic_download_preference_is_independent_and_manual_retry_works(self):
+        self.panel.automatic_download.setChecked(False)
+        self.checker.update_available.emit(self.release)
+        self.assertFalse(self.downloader.calls)
+        preferences, _ = load_update_preferences(self.root)
+        self.assertEqual(preferences, UpdatePreferences(True, False))
+        self.panel.download_button.click()
+        self.assertEqual(len(self.downloader.calls), 1)
+        self.panel.automatic.setChecked(False)
+        self.assertTrue(self.downloader.downloading)
+
+    def test_disabling_automatic_download_cancels_automatic_request(self):
+        self.checker.update_available.emit(self.release)
+        self.panel.automatic_download.setChecked(False)
+        self.assertEqual(self.downloader.cancels, 1)
+        self.assertFalse(self.downloader.downloading)
+
+    def test_missing_trusted_asset_offers_release_page_without_download(self):
+        self.checker.update_available.emit(ReleaseInfo("99.0.0", "v99.0.0", self.release.url))
+        self.assertFalse(self.downloader.calls)
+        self.assertFalse(self.panel.download_button.isEnabled())
+        self.assertIn("SHA-256", self.panel.download_status.text())
+        self.assertTrue(self.panel.release_button.isVisible())
+
+    def test_close_cancels_download_and_ignores_late_completion(self):
+        self.checker.update_available.emit(self.release)
+        self.panel.stop()
+        self.assertTrue(self.downloader.closed)
+        self.downloader.finished.emit(self.root / self.asset.name)
+        self.assertIsNone(self.panel._downloaded_path)
+
+    def test_running_distribution_selects_same_update_package_format(self):
+        with patch("rigol_control.ui.update_panel.sys.frozen", True, create=True), \
+                patch("rigol_control.ui.update_panel.sys.executable", str(self.root / "app.exe")):
+            with patch("rigol_control.ui.update_panel.sys._MEIPASS", str(self.root / "_internal"), create=True):
+                self.assertEqual(preferred_update_package(), "zip")
+            with patch("rigol_control.ui.update_panel.sys._MEIPASS", str(self.root / "temp/extraction"), create=True):
+                self.assertEqual(preferred_update_package(), "exe")

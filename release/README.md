@@ -1,6 +1,6 @@
 # Windows 便携发行版使用与构建说明
 
-最新正式下载：0.7.20；当前源码与本地开发构建：0.7.21；目标平台：Windows 10/11 x64。
+最新正式下载：0.7.20；当前源码与本地开发构建：0.7.22；目标平台：Windows 10/11 x64。
 
 发行版包含运行程序所需的 Python、Qt、PyVISA、pyserial 和 nidaqmx。目标电脑无需安装 Python、pip 或创建虚拟环境，首次启动也无需联网下载 Python 组件。内置运行时只供本软件使用，不修改系统 Python。
 
@@ -17,7 +17,7 @@
 
 项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。正式发行文件从 [v0.7.20 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.20) 下载，由版本标签对应的提交构建。发布附件的本地副本位于 `dist/published/v0.7.20/`，自行构建的输出目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以同组附件的 `release-manifest.json` 为准，完整性可用 `SHA256SUMS.txt` 核对。
 
-本文下载文件名和运行示例使用正式版 0.7.20。第 7 节从当前源码构建生成 0.7.21 文件，本地构建本身不会创建标签或 Release。0.7.21 新增 GitHub 更新检查，操作见[使用说明](../docs/USER_MANUAL_CN.md#44-联网检查软件更新)，变更及实际验证见[本版记录](NOTES-0.7.21.md)。正式附件、`dist/local/v0.7.21/` 本地开发构建、`dist/local/v0.7.20/` 原开发构建、`dist/published/v0.7.20/` 正式附件及其他既有包分别保存，不互相覆盖。0.7.20 的 Newport 状态与手动恢复修复见[发行说明](NOTES-0.7.20.md)；DG4000 重连快照修复、SSG/Vaunix 回读、此前 DG 回读与 NI 采集修复分别见[0.7.19](NOTES-0.7.19.md)、[0.7.18](NOTES-0.7.18.md)、[0.7.17](NOTES-0.7.17.md)和[0.7.16](NOTES-0.7.16.md)记录。
+本文下载文件名和运行示例使用正式版 0.7.20。第 7 节从当前源码构建生成 0.7.22 文件，本地构建本身不会创建标签或 Release。0.7.22 在更新检查上增加自动下载与校验，操作见[使用说明](../docs/USER_MANUAL_CN.md#44-联网检查软件更新)，变更及实际验证见[本版记录](NOTES-0.7.22.md)。正式附件、`dist/local/v0.7.22/` 本地开发构建、`dist/local/v0.7.21/` 原更新检查构建、`dist/local/v0.7.20/` 原开发构建、`dist/published/v0.7.20/` 正式附件及其他既有包分别保存，不互相覆盖。0.7.20 的 Newport 状态与手动恢复修复见[发行说明](NOTES-0.7.20.md)；更新提示、DG4000 重连快照修复、SSG/Vaunix 回读、此前 DG 回读与 NI 采集修复分别见[0.7.21](NOTES-0.7.21.md)、[0.7.19](NOTES-0.7.19.md)、[0.7.18](NOTES-0.7.18.md)、[0.7.17](NOTES-0.7.17.md)和[0.7.16](NOTES-0.7.16.md)记录。
 
 仓库根目录原有的小型 `Lab Control Center.exe` 是源码启动器，仍需外部 Python/PyQt6；它与上述编译产物不同。使用免 Python 版本时，应下载发行附件或按第 7 节构建。
 
@@ -31,7 +31,7 @@
 4. 实机使用按第 4 节准备对应驱动，再在软件中添加或导入设备配置。
 5. 软件启动和配置恢复不会自动开启 RF、移动旋转台或启动扫描；连接、参数应用、输出与任务仍由用户在界面中操作。
 
-0.7.21 源码与本地构建的首页底部提供 GitHub 更新检查。默认正常启动约 3 秒后异步检查最新正式 Release，运行中每 6 小时检查；可取消“启动后自动检查更新”，也可手动点击“检查更新”。发现更高版本时持续显示提示，点击“打开发布页”才打开浏览器下载；不自动安装或替换正在运行的程序。无网络、代理失败或限流只在更新区提示，仪器仍可离线使用。联网使用系统代理与 HTTPS 证书验证，无需登录或令牌，不上传设备配置。完整操作见[软件更新](../docs/USER_MANUAL_CN.md#44-联网检查软件更新)。
+0.7.22 源码与本地构建的首页底部提供 GitHub 更新检查及自动下载。默认正常启动约 3 秒后异步检查最新正式 Release，运行中每 6 小时检查；可分别关闭“启动后自动检查更新”和“发现更新后自动下载”，也可手动检查或重试下载。发现更高版本且附件可校验时，后台下载对应格式 ZIP/EXE，验证 GitHub API 提供的字节数与 SHA-256 后保存在 `data/updates/v版本号/`，显示进度、取消及文件夹入口；不自动解压、安装、执行或覆盖程序。无网络、代理失败或限流只在更新区提示，仪器仍可离线使用。联网使用系统代理与 HTTPS 证书验证，无需登录或令牌，不上传设备配置；缺少校验值或仅有不受支持的 SOCKS 下载代理时，可通过发布页使用浏览器下载。完整操作见[软件更新](../docs/USER_MANUAL_CN.md#44-联网检查软件更新)。
 
 目录包主要结构：
 
@@ -198,9 +198,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1 -V
 
 ```text
 dist/release/
-├─ Lab-Control-Center-0.7.21-windows-x64-portable.zip
-├─ Lab-Control-Center-0.7.21-windows-x64.exe
-├─ Lab-Control-Center-0.7.21-windows-x64-source.zip
+├─ Lab-Control-Center-0.7.22-windows-x64-portable.zip
+├─ Lab-Control-Center-0.7.22-windows-x64.exe
+├─ Lab-Control-Center-0.7.22-windows-x64-source.zip
 ├─ RELEASE-NOTES.md
 ├─ SHA256SUMS.txt
 └─ release-manifest.json
@@ -218,7 +218,7 @@ dist/release/
 
 ## 8. 本版记录
 
-0.7.21 源码与本地开发构建增加联网更新提示，详见[0.7.21 记录](NOTES-0.7.21.md)。本轮不创建标签或公开 Release；GitHub 上最后正式版低于本地开发版时，不会提示降级。
+0.7.22 源码与本地开发构建增加自动下载和校验，详见[0.7.22 记录](NOTES-0.7.22.md)，原更新提示实现见[0.7.21 记录](NOTES-0.7.21.md)。本轮不创建标签或公开 Release；GitHub 上最后正式版低于本地开发版时，不会提示降级或下载旧版。
 
 正式发行的变更范围和验证见 [0.7.20 发行说明](NOTES-0.7.20.md)，DG 快速重连修复保留在 [0.7.19 说明](NOTES-0.7.19.md)，此前公开版本记录见 [0.7.18 发行说明](NOTES-0.7.18.md)与[0.7.15 发行说明](NOTES-0.7.15.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
 

@@ -23,7 +23,16 @@ REPOSITORY_URL = "https://github.com/Rechoncy/Rigol_Generator_GUI"
 LATEST_RELEASE_URL = "https://api.github.com/repos/Rechoncy/Rigol_Generator_GUI/releases/latest"
 CHECK_TIMEOUT_MS = 15_000
 MAX_RESPONSE_BYTES = 256 * 1024
+MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
 _VERSION = re.compile(r"v?(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})", re.ASCII)
+
+
+@dataclass(frozen=True)
+class ReleaseAsset:
+    name: str
+    url: str
+    size: int
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -31,6 +40,7 @@ class ReleaseInfo:
     version: str
     tag: str
     url: str
+    assets: tuple[ReleaseAsset, ...] = ()
 
 
 def _version_parts(value: str) -> tuple[int, int, int]:
@@ -38,6 +48,30 @@ def _version_parts(value: str) -> tuple[int, int, int]:
     if match is None:
         raise ValueError("版本号格式无效，需为 x.y.z 或 vx.y.z 的正式版本")
     return tuple(int(part) for part in match.groups())
+
+
+def _release_assets(payload: dict, tag: str, version: str) -> tuple[ReleaseAsset, ...]:
+    entries = payload.get("assets")
+    if not isinstance(entries, list):
+        return ()
+    allowed = {f"Lab-Control-Center-{version}-windows-x64-portable.zip",
+               f"Lab-Control-Center-{version}-windows-x64.exe"}
+    assets: dict[str, ReleaseAsset] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or name not in allowed:
+            continue
+        url = f"{REPOSITORY_URL}/releases/download/{tag}/{name}"
+        size, digest = entry.get("size"), entry.get("digest")
+        if (entry.get("state") != "uploaded" or entry.get("browser_download_url") != url
+                or type(size) is not int or not 0 < size <= MAX_DOWNLOAD_BYTES
+                or not isinstance(digest, str)
+                or re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest, re.ASCII) is None):
+            continue
+        assets[name] = ReleaseAsset(name, url, size, digest[7:].lower())
+    return tuple(assets[name] for name in sorted(assets))
 
 
 def _release_info(payload: object) -> ReleaseInfo:
@@ -49,7 +83,9 @@ def _release_info(payload: object) -> ReleaseInfo:
     parts = _version_parts(tag)
     # Only display a URL derived from the validated tag and fixed repository.
     # The response's html_url/body/assets are never opened or rendered as HTML.
-    return ReleaseInfo(".".join(map(str, parts)), tag, f"{REPOSITORY_URL}/releases/tag/{tag}")
+    version = ".".join(map(str, parts))
+    return ReleaseInfo(version, tag, f"{REPOSITORY_URL}/releases/tag/{tag}",
+                       _release_assets(payload, tag, version))
 
 
 def parse_release(payload: object, current_version: str = __version__) -> ReleaseInfo | None:
@@ -58,8 +94,8 @@ def parse_release(payload: object, current_version: str = __version__) -> Releas
     return release if _version_parts(release.version) > _version_parts(current_version) else None
 
 
-def _system_https_proxy():
-    proxies = QNetworkProxyFactory.systemProxyForQuery(QNetworkProxyQuery(QUrl(LATEST_RELEASE_URL)))
+def _system_https_proxy(url: str = LATEST_RELEASE_URL):
+    proxies = QNetworkProxyFactory.systemProxyForQuery(QNetworkProxyQuery(QUrl(url)))
     # Match Qt's HTTPS selection: the first transparent proxy (including DIRECT).
     # Returning a value avoids a Python virtual factory callback during Qt I/O.
     for proxy in proxies:

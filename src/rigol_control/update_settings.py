@@ -2,11 +2,18 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, replace
 from pathlib import Path
 import tempfile
 
 
-def load_update_preference(data_dir: Path) -> tuple[bool, str]:
+@dataclass(frozen=True)
+class UpdatePreferences:
+    automatic_check: bool = True
+    automatic_download: bool = True
+
+
+def load_update_preferences(data_dir: Path) -> tuple[UpdatePreferences, str]:
     path = data_dir / "update_settings.json"
     try:
         with path.open("r", encoding="utf-8") as stream:
@@ -15,17 +22,18 @@ def load_update_preference(data_dir: Path) -> tuple[bool, str]:
             raise ValueError("文件过大")
         settings = json.loads(raw)
         if (not isinstance(settings, dict) or settings.get("schema_version") != 1
-                or not isinstance(settings.get("automatic_check"), bool)):
+                or not isinstance(settings.get("automatic_check"), bool)
+                or not isinstance(settings.get("automatic_download", True), bool)):
             raise ValueError("格式不受支持")
-        return settings["automatic_check"], ""
+        return UpdatePreferences(settings["automatic_check"], settings.get("automatic_download", True)), ""
     except FileNotFoundError:
-        return True, ""
-    except (OSError, ValueError) as exc:
+        return UpdatePreferences(), ""
+    except (OSError, ValueError, RecursionError) as exc:
         # Do not silently re-enable networking when an existing setting is unreadable.
-        return False, f"更新设置读取失败，自动检查已暂停：{exc}"
+        return UpdatePreferences(False, False), f"更新设置读取失败，自动检查已暂停：{exc}"
 
 
-def save_update_preference(data_dir: Path, enabled: bool) -> None:
+def save_update_preferences(data_dir: Path, settings: UpdatePreferences) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -33,10 +41,21 @@ def save_update_preference(data_dir: Path, enabled: bool) -> None:
                                          prefix="update_settings-", suffix=".tmp",
                                          delete=False) as stream:
             temporary = Path(stream.name)
-            json.dump({"schema_version": 1, "automatic_check": bool(enabled)}, stream,
+            json.dump({"schema_version": 1, "automatic_check": settings.automatic_check,
+                       "automatic_download": settings.automatic_download}, stream,
                       ensure_ascii=False, indent=2)
             stream.write("\n")
         temporary.replace(data_dir / "update_settings.json")
     finally:
         if temporary is not None and temporary.exists():
             temporary.unlink()
+
+
+def load_update_preference(data_dir: Path) -> tuple[bool, str]:
+    settings, error = load_update_preferences(data_dir)
+    return settings.automatic_check, error
+
+
+def save_update_preference(data_dir: Path, enabled: bool) -> None:
+    settings, _ = load_update_preferences(data_dir)
+    save_update_preferences(data_dir, replace(settings, automatic_check=bool(enabled)))

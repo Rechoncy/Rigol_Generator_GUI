@@ -373,11 +373,12 @@ def _bundle_self_test(report_path: Path) -> int:
         from PyQt6.QtGui import QDesktopServices
         from PyQt6.QtNetwork import QSslSocket
         from rigol_control.updates import parse_release
-        from rigol_control.update_settings import load_update_preference
+        from rigol_control.update_settings import load_update_preference, load_update_preferences
 
         update = home.update_panel
         if (update._automatic_started or update.startup_timer.isActive()
-                or update.periodic_timer.isActive() or update.checker.checking):
+                or update.periodic_timer.isActive() or update.checker.checking
+                or update.downloader.downloading):
             raise AssertionError("Bundle self-test unexpectedly scheduled an update request")
         if not QSslSocket.supportsSsl():
             raise AssertionError("Qt update checker has no usable TLS backend")
@@ -430,6 +431,112 @@ def _bundle_self_test(report_path: Path) -> int:
             "preference_persisted": True, "tls_backend_available": True,
             "tls_backends": QSslSocket.availableBackends(),
             "tls_active_backend": QSslSocket.activeBackend(),
+            "hardware_access": False, "network_access": False,
+        }
+        # Check download controls with a verified local fixture and stubbed
+        # transport. No HTTP request, archive extraction or program is started.
+        import _ssl
+        import ssl
+        download_ssl_context = ssl.create_default_context()
+        if (download_ssl_context.verify_mode != ssl.CERT_REQUIRED
+                or not download_ssl_context.check_hostname):
+            raise AssertionError("Update download TLS context does not verify certificates and hostnames")
+        download_ssl_module = Path(_ssl.__file__).resolve()
+        if is_frozen() and not download_ssl_module.is_relative_to(root):
+            raise AssertionError(f"Update download SSL module came from outside the bundle: {download_ssl_module}")
+        download_bytes = b"Bundle self-test update fixture; never execute.\n"
+        download_digest = hashlib.sha256(download_bytes).hexdigest()
+        asset_names = ["Lab-Control-Center-99.0.0-windows-x64-portable.zip",
+                       "Lab-Control-Center-99.0.0-windows-x64.exe"]
+        download_payload = dict(payload, assets=[{
+            "name": name, "size": len(download_bytes), "state": "uploaded",
+            "digest": f"sha256:{download_digest}",
+            "browser_download_url":
+                f"https://github.com/Rechoncy/Rigol_Generator_GUI/releases/download/v99.0.0/{name}",
+        } for name in asset_names])
+        downloadable = parse_release(download_payload, __version__)
+        if downloadable is None or len(downloadable.assets) != 2:
+            raise AssertionError("Valid update attachments were not recognized")
+        download_calls = []
+        opened_folders = []
+        downloader = update.downloader
+        original_start, original_cancel, original_close = downloader.start, downloader.cancel, downloader.close
+
+        def start_fixture_download(asset, destination):
+            download_calls.append((asset, Path(destination)))
+            downloader._active = True
+            downloader.downloading_changed.emit(True)
+            return True
+
+        def cancel_fixture_download():
+            downloader._active = False
+            downloader.downloading_changed.emit(False)
+
+        original_open_url = QDesktopServices.openUrl
+        try:
+            downloader.start = start_fixture_download
+            downloader.cancel = cancel_fixture_download
+            downloader.close = cancel_fixture_download
+            QDesktopServices.openUrl = lambda url: opened_folders.append(url.toString()) or True
+            if not update.automatic_download.isChecked():
+                raise AssertionError("Automatic update downloading was not enabled by default")
+            update.checker.update_available.emit(downloadable)
+            expected_directory = data_dir / "updates" / "v99.0.0"
+            expected_suffix = "-portable.zip" if update.package_format == "zip" else ".exe"
+            if (len(download_calls) != 1 or download_calls[0][1] != expected_directory
+                    or not download_calls[0][0].name.endswith(expected_suffix)
+                    or update.download_controls.isHidden() or opened_folders):
+                raise AssertionError("New release did not start a matching download in the update directory")
+            downloader.progress.emit(len(download_bytes) // 2, len(download_bytes))
+            if (update.download_progress.isHidden() or not 400 <= update.download_progress.value() <= 600
+                    or "取消下载" != update.download_button.text()):
+                raise AssertionError("Update download progress was not displayed")
+            selected_asset = download_calls[0][0]
+            expected_directory.mkdir(parents=True, exist_ok=True)
+            fixture_path = expected_directory / selected_asset.name
+            fixture_path.write_bytes(download_bytes)
+            if hashlib.sha256(fixture_path.read_bytes()).hexdigest() != selected_asset.sha256:
+                raise AssertionError("Local update presentation fixture failed its checksum")
+            cancel_fixture_download()
+            downloader.finished.emit(fixture_path)
+            if (update.open_folder_button.isHidden() or update._downloaded_path != fixture_path
+                    or "校验" not in update.download_status.text() or opened_folders):
+                raise AssertionError("Verified download did not produce a completion notice")
+            update.open_folder_button.click()
+            from PyQt6.QtCore import QUrl
+            if opened_folders != [QUrl.fromLocalFile(str(expected_directory)).toString()]:
+                raise AssertionError("Downloaded update folder was not opened only by explicit action")
+            downloader.failed.emit("离线下载自检：连接中断")
+            if (not home.isEnabled() or not update.download_button.isEnabled()
+                    or any(not window.isEnabled() for window in home.open_windows.values())
+                    or tuple(home.connection_manager.is_connected(item) for item in records)
+                    != connected_before or "离线下载自检" not in update.download_status.text()):
+                raise AssertionError("Update download failure interrupted virtual devices or prevented retry")
+            update.download_button.click()
+            if len(download_calls) != 2:
+                raise AssertionError("Update download did not allow manual retry")
+            cancel_fixture_download()
+            update.automatic_download.setChecked(False)
+            preferences, preference_error = load_update_preferences(data_dir)
+            if preference_error or preferences.automatic_download or not preferences.automatic_check:
+                raise AssertionError("Download preference was not saved independently from update checking")
+            update.checker.up_to_date.emit(__version__)
+            update.automatic_download.setChecked(True)
+            preferences, preference_error = load_update_preferences(data_dir)
+            if preference_error or not preferences.automatic_download or len(download_calls) != 2:
+                raise AssertionError("Download preference could not be restored without replaying a download")
+        finally:
+            cancel_fixture_download()
+            downloader.start, downloader.cancel, downloader.close = original_start, original_cancel, original_close
+            QDesktopServices.openUrl = original_open_url
+        report["github_update_download"] = {
+            "automatic_download_started": True, "progress_displayed": True,
+            "verified_ready_notice": True, "manual_retry_available": True,
+            "preference_persisted": True, "explicit_folder_open_only": True,
+            "device_controls_preserved": True,
+            "verified_ssl_context": True, "download_tls_version": ssl.OPENSSL_VERSION,
+            "download_ssl_module": str(download_ssl_module),
+            "download_ca_certificates": len(download_ssl_context.get_ca_certs()),
             "hardware_access": False, "network_access": False,
         }
         # Verify the global input policy on the real six device windows,

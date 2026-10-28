@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import time
 import unittest
@@ -14,8 +15,11 @@ from PyQt6.QtWidgets import QApplication
 from rigol_control.updates import (
     LATEST_RELEASE_URL,
     MAX_RESPONSE_BYTES,
+    MAX_DOWNLOAD_BYTES,
+    ReleaseAsset,
     ReleaseInfo,
     UpdateChecker,
+    _system_https_proxy,
     parse_release,
 )
 
@@ -119,6 +123,40 @@ class ReleaseParsingTests(unittest.TestCase):
         release = parse_release(payload(html_url="https://example.com/malicious", body="<script/>"), "0.7.21")
         self.assertEqual(release, ReleaseInfo("0.7.22", "v0.7.22",
                          "https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.22"))
+
+    def test_only_matching_verified_windows_release_assets_are_available(self):
+        entries = []
+        for suffix in ("-portable.zip", ".exe", "-source.zip"):
+            name = f"Lab-Control-Center-0.7.22-windows-x64{suffix}"
+            entries.append(dict(name=name, state="uploaded", size=123,
+                                digest="sha256:" + "A" * 64,
+                                browser_download_url=f"https://github.com/Rechoncy/Rigol_Generator_GUI/releases/download/v0.7.22/{name}"))
+        release = parse_release(payload(assets=entries), "0.7.21")
+        self.assertEqual(len(release.assets), 2)
+        self.assertTrue(all(isinstance(asset, ReleaseAsset) for asset in release.assets))
+        self.assertTrue(all(asset.sha256 == "a" * 64 for asset in release.assets))
+        self.assertEqual({asset.name for asset in release.assets}, {entry["name"] for entry in entries[:2]})
+
+    def test_bad_or_missing_download_metadata_keeps_the_version_notice(self):
+        name = "Lab-Control-Center-0.7.22-windows-x64.exe"
+        valid = dict(name=name, state="uploaded", size=123, digest="sha256:" + "a" * 64,
+                     browser_download_url=f"https://github.com/Rechoncy/Rigol_Generator_GUI/releases/download/v0.7.22/{name}")
+        for changed in ({"digest": None}, {"digest": "sha256:bad"}, {"size": True}, {"size": 0},
+                        {"size": MAX_DOWNLOAD_BYTES + 1}, {"state": "new"},
+                        {"browser_download_url": "https://example.com/update.exe"},
+                        {"name": "Lab-Control-Center-0.7.21-windows-x64.exe"}):
+            with self.subTest(changed=changed):
+                release = parse_release(payload(assets=[dict(valid, **changed)]), "0.7.21")
+                self.assertEqual(release.version, "0.7.22")
+                self.assertEqual(release.assets, ())
+        self.assertEqual(parse_release(payload(assets=None), "0.7.21").assets, ())
+
+    def test_system_proxy_lookup_uses_the_requested_url(self):
+        target = "https://release-assets.githubusercontent.com/asset?signature=signed"
+        direct = QNetworkProxy(QNetworkProxy.ProxyType.NoProxy)
+        with patch("rigol_control.updates.QNetworkProxyFactory.systemProxyForQuery", return_value=[direct]) as lookup:
+            self.assertEqual(_system_https_proxy(target).type(), QNetworkProxy.ProxyType.NoProxy)
+        self.assertEqual(lookup.call_args.args[0].url().toString(), target)
 
 
 class UpdateCheckerTests(unittest.TestCase):
