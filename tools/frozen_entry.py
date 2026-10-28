@@ -359,7 +359,8 @@ def _bundle_self_test(report_path: Path) -> int:
         records = repository.list()
         report["virtual_device_count"] = len(records)
         if len(records) != 6 or any(not item.resource.startswith("SIM::") for item in records):
-            raise AssertionError("Expected exactly six simulated devices")
+            detail = "; ".join(dialog_errors) or "No dialog error was recorded"
+            raise AssertionError(f"Expected exactly six simulated devices; got {len(records)}. {detail}")
 
         def wait_idle(*, require_connected: bool = False) -> None:
             deadline = time.monotonic() + 20
