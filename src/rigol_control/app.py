@@ -96,4 +96,6 @@ def main(argv: list[str] | None = None) -> int:
     window.show()
     if args.smoke_test:
         QTimer.singleShot(250, app.quit)
+    else:
+        window.update_panel.start_automatic_checks()
     return app.exec()

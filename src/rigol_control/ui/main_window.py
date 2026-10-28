@@ -38,6 +38,7 @@ from .device_windows import BaseDeviceWindow, create_device_window
 from .dialogs import DeviceDialog
 from .linkage_window import LinkageTaskWindow
 from .widgets import AddDeviceCard, CallTask, DeviceCard, ProbeTask
+from .update_panel import UpdatePanel
 
 
 class DeviceCenterWindow(QMainWindow):
@@ -132,6 +133,9 @@ class DeviceCenterWindow(QMainWindow):
         self.grid.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(self.grid_host)
         outer.addWidget(scroll, 1)
+
+        self.update_panel = UpdatePanel(repository.data_dir, self)
+        outer.addWidget(self.update_panel)
 
         footer = QHBoxLayout()
         path = QLabel("设备列表及参数已自动保存在本机")
@@ -649,4 +653,5 @@ class DeviceCenterWindow(QMainWindow):
             self.statusBar().showMessage(str(exc), 15000)
             event.ignore()
             return
+        self.update_panel.stop()
         super().closeEvent(event)

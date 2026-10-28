@@ -368,6 +368,70 @@ def _bundle_self_test(report_path: Path) -> int:
         if not all(title.endswith(f"v{__version__}") for title in titles):
             raise AssertionError(f"Window titles do not identify the running version: {titles}")
         report["window_versions_visible"] = True
+        # Exercise update presentation without contacting GitHub. Constructing
+        # the home window must never schedule networking in this diagnostic path.
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtNetwork import QSslSocket
+        from rigol_control.updates import parse_release
+        from rigol_control.update_settings import load_update_preference
+
+        update = home.update_panel
+        if (update._automatic_started or update.startup_timer.isActive()
+                or update.periodic_timer.isActive() or update.checker.checking):
+            raise AssertionError("Bundle self-test unexpectedly scheduled an update request")
+        if not QSslSocket.supportsSsl():
+            raise AssertionError("Qt update checker has no usable TLS backend")
+        payload = {"tag_name": "v99.0.0", "draft": False, "prerelease": False}
+        newer = parse_release(payload, __version__)
+        if newer is None:
+            raise AssertionError("A newer stable GitHub release was not recognized")
+        if (parse_release(dict(payload, tag_name="v0.7.100"), "0.7.99") is None
+                or parse_release(dict(payload, tag_name="v0.7.9"), "0.7.21") is not None):
+            raise AssertionError("GitHub update versions were compared as text")
+        connected_before = tuple(home.connection_manager.is_connected(item) for item in records)
+        opened_urls = []
+        original_open_url = QDesktopServices.openUrl
+        original_check = update.checker.check
+        checks = []
+        try:
+            QDesktopServices.openUrl = lambda url: opened_urls.append(url.toString()) or True
+            update.checker.update_available.emit(newer)
+            app.processEvents()
+            if (update.release_button.isHidden() or "99.0.0" not in update.status.text()
+                    or opened_urls):
+                raise AssertionError("New GitHub release did not produce a non-modal notice")
+            update.release_button.click()
+            if opened_urls != [newer.url]:
+                raise AssertionError("Explicit update action did not open the canonical release URL")
+            update.checker.failed.emit("离线自检：网络暂不可用")
+            if (not home.isEnabled() or not update.check_button.isEnabled()
+                    or any(not window.isEnabled() for window in home.open_windows.values())
+                    or tuple(home.connection_manager.is_connected(item) for item in records)
+                    != connected_before or "离线自检" not in update.status.text()):
+                raise AssertionError("Update failure interrupted virtual device operation")
+            update.checker.check = lambda: checks.append(True) or True
+            update.check_button.click()
+            if checks != [True]:
+                raise AssertionError("Update failure did not permit manual retry")
+            update.automatic.setChecked(False)
+            if load_update_preference(data_dir) != (False, ""):
+                raise AssertionError("Automatic update preference did not persist in the data directory")
+            update.automatic.setChecked(True)
+            if load_update_preference(data_dir) != (True, ""):
+                raise AssertionError("Automatic update preference could not be re-enabled")
+            update.checker.up_to_date.emit(__version__)
+        finally:
+            QDesktopServices.openUrl = original_open_url
+            update.checker.check = original_check
+        report["github_update_check"] = {
+            "startup_network_disabled_in_self_test": True,
+            "newer_release_notice": True, "numeric_version_ordering": True,
+            "failure_keeps_device_controls": True, "manual_retry_available": True,
+            "preference_persisted": True, "tls_backend_available": True,
+            "tls_backends": QSslSocket.availableBackends(),
+            "tls_active_backend": QSslSocket.activeBackend(),
+            "hardware_access": False, "network_access": False,
+        }
         # Verify the global input policy on the real six device windows,
         # including dynamically created numeric fields and unit dropdowns.
         from PyQt6.QtCore import QPoint, QPointF, Qt
