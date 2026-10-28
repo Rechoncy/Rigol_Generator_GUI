@@ -20,7 +20,17 @@ try {
     if ($commit.Trim() -ne $handoff.nonce) { throw 'Invalid upgrade confirmation' }
     $installer = Get-Item -LiteralPath $handoff.installer -ErrorAction Stop
     if ($installer.Length -ne $handoff.bytes) { throw 'Installer size changed; upgrade stopped' }
-    if ((Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $handoff.sha256) { throw 'Installer checksum changed; upgrade stopped' }
+    # Inherited module settings can leave Get-FileHash unavailable in Windows
+    # PowerShell 5. Use .NET without depending on that function's autoloading.
+    $stream = [IO.File]::OpenRead($installer.FullName)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $stream.Dispose()
+        $algorithm.Dispose()
+    }
+    if ($digest -ne $handoff.sha256) { throw 'Installer checksum changed; upgrade stopped' }
     Write-State 'installing' '正在安装更新并保留用户数据。'
     # All paths are ticket data, passed as arguments, never evaluated as script.
     $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOAUTORUN',
