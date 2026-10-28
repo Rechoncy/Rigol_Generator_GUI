@@ -23,6 +23,8 @@
 
 最终完整源码回归 **600 项通过（81.031 秒）**，源码虚拟自检及下载 TLS 检查通过；原有仪器、触发、回读及停止清理回归继续执行。耗时为本次运行记录，不构成实机性能保证。
 
+Windows CI 复查修正了原有 UI 测试的清理流程：恢复后的 Vaunix 窗口有初始后台读取，旧测试忽略关闭被拒后丢弃窗口，影响后续模拟采集界面。测试现等待读取完成并断言关闭成功；两个测试连续 20 轮通过，完整 UI smoke 15 项通过。该修正只涉及测试，不改变应用行为；同版本较早构建保留在本地历史目录。
+
 另以本版下载器单独下载已公开的 0.7.20 正式便携 ZIP 作为真实 HTTPS 传输样本：**56,293,604 字节**，SHA-256 为 `9f9ba1cbec6872c23b6277923ad6eaa532b56b4eecb9a63601c87a28de15f7c5`，与 GitHub API 声明一致，耗时 38.206 秒。证据为 `dist/verification/0.7.22/live-download-check.json`；样本独立保存用于验证，没有运行或解压该 ZIP，也没有将本地应用降级。
 
 代理按实际目标解析的真实 HTTPS Range 检查返回 206 和 1 字节，经过 `github.com`、`release-assets.githubusercontent.com` 各自的代理解析，2.959 秒完成并保留 TLS 验证，报告为 `dist/verification/0.7.22/live-download-range-pac.json`。Range 检查只验证该路径，没有将其当成完整 EXE 下载验收；上述完整包记录与 Range 耗时均不代表其他电脑或网络性能。

@@ -467,6 +467,7 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 - 修复深层 JSON 偏好解析的 `RecursionError` 未被捕获、可能中断首页启动的问题；损坏偏好按读取失败处理，自动检查/下载均暂停并显示原因，保留手动入口，补充对应回归。
 - 最终针对性回归 71 项通过（0.603 秒），含后端 47 项和 UI/设置/启动 24 项。源码虚拟自检通过，下载组七个行为标志及 `verified_ssl_context` 均为 true，TLS 为 OpenSSL 3.0.21，`network_access=false`、`hardware_access=false`；冻结自检另核对 TLS 模块来自包内。真实 HTTPS 传输样本完整下载官方 0.7.20 便携 ZIP：56,293,604 字节，SHA-256 `9f9ba1cbec6872c23b6277923ad6eaa532b56b4eecb9a63601c87a28de15f7c5`，与 GitHub API 一致，38.206 秒；报告 `dist/verification/0.7.22/live-download-check.json`，该独立样本没有解压、执行或使应用降级，也没有操作硬件。耗时仅为本次网络记录。
 - 最终完整源码回归 600 项通过（81.031 秒），源码虚拟自检与下载 TLS 检查通过；原有仪器、触发、回读和停止清理回归继续执行，耗时仅为本次记录。
+- Windows CI 追加复查：旧 Vaunix 参数恢复测试忽略后台读取期间 `close()` 返回 False，窗口被丢弃后影响紧邻的模拟采集弹出框事件，最小两个测试顺序可复现。仅修正测试，等待恢复读取完成并断言两次关闭成功；同顺序 20 轮 / 40 次测试通过，完整 UI smoke 15 项通过。应用行为及版本保持 0.7.22，较早构建保留在 `dist/local/history/`，重新从干净提交构建对应源码快照。
 - 本版回归、源码虚拟自检及产物验证证据统一放入 `dist/verification/0.7.22/`；本地开发包保存到 `dist/local/v0.7.22/`，冻结自检和普通启动实际结果以同组 `release-manifest.json` 为准。原 `dist/local/v0.7.21/`、其他开发包和正式发行附件分别保留；本轮不创建标签或 GitHub Release。
 - 保持 DG/Vaunix 首触发 P0、有序累计计数、CH2 隔离、停止失败保留占用、未知接受结果不自动重放及 SSG 原生扫描恢复规则。默认自动测试不访问 GitHub、不枚举或连接实体仪器，下载验证使用受控回复与临时目录。
 

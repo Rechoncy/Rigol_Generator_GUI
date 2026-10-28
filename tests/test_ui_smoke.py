@@ -781,7 +781,7 @@ class UiSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "0.5 dB"):
             window._trigger_points()
         window.trigger_table.item(1, 2).setText("-3.5")
-        window.close()
+        self.assertTrue(window.close())
         self.app.processEvents()
 
         restored = VaunixLmsWindow(
@@ -790,6 +790,9 @@ class UiSmokeTests(unittest.TestCase):
             manager,
             parameter_repository=parameter_repository,
         )
+        # Restoring a connected window schedules its initial background read.
+        # Retain it until finished; close() deliberately refuses pending work.
+        self.assertTrue(self._wait_for(lambda: not restored._call_tasks))
         self.assertEqual(restored.output_frequency.current_unit(), "MHz")
         self.assertAlmostEqual(restored.output_frequency.value(), 7.25e9)
         self.assertAlmostEqual(restored.output_power.value(), -11.5)
@@ -798,7 +801,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(restored.trigger_power_enabled.isChecked())
         self.assertEqual(restored.trigger_table.rowCount(), 2)
         self.assertEqual(restored.trigger_table.item(1, 2).text(), "-3.5")
-        restored.close()
+        self.assertTrue(restored.close())
         manager.close_all()
         self.app.processEvents()
 
