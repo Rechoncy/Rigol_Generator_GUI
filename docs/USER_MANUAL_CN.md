@@ -1,6 +1,6 @@
 # DG4000 + SIGLENT SSG + Vaunix + Newport + NI 多设备联动控制软件使用说明
 
-版本：0.7.23（源码与本地开发构建；最新 GitHub 正式发行仍为 0.7.20）
+版本：0.7.23（[GitHub 正式发行](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23)）
 更新日期：2026-10-28（新增安装程序 EXE 与保留数据的自动升级）
 适用范围：RIGOL DG4000 系列、鼎阳 SIGLENT SSG、Vaunix Lab Brick LMS/BLX、Newport、带模拟输入/边沿计数能力的 NI DAQ、内置虚拟实验室
 
@@ -190,7 +190,7 @@ $env:VAUNIX_LMS_DLL = "C:\path\to\vnx_fmsynth.dll"
 
 ### 4.5 安装版 EXE 与保留数据升级
 
-0.7.23 增加 `Lab-Control-Center-0.7.23-windows-x64-setup.exe`。这是安装程序，和原有直接运行的独立 EXE 不同；本地文件位于 `dist/local/v0.7.23/`。安装默认仅针对当前 Windows 用户，提供开始菜单入口与卸载项，内置应用所需 Python/Qt 和 Python 仪器接口，目标电脑无需另外安装 Python。真实仪器的系统驱动仍按本说明准备。
+从 [v0.7.23 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23) 下载 `Lab-Control-Center-0.7.23-windows-x64-setup.exe`。这是安装程序，和原有直接运行的独立 EXE 不同；正式附件本地副本位于 `dist/published/v0.7.23/`，原 `dist/local/v0.7.23/` 开发包保留。安装默认仅针对当前 Windows 用户，提供开始菜单入口与卸载项，内置应用所需 Python/Qt 和 Python 仪器接口，目标电脑无需另外安装 Python。真实仪器的系统驱动仍按本说明准备。
 
 默认程序目录为 `%LOCALAPPDATA%\Programs\LabControlCenter`，默认用户数据目录为 `%LOCALAPPDATA%\RigolGeneratorControl\data`，安装向导也可选择已有的独立数据目录。程序文件与用户数据分开；`--data-dir`、`RIGOL_GUI_DATA_DIR` 仍有优先级，自动升级沿用当前实际数据目录。不要将用户数据放在程序安装目录中。正常卸载移除软件与快捷方式，保留独立用户数据及升级备份；默认升级备份位于 `%LOCALAPPDATA%\RigolGeneratorControl\installer-backups`。
 
@@ -839,6 +839,8 @@ cmd /c run_app.cmd --smoke-test --data-dir "%TEMP%\rigol-gui-smoke"
 - [ ] 停止和断开流程已验证。
 
 ## 17. 版本说明
+
+0.7.23 按用户要求正式发行安装程序 EXE、便携 ZIP 和独立 EXE，并带入 0.7.21 的联网更新检查、0.7.22 的自动下载和校验。安装版后续可在下载完成、设备空闲且正常退出后自动安装；安装程序先备份用户数据，再卸载已登记的旧安装版，安装后核对并恢复缺失文件。正式下载与本版验证范围见[0.7.23 发行说明](../release/NOTES-0.7.23.md)，具体附件以同组 `release-manifest.json` 为准；历史版本记录和已有交付包保留，未进行实体仪器验收。
 
 0.7.20 正式发行，完善 Newport 波片架状态提示和手动恢复入口：区分未参考、已就绪、禁用、运动与配置状态；寻原点被本地状态守卫拒绝时保留可确认的位置，不自动复位或重复运动。显式恢复使能只按适用状态发送有地址 `MM1`；后台任务未开始的提交失败恢复完成标志，手动停止未确认则保留原任务占用供显式清理。DG/Vaunix 触发、SSG 原生扫描及原有配置格式保持。完整变更和实际验收见[0.7.20 发行说明](../release/NOTES-0.7.20.md)，正式附件由标签提交构建，未实机验收。
 

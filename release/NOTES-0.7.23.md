@@ -1,7 +1,7 @@
 # Lab Control Center 0.7.23
 
 日期：2026-10-28；平台：Windows 10/11 x64。
-状态：源码与本地开发构建；本轮不创建新标签或 GitHub Release，最新公开下载仍为 [v0.7.20](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.20)。本地新版本位于 `dist/local/v0.7.23/`，原便携包、独立 EXE、历史开发构建和正式附件分别保留。
+状态：本次按用户授权以 [v0.7.23 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23) 正式发行，由标签提交通过 GitHub 发布工作流构建、验证并发布。正式附件本地副本使用 `dist/published/v0.7.23/`；已验收的 `dist/local/v0.7.23/` 开发包、原便携包、独立 EXE、历史构建和旧正式附件分别保留，不覆盖。
 
 ## 可安装 EXE
 
@@ -35,6 +35,6 @@
 
 最新完整源码 unittest 执行 **666 项，结果 OK（79.822 秒）**，其中 1 项符号链接测试因 Windows 链接权限跳过；安装标识、控制器、默认目录和构建等 **39 项针对性检查全部通过**，原有联网更新 **71 项全部通过（0.562 秒）**。最新源码虚拟自检通过，安装生命周期七项与原有检查继续保留。原生 PowerShell 交接验证记录为 `handoff-acceptance.json`，`parent_exit_waited=true`、`no_commit_prevents_install=true`；源码/交接验收不等同于重编译后的实际安装及冻结产物验收。
 
-本版针对性测试、完整 unittest、源码虚拟自检、冻结产物和隔离安装/升级/卸载的实际记录保存在 `dist/verification/0.7.23/`，不沿用上一版结果作通过声明。本地交付包含 Setup EXE、便携 ZIP、独立 EXE、源码快照、发行说明、SHA-256 与构建清单；具体字节、源码提交、内置运行时和安装验收以本组 `release-manifest.json` 为准。安装测试使用独立产品标识与临时路径，不覆盖用户已有安装或数据。
+本版针对性测试、完整 unittest、源码虚拟自检、冻结产物和隔离安装/升级/卸载的实际记录保存在 `dist/verification/0.7.23/`，不沿用上一版结果作通过声明。正式发行包含 Setup EXE、便携 ZIP、独立 EXE、源码快照、发行说明、SHA-256 与构建清单共七个附件；具体字节、源码提交、内置运行时和安装验收以正式发布的本组 `release-manifest.json` 为准。安装测试使用独立产品标识与临时路径，不覆盖用户已有安装或数据。
 
 本轮不修改仪器协议，不自动操作实体仪器；保留 DG/Vaunix 首触发 P0、有序累计计数、CH2 隔离、停止失败保留占用、未知接受结果不自动重放，以及 SSG 自身原生扫描和恢复规则。
