@@ -40,9 +40,13 @@ def _atomic_text(path: Path, text: str) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         temporary.replace(path)
+        temporary = None  # A successful publish must not fail during temp cleanup.
     finally:
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def verify_installer(path: Path, asset: ReleaseAsset, data_dir: Path) -> Path:
@@ -79,6 +83,8 @@ def prepare_handoff(path: Path, asset: ReleaseAsset, data_dir: Path, *, parent_p
     info = installed_info()
     if info is None or os.name != "nt":
         raise RuntimeError("自动安装仅用于 Windows 安装版，请运行下载的安装程序")
+    if info.get("instance_suffix"):
+        raise RuntimeError("隔离测试安装不能自动安装正式更新")
     verified = verify_installer(path, asset, data_dir)
     install_dir = Path(sys.executable).resolve().parent
     data = data_dir.resolve()

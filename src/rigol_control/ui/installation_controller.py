@@ -59,17 +59,57 @@ class InstallationController(QObject):
         self.committing = False
         self.task = None
         self._closed = False
+        self.uncertain_handoff = None
+        self._last_cancel_error = ""
         window.update_panel.install_requested.connect(self.request)
 
     def request(self, request) -> None:
         if self._closed or self.preparing:
             return
+        if not self.cancel_unconfirmed_handoff():
+            self._status("升级撤回尚未确认，请先处理磁盘错误后再重试。")
+            return
+        self._last_cancel_error = ""
         self.pending = request
         self.automatic = self.window.update_panel.install_request_automatic
         self._try_start()
 
     def _status(self, message: str, *, retry: bool = True) -> None:
+        if self._last_cancel_error:
+            message += " 撤回标记保存失败，请检查磁盘权限或空间；未提交安装时不会执行升级。"
         self.window.update_panel.set_install_status(message, retry=retry)
+
+    def _cancel_prepared(self, handoff, *, possible_commit: bool = False) -> bool:
+        try:
+            cancel_handoff(handoff)
+            return True
+        except Exception as exc:
+            self._last_cancel_error = str(exc)
+            if possible_commit:
+                try:
+                    handoff.commit_file.unlink(missing_ok=True)
+                except Exception:
+                    self.uncertain_handoff = handoff
+            return False
+
+    def cancel_unconfirmed_handoff(self) -> bool:
+        if self.uncertain_handoff is None:
+            return True
+        handoff = self.uncertain_handoff
+        if self._cancel_prepared(handoff, possible_commit=True):
+            self.uncertain_handoff = None
+            self._last_cancel_error = ""
+            return True
+        # Removing a potentially published confirmation also revokes it while
+        # this parent process remains alive. Keep the window if both writes fail.
+        if self.uncertain_handoff is handoff:
+            try:
+                if not handoff.commit_file.exists():
+                    self.uncertain_handoff = None
+                    return True
+            except Exception:
+                pass
+        return False
 
     def _try_start(self) -> None:
         if self._closed or self.preparing or self.pending is None:
@@ -113,7 +153,7 @@ class InstallationController(QObject):
         self.preparing = False
         self.task = None
         if self._closed:
-            cancel_handoff(handoff)
+            self._cancel_prepared(handoff)
             return
         try:
             focus = QApplication.focusWidget()
@@ -124,13 +164,13 @@ class InstallationController(QObject):
                     editor.interpretText()
             self.window._flush_device_parameters()
         except Exception as exc:
-            cancel_handoff(handoff)
+            self._cancel_prepared(handoff)
             self.pending = None
             self._status(f"参数保存未完成，升级已取消：{exc}。请保留当前窗口处理后重试。")
             return
         reason = installation_busy_reason(self.window)
         if reason or (self.automatic and not self.window.update_panel.automatic_install.isChecked()):
-            cancel_handoff(handoff)
+            self._cancel_prepared(handoff)
             if self.automatic and self.window.update_panel.automatic_install.isChecked():
                 self.timer.start()
                 self._status(reason + "；已撤回升级准备，等待任务完成。")
@@ -144,7 +184,7 @@ class InstallationController(QObject):
         self.committing = True
         try:
             if not self.window.close():
-                cancel_handoff(handoff)
+                self._cancel_prepared(handoff)
                 self.pending = None
                 self._status("窗口尚不能安全关闭，升级已取消；任务结束后可重试。")
                 return
@@ -154,7 +194,7 @@ class InstallationController(QObject):
             self.pending = None
             app.quit()
         except Exception as exc:
-            cancel_handoff(handoff)
+            self._cancel_prepared(handoff, possible_commit=True)
             self.window.show()
             self.window.connection_timer.start()
             self.window.statusBar().showMessage(f"升级未开始：{exc}。请重新启动应用后再试。", 30000)

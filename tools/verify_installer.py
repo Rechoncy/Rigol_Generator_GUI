@@ -16,6 +16,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 
 if sys.platform == "win32":
@@ -48,6 +49,20 @@ def read_value(key_path: str, name: str):
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
                         winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
         return winreg.QueryValueEx(key, name)[0]
+
+
+def wait_for_uninstall(uninstaller: Path, key_path: str) -> None:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            read_value(key_path, "InstallLocation")
+            registered = True
+        except FileNotFoundError:
+            registered = False
+        if not uninstaller.exists() and not registered:
+            return
+        time.sleep(0.05)
+    raise RuntimeError("Isolated test uninstaller did not complete program/registry cleanup")
 
 
 def execute(executable: Path, arguments: list[str], log: Path, *, expected_success: bool = True,
@@ -83,7 +98,7 @@ def verify_installer(portable_dir: Path, version: str, work_dir: Path, *,
     uninstall_key = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{{{test_uuid}}}_is1"
     persistent_key = rf"Software\Rechoncy\LabControlCenter-Test-{test_id}"
     app_dir = work_dir / "安装 O'Brien & app"
-    data_dir = work_dir / "用户 data"
+    data_dir = work_dir / "用户 data {kept}"
     backup_root = work_dir / "保留 backups"
     data_dir.mkdir()
     (data_dir / "devices.json").write_text('{"schema_version":1,"devices":[]}\n', encoding="utf-8")
@@ -140,8 +155,10 @@ def verify_installer(portable_dir: Path, version: str, work_dir: Path, *,
         marker = json.loads((app_dir / "installed-mode.json").read_text(encoding="utf-8"))
         require(marker["app_id"] == "{" + APP_ID + "}" and Path(marker["data_dir"]) == data_dir,
                 "Installed marker does not identify its separate data directory")
+        require(marker.get("instance_suffix") == "-Test-" + test_id,
+                "Test installation does not have its isolated runtime mutex namespace")
         require(not (app_dir / "install-pending.json").exists(), "Successful first install retained pending marker")
-        report["first_install_preserved_user_data"] = True
+        report.update(first_install_preserved_user_data=True, isolated_instance_namespace=True)
 
         # A running application must never be force-closed by silent update.
         mutex_handle = kernel.CreateMutexW(None, False, "Local\\LabControlCenter.App-Test-" + test_id)
@@ -165,6 +182,10 @@ def verify_installer(portable_dir: Path, version: str, work_dir: Path, *,
         require((app_dir / obsolete).is_file() and uninstaller.is_file(),
                 "Backup failure removed the previous program")
         require(file_hashes(data_dir) == expected_hashes, "Backup failure changed user data")
+        backup_failures = [json.loads(path.read_text(encoding="utf-8"))
+                           for path in backup_root.glob("*/backup-report.json")]
+        require(any(value.get("success") is False for value in backup_failures),
+                "Denied-read scenario did not reach the real data backup helper")
         report["backup_failure_blocks_old_uninstall"] = True
 
         # A file not owned by either installer must also survive program cleanup.
@@ -208,6 +229,7 @@ def verify_installer(portable_dir: Path, version: str, work_dir: Path, *,
 
         execute(uninstaller, ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
                                f"/LOG={work_dir / '05-uninstall.log'}"], work_dir / "05-uninstall-process.log")
+        wait_for_uninstall(uninstaller, uninstall_key)
         installed = False
         require(file_hashes(data_dir) == expected_hashes, "Normal uninstall deleted user data")
         require(read_value(persistent_key, "UserDataDir") == str(data_dir),
@@ -231,10 +253,11 @@ def verify_installer(portable_dir: Path, version: str, work_dir: Path, *,
             kernel.CloseHandle(mutex_handle)
         if lock_handle and lock_handle != ctypes.c_void_p(-1).value:
             kernel.CloseHandle(lock_handle)
-        if uninstaller.exists():
+        if uninstaller.exists() and (app_dir / "Lab Control Center.exe").exists():
             execute(uninstaller, ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
                                    f"/LOG={work_dir / '07-test-cleanup.log'}"],
                     work_dir / "07-test-cleanup-process.log")
+            wait_for_uninstall(uninstaller, uninstall_key)
         # Only this generated test identity is removed. Test data/backups and
         # evidence remain available; production registry entries are untouched.
         try:

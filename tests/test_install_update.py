@@ -16,7 +16,7 @@ from rigol_control.updates import ReleaseAsset, parse_release
 class InstalledRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.app = self.root / "program"
         self.app.mkdir()
         self.data = self.root / "user data"
@@ -71,11 +71,29 @@ class InstalledRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "安装尚未完成"):
             installation.is_installed()
 
+    @unittest.skipUnless(os.name == "nt", "Windows application mutex")
+    def test_isolated_installation_uses_its_own_application_mutex(self):
+        self.marker(instance_suffix="-Test-acceptance_1")
+        kernel = Mock()
+        kernel.CreateMutexW.return_value = 123
+        with patch.object(installation, "_mutex_handle", None), \
+                patch.object(installation.ctypes, "WinDLL", return_value=kernel), \
+                patch.object(installation.ctypes, "get_last_error", return_value=0):
+            installation.acquire_application_mutex()
+        kernel.CreateMutexW.assert_called_once_with(None, False,
+            installation.APP_MUTEX + "-Test-acceptance_1")
+
+    def test_rejects_invalid_test_instance_suffix(self):
+        for suffix in ("other", "-Test-", "-Test-bad/slash", 123):
+            self.marker(instance_suffix=suffix)
+            with self.subTest(suffix=suffix), self.assertRaisesRegex(RuntimeError, "安装实例标识"):
+                installation.installed_info()
+
 
 class InstallerHandoffTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.data = self.root / "data"
         self.name = "Lab-Control-Center-99.0.0-windows-x64-setup.exe"
         self.path = self.data / "updates/v99.0.0" / self.name
@@ -146,3 +164,11 @@ class InstallerHandoffTests(unittest.TestCase):
         with patch("rigol_control.install_update.installed_info", return_value=None), self.assertRaises(RuntimeError):
             prepare_handoff(self.path, self.asset, self.data, launcher=launcher)
         launcher.assert_not_called()
+
+    def test_isolated_test_instance_cannot_install_production_update(self):
+        launcher = Mock()
+        with patch("rigol_control.install_update.installed_info", return_value={"instance_suffix": "-Test-test"}), \
+                self.assertRaisesRegex(RuntimeError, "隔离测试"):
+            prepare_handoff(self.path, self.asset, self.data, launcher=launcher)
+        launcher.assert_not_called()
+        self.assertFalse(list((self.data / "updates").glob("handoff-*")))

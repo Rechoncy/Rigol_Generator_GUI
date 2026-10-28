@@ -78,6 +78,26 @@ def _enable_fault_logging():
     return None
 
 
+def _check_default_data_directory(default_data: Path, report: dict) -> None:
+    """Check edition defaults without creating or reading any user data files."""
+    from rigol_control.installation import installed_info
+    from rigol_control.runtime import executable_dir, is_frozen
+
+    if not is_frozen():
+        report["default_data_mode"] = "source"
+        return
+    installation = installed_info()
+    if installation is not None:
+        expected = Path(installation["data_dir"]).resolve()
+        mode = "installed"
+    else:
+        expected = executable_dir() / "data"
+        mode = "portable"
+    if default_data != expected:
+        raise AssertionError(f"{mode.capitalize()} default data directory is incorrect: {default_data}")
+    report["default_data_mode"] = mode
+
+
 def _bundle_self_test(report_path: Path) -> int:
     """Check the bundled interpreter, dependencies and six virtual UI windows.
 
@@ -182,8 +202,7 @@ def _bundle_self_test(report_path: Path) -> int:
                             raise AssertionError(f"Vaunix runtime came from outside the bundle: {runtime_path}")
                         runtimes[name] = str(runtime_path)
                     report["vaunix_dll"]["native_runtime"] = runtimes
-        if is_frozen() and default_data != executable_dir() / "data":
-            raise AssertionError(f"Portable default data directory is incorrect: {default_data}")
+        _check_default_data_directory(default_data, report)
         dependencies = {
             "PyQt6": PyQt6, "PyVISA": pyvisa, "pyserial": serial,
             "nidaqmx": nidaqmx, "numpy": numpy,

@@ -108,3 +108,67 @@ class InstallationControllerTests(unittest.TestCase):
         self.controller.on_window_closed()
         self.assertIsNone(self.controller.pending)
         self.assertFalse(self.controller.timer.isActive())
+
+    def test_cancel_marker_write_failure_never_escapes_prepared_callback(self):
+        for reason in ("closed", "save-failed", "busy", "close-refused"):
+            with self.subTest(reason=reason):
+                self.controller._closed = reason == "closed"
+                self.controller.pending = self.request
+                self.controller.preparing = True
+                self.controller.automatic = False
+                with patch("rigol_control.ui.installation_controller.cancel_handoff",
+                           side_effect=OSError("CANCEL_WRITE_FAILED")) as cancel, \
+                        patch("rigol_control.ui.installation_controller.commit_handoff") as commit, \
+                        patch("rigol_control.ui.installation_controller.installation_busy_reason",
+                              return_value="device busy" if reason == "busy" else ""), \
+                        patch.object(self.home, "_flush_device_parameters",
+                                     side_effect=OSError("DATA_DISK_FULL") if reason == "save-failed" else None), \
+                        patch.object(self.home, "close", return_value=False), \
+                        patch.object(self.app, "quit") as quit:
+                    token = Mock()
+                    self.controller._prepared(token)
+                cancel.assert_called_once_with(token)
+                commit.assert_not_called()
+                quit.assert_not_called()
+                self.assertIn("CANCEL_WRITE_FAILED", self.controller._last_cancel_error)
+                self.assertIsNone(self.controller.uncertain_handoff,
+                                  "No install confirmation was ever written on these paths")
+                self.controller._closed = False
+                self.controller.pending = None
+
+    def test_uncertain_confirmation_blocks_exit_until_explicit_cancellation_succeeds(self):
+        token = Mock()
+        token.commit_file.unlink.side_effect = OSError("DELETE_CONFIRMATION_DENIED")
+        token.commit_file.exists.return_value = True
+        with patch("rigol_control.ui.installation_controller.cancel_handoff",
+                   side_effect=OSError("CANCEL_WRITE_FAILED")), \
+                patch("rigol_control.ui.installation_controller.commit_handoff",
+                      side_effect=OSError("COMMIT_OUTCOME_UNKNOWN")), \
+                patch.object(self.app, "quit") as quit:
+            with patch.object(self.home, "close", return_value=True):
+                self.controller._prepared(token)
+            self.assertIs(self.controller.uncertain_handoff, token)
+            self.assertFalse(self.controller.cancel_unconfirmed_handoff())
+            self.assertFalse(self.home.close(), "Exiting would authorize a possibly published confirmation")
+            self.assertTrue(self.home.isVisible())
+            quit.assert_not_called()
+        with patch("rigol_control.ui.installation_controller.cancel_handoff") as cancel:
+            self.assertTrue(self.controller.cancel_unconfirmed_handoff())
+            cancel.assert_called_once_with(token)
+        self.assertIsNone(self.controller.uncertain_handoff)
+
+    def test_failed_cancel_marker_can_revoke_confirmation_by_removing_it(self):
+        confirmation = Path(self.temporary.name) / "commit.txt"
+        confirmation.write_text("confirmation could have been published", encoding="utf-8")
+        token = Mock(commit_file=confirmation)
+        with patch.object(self.home, "close", return_value=True), \
+                patch("rigol_control.ui.installation_controller.commit_handoff",
+                      side_effect=OSError("COMMIT_OUTCOME_UNKNOWN")), \
+                patch("rigol_control.ui.installation_controller.cancel_handoff",
+                      side_effect=OSError("CANCEL_WRITE_FAILED")), \
+                patch.object(self.app, "quit") as quit:
+            self.controller._prepared(token)
+        self.assertFalse(confirmation.exists())
+        self.assertIsNone(self.controller.uncertain_handoff)
+        self.assertTrue(self.controller.cancel_unconfirmed_handoff())
+        quit.assert_not_called()

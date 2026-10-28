@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import re
 import sys
 
 APP_ID = "{D9D0E8E6-83E5-46F4-B5B1-9B3D7EE9C523}"
@@ -34,6 +35,9 @@ def installed_info() -> dict | None:
                 or data.get("schema_version") != 1 or data.get("app_id") != APP_ID
                 or not isinstance(data.get("data_dir"), str)):
             raise ValueError("标记格式无效")
+        suffix = data.get("instance_suffix", "")
+        if not isinstance(suffix, str) or (suffix and re.fullmatch(r"-Test-[A-Za-z0-9_-]{1,40}", suffix) is None):
+            raise ValueError("安装实例标识无效")
         path = Path(data["data_dir"])
         if not path.is_absolute() or not path.name:
             raise ValueError("数据目录无效")
@@ -53,12 +57,15 @@ def is_installed() -> bool:
 def acquire_application_mutex() -> None:
     """Keep the installer from replacing a live installed application."""
     global _mutex_handle
-    if os.name != "nt" or not is_installed() or _mutex_handle is not None:
+    if os.name != "nt" or _mutex_handle is not None:
+        return
+    info = installed_info()
+    if info is None:
         return
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
     kernel.CreateMutexW.restype = ctypes.c_void_p
-    handle = kernel.CreateMutexW(None, False, APP_MUTEX)
+    handle = kernel.CreateMutexW(None, False, APP_MUTEX + info.get("instance_suffix", ""))
     error = ctypes.get_last_error()
     if not handle:
         raise RuntimeError("无法创建安装程序互斥锁，请稍后重试")

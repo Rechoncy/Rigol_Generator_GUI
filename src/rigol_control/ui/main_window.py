@@ -632,6 +632,10 @@ class DeviceCenterWindow(QMainWindow):
                 update_ni_devices(records)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if not self.installation_controller.cancel_unconfirmed_handoff():
+            self.statusBar().showMessage("升级撤回尚未确认，请处理磁盘错误后再尝试关闭。", 15000)
+            event.ignore()
+            return
         if self.installation_controller.preparing:
             self.statusBar().showMessage("正在准备更新，请等待安装包校验结束。", 5000)
             event.ignore()

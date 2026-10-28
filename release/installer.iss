@@ -112,8 +112,6 @@ Name: "{autoprograms}\Lab Control Center{#InstanceSuffix}"; Filename: "{app}\Lab
 Name: "{autodesktop}\Lab Control Center{#InstanceSuffix}"; Filename: "{app}\Lab Control Center.exe"; Parameters: "--data-dir ""{code:GetUserDataDir}"""; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{{#InstallerId}}_is1"; ValueType: string; ValueName: "UserDataDir"; ValueData: "{code:GetUserDataDir}"
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{{#InstallerId}}_is1"; ValueType: string; ValueName: "LastDataBackup"; ValueData: "{code:GetBackupDir}"
 ; Retained across ordinary uninstall, so reinstall can find a custom data path.
 Root: HKCU; Subkey: "Software\Rechoncy\LabControlCenter{#InstanceSuffix}"; ValueType: string; ValueName: "UserDataDir"; ValueData: "{code:GetUserDataDir}"
 
@@ -187,8 +185,12 @@ begin
   Result := Trim(Value);
   if Copy(Result, 1, 1) = '"' then begin
     Delete(Result, 1, 1);
-    ClosingQuote := Pos('"', Result);
-    if ClosingQuote = 0 then begin
+    // Keep the index in Pascal Script string-character units. Pos() may use
+    // an ANSI overload, whose byte offset differs for non-ASCII app paths.
+    ClosingQuote := 1;
+    while (ClosingQuote <= Length(Result)) and (Result[ClosingQuote] <> '"') do
+      ClosingQuote := ClosingQuote + 1;
+    if ClosingQuote > Length(Result) then begin
       Result := '';
       Exit;
     end;
@@ -206,7 +208,11 @@ begin
        (Trim(PreviousData) = '') then
       PreviousData := ExpandConstant('{localappdata}\RigolGeneratorControl\data');
   end;
-  DataDirectory := NormalPath(ExpandConstant('{param:DATADIR|' + PreviousData + '}'));
+  // A remembered user path is opaque data, not part of an Inno constant
+  // expression (a legal Windows directory name may contain literal braces).
+  DataDirectory := ExpandConstant('{param:DATADIR|}');
+  if Trim(DataDirectory) = '' then DataDirectory := PreviousData;
+  DataDirectory := NormalPath(DataDirectory);
   OldInstallDirectory := '';
   OldUninstaller := '';
   if RegQueryStringValue(HKCU, UninstallKey, 'InstallLocation', OldInstallDirectory) then begin
@@ -297,28 +303,43 @@ function IsPreviousApplication: Boolean;
 var
   Marker: AnsiString;
 begin
-  Result := LoadStringFromFile(AddBackslash(OldInstallDirectory) + 'installed-mode.json', Marker) and
-    (Pos('"format":"lab-control-center-installed"', String(Marker)) > 0) and
-    (Pos('"app_id":"' + ProductId + '"', String(Marker)) > 0);
+  Result := False;
+  if LoadStringFromFile(AddBackslash(OldInstallDirectory) + 'installed-mode.json', Marker) then begin
+    Log('Previous marker format position: ' + IntToStr(Pos('"format":"lab-control-center-installed"', String(Marker))));
+    Log('Previous marker identity position: ' + IntToStr(Pos('"app_id":"' + ProductId + '"', String(Marker))));
+    Result := (Pos('"format":"lab-control-center-installed"', String(Marker)) > 0) and
+      (Pos('"app_id":"' + ProductId + '"', String(Marker)) > 0);
+  end else
+    Log('Previous installed marker could not be read.');
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  BackupBase, Parameters: String;
-  ExitCode: Integer;
+  BackupBase, Parameters, RegistrationProblem: String;
+  ExitCode, Attempts: Integer;
 begin
   Result := '';
   if Prepared then Exit;
   Result := ValidateDirectories;
   if Result <> '' then Exit;
-  if (OldInstallDirectory <> '') and
-     ((OldUninstaller = '') or not FileExists(OldUninstaller) or
-      (CompareText(NormalPath(ExtractFileDir(OldUninstaller)), OldInstallDirectory) <> 0) or
-      (CompareText(Copy(ExtractFileName(OldUninstaller), 1, 5), 'unins') <> 0) or
-      (CompareText(ExtractFileExt(OldUninstaller), '.exe') <> 0) or
-      not IsPreviousApplication) then begin
-    Result := CustomMessage('OldRegistration');
-    Exit;
+  if OldInstallDirectory <> '' then begin
+    Log('Previous registered directory: ' + OldInstallDirectory);
+    Log('Previous registered uninstaller: ' + OldUninstaller);
+    RegistrationProblem := '';
+    if OldUninstaller = '' then RegistrationProblem := 'empty uninstaller'
+    else if not FileExists(OldUninstaller) then RegistrationProblem := 'uninstaller missing'
+    else if CompareText(NormalPath(ExtractFileDir(OldUninstaller)), OldInstallDirectory) <> 0 then
+      RegistrationProblem := 'uninstaller directory differs'
+    else if CompareText(Copy(ExtractFileName(OldUninstaller), 1, 5), 'unins') <> 0 then
+      RegistrationProblem := 'uninstaller filename is not owned'
+    else if CompareText(ExtractFileExt(OldUninstaller), '.exe') <> 0 then
+      RegistrationProblem := 'uninstaller extension is not exe'
+    else if not IsPreviousApplication then RegistrationProblem := 'installed marker differs';
+    if RegistrationProblem <> '' then begin
+      Log('Previous registration validation failed: ' + RegistrationProblem);
+      Result := CustomMessage('OldRegistration');
+      Exit;
+    end;
   end;
   BackupBase := NormalPath(ExpandConstant('{param:BACKUPROOT|{localappdata}\RigolGeneratorControl\installer-backups}'));
   if AtOrBelow(BackupBase, DataDirectory) or AtOrBelow(DataDirectory, BackupBase) or
@@ -362,7 +383,14 @@ begin
       Result := CustomMessage('UninstallFailed') + ' ' + BackupParent;
       Exit;
     end;
-    if FileExists(OldUninstaller) then begin
+    // Inno's original uninstaller can exit before its temporary worker has
+    // removed the executable. Wait for owned files AND registration to clear.
+    Attempts := 0;
+    while ((FileExists(OldUninstaller) or RegKeyExists(HKCU, UninstallKey)) and (Attempts < 300)) do begin
+      Sleep(100);
+      Attempts := Attempts + 1;
+    end;
+    if FileExists(OldUninstaller) or RegKeyExists(HKCU, UninstallKey) then begin
       Result := CustomMessage('UninstallIncomplete') + ' ' + BackupParent;
       Exit;
     end;
@@ -398,8 +426,14 @@ begin
                 SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
       RaiseException(CustomMessage('RestoreFailed') + ' ' + BackupParent);
     Marker := '{"format":"lab-control-center-installed","schema_version":1,' +
-      '"app_id":"' + ProductId + '","data_dir":' + JsonString(DataDirectory) + '}';
+      '"app_id":"' + ProductId + '","instance_suffix":"{#InstanceSuffix}","data_dir":' +
+      JsonString(DataDirectory) + '}';
     if not SaveStringToFile(ExpandConstant('{app}\installed-mode.json'), UTF8Encode(Marker), False) then
+      RaiseException(CustomMessage('InstalledMarker') + ' ' + BackupParent);
+    // Inno recreates its uninstall key after processing [Registry]. Record
+    // custom metadata only after that standard key has been saved.
+    if not RegWriteStringValue(HKCU, UninstallKey, 'UserDataDir', DataDirectory) or
+       not RegWriteStringValue(HKCU, UninstallKey, 'LastDataBackup', BackupDirectory) then
       RaiseException(CustomMessage('InstalledMarker') + ' ' + BackupParent);
     if not DeleteFile(ExpandConstant('{app}\install-pending.json')) then
       RaiseException(CustomMessage('FinishMarker') + ' ' + BackupParent);
