@@ -1,6 +1,6 @@
-# Windows 便携发行版使用与构建说明
+# Windows 安装版与便携发行版使用及构建说明
 
-最新正式下载：0.7.20；当前源码与本地开发构建：0.7.22；目标平台：Windows 10/11 x64。
+最新正式下载：0.7.20；当前源码与本地开发构建：0.7.23；目标平台：Windows 10/11 x64。
 
 发行版包含运行程序所需的 Python、Qt、PyVISA、pyserial 和 nidaqmx。目标电脑无需安装 Python、pip 或创建虚拟环境，首次启动也无需联网下载 Python 组件。内置运行时只供本软件使用，不修改系统 Python。
 
@@ -17,7 +17,7 @@
 
 项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。正式发行文件从 [v0.7.20 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.20) 下载，由版本标签对应的提交构建。发布附件的本地副本位于 `dist/published/v0.7.20/`，自行构建的输出目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以同组附件的 `release-manifest.json` 为准，完整性可用 `SHA256SUMS.txt` 核对。
 
-本文下载文件名和运行示例使用正式版 0.7.20。第 7 节从当前源码构建生成 0.7.22 文件，本地构建本身不会创建标签或 Release。0.7.22 在更新检查上增加自动下载与校验，操作见[使用说明](../docs/USER_MANUAL_CN.md#44-联网检查软件更新)，变更及实际验证见[本版记录](NOTES-0.7.22.md)。正式附件、`dist/local/v0.7.22/` 本地开发构建、`dist/local/v0.7.21/` 原更新检查构建、`dist/local/v0.7.20/` 原开发构建、`dist/published/v0.7.20/` 正式附件及其他既有包分别保存，不互相覆盖。0.7.20 的 Newport 状态与手动恢复修复见[发行说明](NOTES-0.7.20.md)；更新提示、DG4000 重连快照修复、SSG/Vaunix 回读、此前 DG 回读与 NI 采集修复分别见[0.7.21](NOTES-0.7.21.md)、[0.7.19](NOTES-0.7.19.md)、[0.7.18](NOTES-0.7.18.md)、[0.7.17](NOTES-0.7.17.md)和[0.7.16](NOTES-0.7.16.md)记录。
+上表公开下载文件名和下文便携运行示例使用正式版 0.7.20。当前源码构建版本为 0.7.23，新增 `Lab-Control-Center-0.7.23-windows-x64-setup.exe` 安装程序；本地构建保存到 `dist/local/v0.7.23/`，常规开发者构建输出到 `dist/release/`。安装版支持下载后自动安装、卸载旧安装版并保留/备份/核对恢复用户数据，详见[安装版操作](../docs/USER_MANUAL_CN.md#45-安装版-exe-与保留数据升级)及[本版记录](NOTES-0.7.23.md)。本地构建不创建公开标签或 Release，原开发包、历史构建与 `dist/published/v0.7.20/` 正式附件均分别保留。
 
 仓库根目录原有的小型 `Lab Control Center.exe` 是源码启动器，仍需外部 Python/PyQt6；它与上述编译产物不同。使用免 Python 版本时，应下载发行附件或按第 7 节构建。
 
@@ -31,7 +31,15 @@
 4. 实机使用按第 4 节准备对应驱动，再在软件中添加或导入设备配置。
 5. 软件启动和配置恢复不会自动开启 RF、移动旋转台或启动扫描；连接、参数应用、输出与任务仍由用户在界面中操作。
 
-0.7.22 源码与本地构建的首页底部提供 GitHub 更新检查及自动下载。默认正常启动约 3 秒后异步检查最新正式 Release，运行中每 6 小时检查；可分别关闭“启动后自动检查更新”和“发现更新后自动下载”，也可手动检查或重试下载。发现更高版本且附件可校验时，后台下载对应格式 ZIP/EXE，验证 GitHub API 提供的字节数与 SHA-256 后保存在 `data/updates/v版本号/`，显示进度、取消及文件夹入口；不自动解压、安装、执行或覆盖程序。无网络、代理失败或限流只在更新区提示，仪器仍可离线使用。联网使用系统代理与 HTTPS 证书验证，无需登录或令牌，不上传设备配置；缺少校验值或仅有不受支持的 SOCKS 下载代理时，可通过发布页使用浏览器下载。完整操作见[软件更新](../docs/USER_MANUAL_CN.md#44-联网检查软件更新)。
+0.7.23 的首页保留 GitHub 正式版自动检查、下载与 SHA-256/字节数校验。安装版选择 Setup EXE，默认可在设备空闲后自动安装；便携 ZIP 与独立 EXE 继续采用原有下载后手动迁移方式。支持关闭自动检查、下载或安装，网络异常不影响离线仪器功能，完整操作见[软件更新](../docs/USER_MANUAL_CN.md#44-联网检查软件更新)。
+
+### 2.1 安装程序 EXE
+
+运行 `Lab-Control-Center-0.7.23-windows-x64-setup.exe`，按向导安装。默认程序目录为 `%LOCALAPPDATA%\Programs\LabControlCenter`，仅针对当前用户；用户数据独立保存在 `%LOCALAPPDATA%\RigolGeneratorControl\data`，向导可选择已有独立数据目录。保留程序与数据目录分离，目标电脑无需外部 Python。安装后通过开始菜单启动，卸载项只移除软件，保留独立数据和备份。
+
+首页“下载后自动安装（空闲时）”默认开启，可取消后手动点击“安装更新”。新版 Setup 完整下载并通过校验后，应用等待扫描、采集、后台通信和清理完成，只有正常退出被接受后才交接给安装程序。安装程序先备份用户数据，再卸载登记的旧版、安装新版并核对恢复；不强制结束实验或自动启动 RF、扫描、运动。数据目录内的测量文件与空目录一并备份，`updates` 下载缓存除外；目录外的采集文件不移动或删除。
+
+默认升级备份保存在 `%LOCALAPPDATA%\RigolGeneratorControl\installer-backups`。备份失败阻止卸载；恢复发现同名不同内容时保留原文件和备份并报告，不静默覆盖。安装失败仍保留外部数据与日志，但不保证旧程序自动回滚，可排除权限、磁盘或安装错误后重试。旧便携版首次迁移应先停止并退出旧程序，再选择原数据目录，或在新旧程序均关闭时复制 `data/`、通过首页导入配置；配置包不含采集文件。更多步骤见[安装版保留数据升级](../docs/USER_MANUAL_CN.md#45-安装版-exe-与保留数据升级)。
 
 目录包主要结构：
 
@@ -183,7 +191,7 @@ Get-FileHash ".\Lab-Control-Center-0.7.20-windows-x64.exe" -Algorithm SHA256
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1
 ```
 
-主目录的 `vnx_fmsynth.dll` 会自动打包到两种格式中。指定构建解释器或覆盖 Vaunix DLL 来源：
+主目录的 `vnx_fmsynth.dll` 会自动内置到目录便携版与独立 EXE，安装程序再使用同一已验证目录载荷。指定构建解释器或覆盖 Vaunix DLL 来源：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1 -Python "C:\Python313\python.exe"
@@ -198,15 +206,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1 -V
 
 ```text
 dist/release/
-├─ Lab-Control-Center-0.7.22-windows-x64-portable.zip
-├─ Lab-Control-Center-0.7.22-windows-x64.exe
-├─ Lab-Control-Center-0.7.22-windows-x64-source.zip
+├─ Lab-Control-Center-0.7.23-windows-x64-setup.exe
+├─ Lab-Control-Center-0.7.23-windows-x64-portable.zip
+├─ Lab-Control-Center-0.7.23-windows-x64.exe
+├─ Lab-Control-Center-0.7.23-windows-x64-source.zip
 ├─ RELEASE-NOTES.md
 ├─ SHA256SUMS.txt
 └─ release-manifest.json
 ```
 
-构建完成后应检查两种格式的启动、中文/空格目录、默认及覆盖数据目录、配置保存重开、虚拟实验室，以及在没有外部 Python 搜索路径时的运行。校验和与版本记录随产物一起保存；不要将 `build/`、`dist/`、本机 `data/` 或构建环境提交到源码仓库。
+安装程序由 Inno Setup 编译器和 `release/installer.iss` 生成，`tools/build_installer.py` 可对已经验证的目录载荷构建 Setup。`build_release.ps1` 通过 `tools/ensure_inno_setup.ps1` 准备工作区 `build/tools/inno/` 内的编译器，并核对固定的 SHA-256 与发布者签名，目标使用电脑不需要该工具。源码快照应同时携带安装脚本。构建时拒绝把开发数据、安装标记或既有卸载器混入便携载荷，具体构建参数与安装验收以仓库脚本及本次清单为准。
+
+构建完成后应检查三种格式的启动、中文/空格目录、默认及覆盖数据目录、配置保存重开、虚拟实验室，以及在没有外部 Python 搜索路径时的运行。安装版另在隔离的安装标识和临时目录中验收首次安装、旧版卸载、数据备份/恢复、卸载保留数据与阻止运行中替换；不要使用真实用户配置或实体仪器执行安装测试。校验和与版本记录随产物一起保存；不要将 `build/`、`dist/`、本机 `data/` 或构建环境提交到源码仓库。
 
 `.github/workflows/release.yml` 提供同一构建流程：手动运行会生成可下载的 Actions artifact；推送 `v*` 标签时，在构建和测试成功、标签与应用版本一致后发布 GitHub Release 附件。源码提交和本地构建本身不会自动创建公开发行版。发版前核对版本与变更说明，避免把未验证的构建直接上传。
 
@@ -214,11 +225,11 @@ dist/release/
 
 打包原理参考 PyInstaller 官方的[目录与单文件运行模式](https://pyinstaller.org/en/stable/operating-mode.html)和[运行时路径说明](https://pyinstaller.org/en/stable/runtime-information.html)。
 
-当前只提供 Windows x64；没有提供 Windows x86、Linux 或 macOS 发行包。新版本需重新构建两种产物，不应以更新根目录小启动器替代发行打包。
+当前只提供 Windows x64；没有提供 Windows x86、Linux 或 macOS 发行包。新版本需重新构建安装程序、便携 ZIP 和独立 EXE，不应以更新根目录小启动器替代发行打包。
 
 ## 8. 本版记录
 
-0.7.22 源码与本地开发构建增加自动下载和校验，详见[0.7.22 记录](NOTES-0.7.22.md)，原更新提示实现见[0.7.21 记录](NOTES-0.7.21.md)。本轮不创建标签或公开 Release；GitHub 上最后正式版低于本地开发版时，不会提示降级或下载旧版。
+0.7.23 新增安装程序 EXE、安装版自动升级与数据备份/恢复，详见[本版记录](NOTES-0.7.23.md)；原自动下载和更新提示实现分别见[0.7.22](NOTES-0.7.22.md)及[0.7.21](NOTES-0.7.21.md)。本轮不创建标签或公开 Release；GitHub 上最后正式版低于本地开发版时，不会提示降级或下载旧版。
 
 正式发行的变更范围和验证见 [0.7.20 发行说明](NOTES-0.7.20.md)，DG 快速重连修复保留在 [0.7.19 说明](NOTES-0.7.19.md)，此前公开版本记录见 [0.7.18 发行说明](NOTES-0.7.18.md)与[0.7.15 发行说明](NOTES-0.7.15.md)。版本记录应区分自动测试、编译产物运行检查和实体硬件验收，不将任一项成功替代另外两项。
 

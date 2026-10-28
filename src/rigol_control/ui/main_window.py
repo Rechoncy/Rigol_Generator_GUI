@@ -39,6 +39,7 @@ from .dialogs import DeviceDialog
 from .linkage_window import LinkageTaskWindow
 from .widgets import AddDeviceCard, CallTask, DeviceCard, ProbeTask
 from .update_panel import UpdatePanel
+from .installation_controller import InstallationController
 
 
 class DeviceCenterWindow(QMainWindow):
@@ -135,6 +136,7 @@ class DeviceCenterWindow(QMainWindow):
         outer.addWidget(scroll, 1)
 
         self.update_panel = UpdatePanel(repository.data_dir, self)
+        self.installation_controller = InstallationController(self)
         outer.addWidget(self.update_panel)
 
         footer = QHBoxLayout()
@@ -630,6 +632,10 @@ class DeviceCenterWindow(QMainWindow):
                 update_ni_devices(records)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.installation_controller.preparing:
+            self.statusBar().showMessage("正在准备更新，请等待安装包校验结束。", 5000)
+            event.ignore()
+            return
         self._pending_connections.clear()
         if self._transfer_task is not None:
             event.ignore()
@@ -654,4 +660,5 @@ class DeviceCenterWindow(QMainWindow):
             event.ignore()
             return
         self.update_panel.stop()
+        self.installation_controller.on_window_closed()
         super().closeEvent(event)

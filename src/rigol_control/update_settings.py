@@ -11,6 +11,7 @@ import tempfile
 class UpdatePreferences:
     automatic_check: bool = True
     automatic_download: bool = True
+    automatic_install: bool = True
 
 
 def load_update_preferences(data_dir: Path) -> tuple[UpdatePreferences, str]:
@@ -23,14 +24,16 @@ def load_update_preferences(data_dir: Path) -> tuple[UpdatePreferences, str]:
         settings = json.loads(raw)
         if (not isinstance(settings, dict) or settings.get("schema_version") != 1
                 or not isinstance(settings.get("automatic_check"), bool)
-                or not isinstance(settings.get("automatic_download", True), bool)):
+                or not isinstance(settings.get("automatic_download", True), bool)
+                or not isinstance(settings.get("automatic_install", True), bool)):
             raise ValueError("格式不受支持")
-        return UpdatePreferences(settings["automatic_check"], settings.get("automatic_download", True)), ""
+        return UpdatePreferences(settings["automatic_check"], settings.get("automatic_download", True),
+                                 settings.get("automatic_install", True)), ""
     except FileNotFoundError:
         return UpdatePreferences(), ""
     except (OSError, ValueError, RecursionError) as exc:
         # Do not silently re-enable networking when an existing setting is unreadable.
-        return UpdatePreferences(False, False), f"更新设置读取失败，自动检查已暂停：{exc}"
+        return UpdatePreferences(False, False, False), f"更新设置读取失败，自动检查已暂停：{exc}"
 
 
 def save_update_preferences(data_dir: Path, settings: UpdatePreferences) -> None:
@@ -42,7 +45,8 @@ def save_update_preferences(data_dir: Path, settings: UpdatePreferences) -> None
                                          delete=False) as stream:
             temporary = Path(stream.name)
             json.dump({"schema_version": 1, "automatic_check": settings.automatic_check,
-                       "automatic_download": settings.automatic_download}, stream,
+                       "automatic_download": settings.automatic_download,
+                       "automatic_install": settings.automatic_install}, stream,
                       ensure_ascii=False, indent=2)
             stream.write("\n")
         temporary.replace(data_dir / "update_settings.json")

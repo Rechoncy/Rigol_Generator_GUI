@@ -55,7 +55,8 @@ def _release_assets(payload: dict, tag: str, version: str) -> tuple[ReleaseAsset
     if not isinstance(entries, list):
         return ()
     allowed = {f"Lab-Control-Center-{version}-windows-x64-portable.zip",
-               f"Lab-Control-Center-{version}-windows-x64.exe"}
+               f"Lab-Control-Center-{version}-windows-x64.exe",
+               f"Lab-Control-Center-{version}-windows-x64-setup.exe"}
     assets: dict[str, ReleaseAsset] = {}
     for entry in entries:
         if not isinstance(entry, dict):

@@ -133,13 +133,13 @@ class UpdatePreferenceTests(unittest.TestCase):
         (self.root / "update_settings.json").write_text(
             '{"schema_version":1,"automatic_check":true,"automatic_download":"yes"}', encoding="utf-8")
         preferences, error = load_update_preferences(self.root)
-        self.assertEqual(preferences, UpdatePreferences(False, False))
+        self.assertEqual(preferences, UpdatePreferences(False, False, False))
         self.assertIn("读取失败", error)
 
     def test_deeply_nested_settings_cannot_abort_application_startup(self):
         (self.root / "update_settings.json").write_text("[" * 1500 + "]" * 1500, encoding="utf-8")
         preferences, error = load_update_preferences(self.root)
-        self.assertEqual(preferences, UpdatePreferences(False, False))
+        self.assertEqual(preferences, UpdatePreferences(False, False, False))
         self.assertIn("读取失败", error)
 
 

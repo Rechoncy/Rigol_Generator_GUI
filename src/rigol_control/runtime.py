@@ -6,6 +6,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .installation import installed_info, is_installed
+
 
 def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
@@ -35,6 +37,9 @@ def resolve_data_dir(data_dir: Path | str | None = None) -> Path:
     override = os.environ.get("RIGOL_GUI_DATA_DIR", "").strip()
     if override:
         return Path(override).expanduser().resolve()
+    installation = installed_info()
+    if installation is not None:
+        return Path(installation["data_dir"]).resolve()
     if is_frozen():
         return executable_dir() / "data"
     app_data = os.environ.get("APPDATA")

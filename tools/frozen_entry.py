@@ -21,12 +21,26 @@ def _write_json(path: Path, report: dict) -> None:
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _report_startup_error(detail: str, *, interactive: bool) -> None:
-    """Keep failures visible even if importing Qt or our runtime module failed."""
-    roots = [Path(sys.executable).resolve().parent / "logs"]
+def _startup_log_roots():
+    roots = []
+    try:
+        from rigol_control.installation import is_installed
+        from rigol_control.runtime import resolve_data_dir
+        if is_installed():
+            roots.append(resolve_data_dir() / "logs")
+    except Exception:
+        pass
+    if not roots:
+        roots.append(Path(sys.executable).resolve().parent / "logs")
     local = os.environ.get("LOCALAPPDATA")
     if local:
         roots.append(Path(local) / "RigolGeneratorControl" / "logs")
+    return roots
+
+
+def _report_startup_error(detail: str, *, interactive: bool) -> None:
+    """Keep failures visible even if importing Qt or our runtime module failed."""
+    roots = _startup_log_roots()
     log_path = None
     for root in roots:
         try:
@@ -48,10 +62,7 @@ def _report_startup_error(detail: str, *, interactive: bool) -> None:
 
 def _enable_fault_logging():
     """Keep Python thread stacks for native crashes that bypass exception hooks."""
-    roots = [Path(sys.executable).resolve().parent / "logs"]
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        roots.append(Path(local) / "RigolGeneratorControl" / "logs")
+    roots = _startup_log_roots()
     for root in roots:
         stream = None
         try:
@@ -447,7 +458,8 @@ def _bundle_self_test(report_path: Path) -> int:
         download_bytes = b"Bundle self-test update fixture; never execute.\n"
         download_digest = hashlib.sha256(download_bytes).hexdigest()
         asset_names = ["Lab-Control-Center-99.0.0-windows-x64-portable.zip",
-                       "Lab-Control-Center-99.0.0-windows-x64.exe"]
+                       "Lab-Control-Center-99.0.0-windows-x64.exe",
+                       "Lab-Control-Center-99.0.0-windows-x64-setup.exe"]
         download_payload = dict(payload, assets=[{
             "name": name, "size": len(download_bytes), "state": "uploaded",
             "digest": f"sha256:{download_digest}",
@@ -455,7 +467,7 @@ def _bundle_self_test(report_path: Path) -> int:
                 f"https://github.com/Rechoncy/Rigol_Generator_GUI/releases/download/v99.0.0/{name}",
         } for name in asset_names])
         downloadable = parse_release(download_payload, __version__)
-        if downloadable is None or len(downloadable.assets) != 2:
+        if downloadable is None or len(downloadable.assets) != 3:
             raise AssertionError("Valid update attachments were not recognized")
         download_calls = []
         opened_folders = []
@@ -473,6 +485,7 @@ def _bundle_self_test(report_path: Path) -> int:
             downloader.downloading_changed.emit(False)
 
         original_open_url = QDesktopServices.openUrl
+        original_update_signal_block = update.blockSignals(True)
         try:
             downloader.start = start_fixture_download
             downloader.cancel = cancel_fixture_download
@@ -529,6 +542,7 @@ def _bundle_self_test(report_path: Path) -> int:
             cancel_fixture_download()
             downloader.start, downloader.cancel, downloader.close = original_start, original_cancel, original_close
             QDesktopServices.openUrl = original_open_url
+            update.blockSignals(original_update_signal_block)
         report["github_update_download"] = {
             "automatic_download_started": True, "progress_displayed": True,
             "verified_ready_notice": True, "manual_retry_available": True,
@@ -538,6 +552,156 @@ def _bundle_self_test(report_path: Path) -> int:
             "download_ssl_module": str(download_ssl_module),
             "download_ca_certificates": len(download_ssl_context.get_ca_certs()),
             "hardware_access": False, "network_access": False,
+        }
+        # Installed updates use external data, a verified setup attachment and
+        # an accepted clean close. All installation/transport actions below are
+        # intercepted; no installer, helper process or real device is started.
+        from unittest.mock import patch
+        from rigol_control.install_data import run_install_data_cli
+        from rigol_control.installation import APP_ID, MARKER_FORMAT, MARKER_NAME
+        from rigol_control.runtime import resolve_data_dir
+        from rigol_control.ui.update_panel import UpdatePanel
+
+        install_fixture = data_dir / "installed-update-self-test"
+        program_root = install_fixture / "program"
+        external_data = install_fixture / "user-data"
+        program_root.mkdir(parents=True)
+        external_data.mkdir()
+        program_exe = program_root / "Lab Control Center.exe"
+        program_exe.write_bytes(b"Non-executable installed path fixture.\n")
+        marker = program_root / MARKER_NAME
+        marker.write_text(json.dumps({
+            "format": MARKER_FORMAT, "schema_version": 1, "app_id": APP_ID,
+            "data_dir": str(external_data.resolve()),
+        }), encoding="utf-8")
+        with patch.object(sys, "frozen", True, create=True), \
+                patch.object(sys, "executable", str(program_exe)), \
+                patch.dict(os.environ, {"RIGOL_GUI_DATA_DIR": ""}):
+            if resolve_data_dir() != external_data.resolve():
+                raise AssertionError("Installed edition did not use the external user-data directory")
+        preserved_bytes = b'{"stable-device-id":"self-test-only","resource":"SIM::DEVICE"}\n'
+        measurement_bytes = bytes(range(256)) * 8
+        (external_data / "devices.json").write_bytes(preserved_bytes)
+        (external_data / "measurement.bin").write_bytes(measurement_bytes)
+        (external_data / "empty-directory").mkdir()
+        backup_report = install_fixture / "backup-report.json"
+        if run_install_data_cli([
+            "--installer-data-backup", str(external_data),
+            "--backup-root", str(install_fixture / "backups"), "--report", str(backup_report),
+        ]) != 0:
+            raise AssertionError("Installer headless data backup failed")
+        backup_receipt = json.loads(backup_report.read_text(encoding="utf-8"))
+        if not backup_receipt.get("success") or backup_receipt.get("file_count") != 2:
+            raise AssertionError("Installer data backup did not verify all user files")
+        # Remove only the synthetic program and selected data to exercise the
+        # restore path. Retained external files must remain byte-identical.
+        marker.unlink()
+        program_exe.unlink()
+        program_root.rmdir()
+        if (external_data / "devices.json").read_bytes() != preserved_bytes:
+            raise AssertionError("Removing old program files changed external user data")
+        (external_data / "measurement.bin").unlink()
+        (external_data / "empty-directory").rmdir()
+        restore_report = install_fixture / "restore-report.json"
+        if run_install_data_cli([
+            "--installer-data-restore", str(external_data),
+            "--backup", backup_receipt["backup_path"], "--report", str(restore_report),
+        ]) != 0:
+            raise AssertionError("Installer headless data restore failed")
+        restore_receipt = json.loads(restore_report.read_text(encoding="utf-8"))
+        if (not restore_receipt.get("success") or restore_receipt.get("restored_file_count") != 1
+                or (external_data / "devices.json").read_bytes() != preserved_bytes
+                or (external_data / "measurement.bin").read_bytes() != measurement_bytes
+                or not (external_data / "empty-directory").is_dir()):
+            raise AssertionError("Installer data restore did not preserve exact files and empty directories")
+
+        setup_name = "Lab-Control-Center-99.0.0-windows-x64-setup.exe"
+        setup_release = parse_release(dict(payload, assets=[{
+            "name": setup_name, "size": len(download_bytes), "state": "uploaded",
+            "digest": f"sha256:{download_digest}",
+            "browser_download_url":
+                f"https://github.com/Rechoncy/Rigol_Generator_GUI/releases/download/v99.0.0/{setup_name}",
+        }]), __version__)
+        if setup_release is None or len(setup_release.assets) != 1:
+            raise AssertionError("Verified installer release attachment was not recognized")
+        installed_panel = None
+        with patch("rigol_control.ui.update_panel.is_installed", return_value=True):
+            installed_panel = UpdatePanel(install_fixture / "panel-data")
+        setup_requests, setup_downloads = [], []
+        setup_downloader = installed_panel.downloader
+        original_setup_start = setup_downloader.start
+
+        def setup_fixture_download(asset, destination):
+            setup_downloads.append((asset, Path(destination)))
+            setup_downloader._active = True
+            setup_downloader.downloading_changed.emit(True)
+            return True
+
+        try:
+            installed_panel.install_requested.connect(setup_requests.append)
+            setup_downloader.start = setup_fixture_download
+            installed_panel.checker.update_available.emit(setup_release)
+            if (installed_panel.package_format != "setup" or len(setup_downloads) != 1
+                    or setup_downloads[0][0].name != setup_name or setup_requests):
+                raise AssertionError("Installed edition did not select only a verified setup attachment")
+            selected_setup, setup_directory = setup_downloads[0]
+            setup_directory.mkdir(parents=True)
+            setup_fixture_path = setup_directory / setup_name
+            setup_fixture_path.write_bytes(download_bytes)
+            setup_downloader._active = False
+            setup_downloader.downloading_changed.emit(False)
+            setup_downloader.finished.emit(setup_fixture_path)
+            if (setup_requests != [(setup_fixture_path, selected_setup)]
+                    or not installed_panel.install_request_automatic
+                    or installed_panel.install_button.isEnabled()):
+                raise AssertionError("Verified setup completion did not request one automatic safe handoff")
+            installed_panel.request_install()
+            if len(setup_requests) != 1:
+                raise AssertionError("Duplicate installer-ready action replayed an installation request")
+        finally:
+            setup_downloader._active = False
+            setup_downloader.start = original_setup_start
+            installed_panel.stop()
+            installed_panel.close()
+            installed_panel.deleteLater()
+
+        controller = home.installation_controller
+        original_automatic_flag = update._install_request_automatic
+        original_automatic_install = update.automatic_install.isChecked()
+        try:
+            update._install_request_automatic = True
+            update.automatic_install.setChecked(True)
+            with patch.object(home.connection_manager, "active_leases", return_value=("self-test-busy",)), \
+                    patch.object(controller.pool, "start") as dispatch:
+                controller.request(setup_requests[0])
+                if controller.pending != setup_requests[0] or controller.preparing or not controller.timer.isActive():
+                    raise AssertionError("Busy devices did not defer automatic installation")
+                dispatch.assert_not_called()
+            controller.timer.stop()
+            controller.pending = None
+            sentinel_handoff = object()
+            with patch("rigol_control.ui.installation_controller.installation_busy_reason", return_value=""), \
+                    patch.object(home, "close", return_value=False), \
+                    patch("rigol_control.ui.installation_controller.cancel_handoff") as cancel_install, \
+                    patch("rigol_control.ui.installation_controller.commit_handoff") as commit_install, \
+                    patch.object(app, "quit") as quit_app:
+                controller._prepared(sentinel_handoff)
+                cancel_install.assert_called_once_with(sentinel_handoff)
+                commit_install.assert_not_called()
+                quit_app.assert_not_called()
+        finally:
+            controller.timer.stop()
+            controller.pending = None
+            controller.automatic = False
+            update._install_request_automatic = original_automatic_flag
+            update.automatic_install.setChecked(original_automatic_install)
+        if tuple(home.connection_manager.is_connected(item) for item in records) != connected_before:
+            raise AssertionError("Installer lifecycle checks changed virtual device connections")
+        report["installed_update_lifecycle"] = {
+            "external_data_preserved": True, "backup_restore_verified": True,
+            "setup_asset_selected": True, "clean_close_required": True,
+            "busy_install_deferred": True, "no_installer_execution": True,
+            "no_hardware_access": True, "hardware_access": False, "network_access": False,
         }
         # Verify the global input policy on the real six device windows,
         # including dynamically created numeric fields and unit dropdowns.
@@ -1214,6 +1378,9 @@ def _bundle_self_test(report_path: Path) -> int:
 
 def main() -> int:
     args = sys.argv[1:]
+    if any(flag in args for flag in ("--installer-data-backup", "--installer-data-restore")):
+        from rigol_control.install_data import run_install_data_cli
+        return run_install_data_cli(args)
     interactive = "--smoke-test" not in args and "--bundle-self-test" not in args
     if "--bundle-self-test" in args:
         if len(args) != 2 or args[0] != "--bundle-self-test":

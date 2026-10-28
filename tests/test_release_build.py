@@ -16,7 +16,8 @@ class ReleaseBuildTests(unittest.TestCase):
     def test_source_archive_allowlist_excludes_user_and_build_directories(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            wanted = ["README.md", "pyproject.toml", "src/rigol_control/app.py", "release/README.md"]
+            wanted = ["README.md", "pyproject.toml", "src/rigol_control/app.py", "release/README.md",
+                      "release/installer.iss", "src/rigol_control/assets/apply_update.ps1"]
             unwanted = ["data/devices.json", "runtime-data/devices.json", ".git/config", "build/env/private.py",
                         "src/rigol_control/__pycache__/app.pyc", "src/rigol_control/settings.json"]
             for name in wanted + unwanted:

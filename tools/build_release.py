@@ -67,7 +67,7 @@ def source_files(root: Path):
         for path in sorted((root / directory).rglob("*")):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
-            if path.suffix.lower() in {".py", ".md", ".toml", ".txt", ".ps1", ".spec", ".cs", ".cmd", ".svg", ".ico", ".png"}:
+            if path.suffix.lower() in {".py", ".md", ".toml", ".txt", ".ps1", ".iss", ".spec", ".cs", ".cmd", ".svg", ".ico", ".png"}:
                 yield path
 
 
@@ -226,10 +226,21 @@ def main() -> int:
     with zipfile.ZipFile(zip_path) as archive:
         archive.extractall(extracted)
     third = run_probe(extracted / portable.name / "Lab Control Center.exe", reports / "zip.json", stage)
+    # Installed and portable editions share these exact verified application bytes.
+    sys.path.insert(0, str(ROOT / "tools"))
+    from build_installer import build_installer
+    installer = build_installer(portable, version, OUTPUT)
+    from verify_installer import verify_installer
+    installer_acceptance = verify_installer(portable, version, stage / "installer-acceptance")
+    if not installer_acceptance.get("success"):
+        raise RuntimeError("Installer install/upgrade/data-preservation acceptance failed")
+    info["installer"] = {"file": installer.name, "bytes": installer.stat().st_size,
+                         "sha256": sha256(installer), "per_user": True,
+                         "data_separate_from_program": True, "automatic_old_version_uninstall": True}
     info["verification"] = {"directory": first, "standalone": second, "zip_roundtrip": third,
                             "normal_startup_passed": True, "normal_startup_platform": "windows", "external_python_on_path": False,
-                            "physical_hardware_tested": False}
-    artifacts = [zip_path, OUTPUT / standalone.name, OUTPUT / (slug + "-source.zip"), OUTPUT / "RELEASE-NOTES.md"]
+                            "physical_hardware_tested": False, "installer": installer_acceptance}
+    artifacts = [zip_path, OUTPUT / standalone.name, installer, OUTPUT / (slug + "-source.zip"), OUTPUT / "RELEASE-NOTES.md"]
     info["artifacts"] = [{"file": p.name, "bytes": p.stat().st_size, "sha256": sha256(p)} for p in artifacts]
     manifest = OUTPUT / "release-manifest.json"
     manifest.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")

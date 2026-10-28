@@ -1,8 +1,8 @@
 # DG4000 + SIGLENT SSG + Vaunix + Newport + NI 多设备联动控制：开发日志与维护指南
 
-文档版本：1.10
+文档版本：1.11
 
-对应软件版本：0.7.22（源码与本地开发构建：GitHub 正式版自动下载与校验；最新正式发行仍为 0.7.20；阶段记录见第 12 节）
+对应软件版本：0.7.23（源码与本地开发构建：安装程序 EXE、保留用户数据的自动升级；最新正式发行仍为 0.7.20；阶段记录见第 12 节）
 
 最后更新：2026-10-28
 适用仓库：`Rigol_Generator_GUI`
@@ -27,7 +27,7 @@
 - 通过 Vaunix Windows SDK 1.15 完整控制 LMS/BLX，并用 NI 累计边沿驱动频率和绝对功率联合扫描。
 - 用 NI 外部触发推进 Newport PR50CC 小角度循环扫描，保持首点并在末点下一触发回跳；可在同一任务内记录连续模拟输入。
 - 通过版本化配置包迁移设备、参数、保存任务和连接恢复列表，导入不自动开启输出或运动。
-- 提供内置 Python/Qt 的 Windows x64 目录 ZIP 和单文件 EXE，目标电脑免 Python 安装；保留原有源码启动器供开发使用。
+- 提供内置 Python/Qt 的 Windows x64 安装程序 EXE、目录 ZIP 和单文件 EXE，目标电脑免 Python 安装；保留原有源码启动器供开发使用。
 - 异步检查公开 GitHub 最新正式 Release，发现更高版本时在首页提示并后台下载适用附件，验证大小与 SHA-256 后独立保存，由用户手动升级；离线继续使用仪器功能。
 - 在无硬件、无 PyVISA、无 NI-DAQmx 的环境中提供可重复的虚拟联调路径。
 
@@ -50,6 +50,7 @@ PyQt6 UI
   └─ PyVISA / vnx_fmsynth.dll / pyserial / NI-DAQmx / VirtualLab
 
 Windows 发行：PyInstaller EXE -> 内置 Python/Qt/Python 仪器接口 -> 应用
+  ├─ Setup EXE：按当前用户安装，程序与持久化数据分离，升级先备份、卸载旧程序、安装后核对恢复
   ├─ 目录 ZIP：EXE + _internal + docs + licenses，配置在 EXE 旁 data
   └─ 单文件 EXE：运行时解压到临时目录，配置仍在原 EXE 旁 data
 
@@ -60,8 +61,8 @@ Windows 源码：根目录旧 Lab Control Center.exe -> tools/launch_app.py -> �
   ├─ device_parameters.json
   ├─ step_tasks.json
   ├─ linkage_tasks.json
-  ├─ update_settings.json（本机自动检查/下载偏好，不随设备配置包导入导出）
-  ├─ updates/v版本号/（已校验的更新附件，不自动安装）
+  ├─ update_settings.json（本机自动检查/下载/安装偏好，不随设备配置包导入导出）
+  ├─ updates/v版本号/（已校验的更新附件，安装版可在空闲后自动交接安装）
   ├─ run_logs/*.csv
   └─ 用户指定的模拟输入 CSV/TXT
 
@@ -100,6 +101,9 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 | `src/rigol_control/analog.py` | 连续文本写入、有限内存缓存、采集控制器 | 成功 flush 后再提交保存计数；错误不掩盖清理状态，静止前保留资源 |
 | `src/rigol_control/virtual_lab.py` | 两台虚拟 DG、Vaunix、Newport、NI 触发与四路模拟输入 | 缓存连接/身份使用短锁，避免与管理器锁反向等待；新硬件功能增加虚拟等价路径 |
 | `src/rigol_control/ui/main_window.py` | 多设备首页、连接/断开、窗口管理 | 不在卡片组件内创建第二份连接会话 |
+| `src/rigol_control/installation.py`、`src/rigol_control/install_update.py` | 安装标记、独立数据目录、运行互斥与退出后的安装交接 | 安装请求固定下载元数据，重新校验；关闭被拒或设备忙时不得卸载/强退 |
+| `src/rigol_control/install_data.py` | 升级前完整数据快照、哈希清单和安装后核对恢复 | 备份失败阻止卸载，保留同名冲突，不遍历链接/重解析点 |
+| `src/rigol_control/ui/update_panel.py` | 检查/下载/安装偏好、进度、安装请求与重试 | 界面不直接启动安装进程，保留已校验的路径和附件摘要 |
 | `src/rigol_control/ui/dialogs.py` | 添加/编辑设备和资源下拉发现 | 保留手工输入作为驱动缺失时的后备路径 |
 | `src/rigol_control/ui/device_windows.py` | DG/NI 单设备页面和任务入口 | 文件较大，新增逻辑优先抽到模型/控制器后再接 UI |
 | `src/rigol_control/ui/siglent_window.py` | SSG 四页窗口、后台执行、租约与参数保存 | 编辑值与回读分离；重连不重放，底部常驻停止/RF 关闭 |
@@ -115,7 +119,8 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 | `tools/build_windows_launcher.ps1`、`tools/build_app_icon.py` | 重建源码启动器和图标资源 | 不得将旧小型启动器视为内置 Python 的发行包 |
 | `tools/build_release.ps1`、`tools/build_release.py` | 独立构建环境、PyInstaller 目录/单文件产物、许可材料、清单及校验和 | 目标 Windows x64；完整复制运行时，不能依赖开发机 Python |
 | `src/rigol_control/runtime.py`、`tools/frozen_entry.py` | 编译/源码运行路径、可写目录检查、独立运行时自检与启动错误日志 | 不把单文件临时资源目录用于保存用户配置；自检仅使用虚拟设备 |
-| `tools/lab_control.spec`、`release/requirements-build.txt`、`.github/workflows/release.yml` | 固定依赖、打包资源与动态后端、自动构建和标签发布 | 两种产物共用依赖；更新版本后重新检查许可材料与发行清单 |
+| `tools/lab_control.spec`、`release/requirements-build.txt`、`.github/workflows/release.yml` | 固定依赖、打包资源与动态后端、自动构建和标签发布 | 三种产物共用应用载荷；更新版本后重新检查许可材料与发行清单 |
+| `tools/build_installer.py`、`release/installer.iss` | Inno Setup 安装、旧安装版卸载、独立数据恢复与卸载保留 | 测试使用隔离 AppId 和临时目录，禁止覆盖真实安装或用户数据 |
 | `release/README.md`、`release/NOTES-0.7.0.md` | 便携运行、数据迁移、硬件依赖和版本交付说明 | 构建验证与实机验收分别记录 |
 
 ## 5. 关键运行流程
@@ -391,6 +396,7 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 | Windows 源码入口 | 目录迁移、特殊字符路径、解释器回退、失败日志 | `test_windows_launcher.py` |
 | 便携发行 | 冻结路径、数据目录优先级、权限错误、厂商 DLL 定位、打包文件选择 | `test_runtime.py`、`test_release_build.py` |
 | 联网更新 | 正式版本比较、受限异步请求、附件 URL/大小/SHA-256 校验、进度、取消、重试、偏好及窗口关闭 | `test_updates.py`、下载服务及更新区 UI 回归；测试不访问真实 GitHub |
+| 安装与保留数据升级 | 安装标记/目录、已校验安装请求、任务忙时等待、退出交接、数据备份/恢复、同名冲突和卸载保留 | `test_installer_update_ui.py`、`test_install_update.py`、`test_installation_controller.py`、`test_install_data.py`、`test_installer_build.py`，实际 Setup 在隔离标识/临时路径验收 |
 | 编译产物自检 | 依赖来自包内、Qt 插件/图标、六台虚拟设备和窗口、普通 GUI 启动 | `tools/frozen_entry.py`、`tools/build_release.py` |
 
 当前新增回归重点为适用附件选择、严格下载来源、大小与 SHA-256 校验、取消/超时后迟到结果、文件保存及不覆盖、UI 自动下载偏好和关闭生命周期；保留原有更新检查、Newport 恢复、DG/SSG/Vaunix 回读、NI 清理、CH2 隔离和任务租约回归。历史版本结果保留在第 12 节，不作为本版全量或冻结产物检查结果。本轮实际验证见[0.7.22 记录](../release/NOTES-0.7.22.md)，未进行本版实机验收。
@@ -453,6 +459,22 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 实体输出测试必须由实验负责人确认幅度、偏置、负载、端接方式、PFI 电平、接地和被测电路耐压。自动测试不能替代这些电气检查。
 
 ## 12. 版本开发日志
+
+### 0.7.23：安装程序 EXE 与保留用户数据的自动升级 — 2026-10-28
+
+用户要求将软件构建为可安装 EXE，后续下载更新后自动安装；有旧安装版时先卸载程序，保留用户数据并在新版本安装后恢复。
+
+- 新增 Inno Setup 安装程序 `Lab-Control-Center-0.7.23-windows-x64-setup.exe`，按当前 Windows 用户安装到 `%LOCALAPPDATA%\Programs\LabControlCenter`，开始菜单与卸载项由安装程序管理。沿用已验证的 Python/Qt/仪器接口载荷，目标电脑无需外部 Python。
+- 安装标记固定产品标识、发行格式和数据目录；默认数据为 `%LOCALAPPDATA%\RigolGeneratorControl\data`，与程序目录分开，显式数据目录覆盖仍有效。正常卸载只删除程序及登记的快捷方式，保留独立数据和安装备份，不把用户数据纳入程序文件删除表。
+- 安装版更新区优先选择严格匹配版本的 `-setup.exe`，下载完成后重新校验路径、大小与 SHA-256，固定附件元数据后再请求安装。增加默认开启的“下载后自动安装（空闲时）”及手动安装重试；便携 ZIP/独立 EXE 保留下载后手动迁移，避免把独立程序误认成安装器。
+- 安装交接不占用仪器队列。设备/采集任务、后台通信、导入和停止清理未完成时，保留原窗口与任务；自动请求等待空闲，关闭自动安装可取消等待。只有主窗口正常关闭被接受后才提交交接，由程序目录外的 Windows PowerShell 工作者等待旧进程完全退出，再启动安装程序；不使用强制杀进程或强制关闭仪器窗口。
+- 交接前提交数值编辑并保存当前参数，写盘失败则取消交接、不退出程序。原生 Windows PowerShell 验收复现 UTF-8 无 BOM 中文脚本解析失败，改为生成带 BOM 的脚本；实际 PowerShell 进程已确认等待父进程退出、未提交票据时不能安装，`handoff-acceptance.json` 中两项为 true，且未执行安装程序、联网或访问硬件。
+- 安装程序在卸载旧登记版本前调用数据快照：备份所选数据目录内的配置、日志、测量文件与空目录，排除 `updates` 缓存；逐文件字节数和 SHA-256 写入清单，拒绝符号链接、重解析点、无效相对路径及复制不完整。默认备份根为 `%LOCALAPPDATA%\RigolGeneratorControl\installer-backups`，备份失败时不卸载旧版。
+- 安装后核对仍存在的同内容数据文件，仅从备份恢复缺失文件；同名不同内容或校验失败保留双方并报告，不覆盖冲突文件。安装失败仍保留独立数据及备份，但不承诺旧程序自动回滚。恢复配置不会开启 RF、扫描或机械运动；数据目录之外的采集文件保持原位置，不列入快照范围。
+- 安装程序与应用使用互斥检查防止运行中替换，卸载同样保留用户数据。安装验收使用隔离 AppId、程序/数据/备份路径和虚拟设备，避免操作真实用户安装与实体仪器。源代码快照需包含 `.iss`、构建与交接脚本，安装程序与便携产物的具体内容及验收结果以本组 `release-manifest.json` 为准。
+- 最终源码完整 unittest 执行 656 项、结果 OK（76.088 秒），其中 1 项符号链接测试因 Windows 链接权限跳过；安装针对性回归执行 56 项、结果 OK（2.051 秒），同样含该跳过项；原有联网更新 71 项全部通过（0.562 秒）。源码虚拟自检通过，`installed_update_lifecycle` 的独立数据保留、备份恢复、Setup 附件选择、要求正常关闭、忙时延后、不执行安装器、不访问硬件七项均为 true，原有全部检查继续保留，网络/硬件访问均为 false。
+- 本版针对性回归、完整 unittest、源码虚拟自检、冻结产物及隔离安装/升级/卸载验证记录保存到 `dist/verification/0.7.23/`；实际安装及冻结验收以本组 `release-manifest.json` 为准，不用源码或上一版结果代替。本地交付保存到新的 `dist/local/v0.7.23/`，保留原开发包与正式附件；本轮不创建新标签或 GitHub Release。
+- DG/Vaunix 首触发 P0、有序累计计数、CH2 隔离、停止失败保留占用、未知接受结果不自动重放及 SSG 原生扫描/恢复规则继续保留，本轮不修改仪器协议或自动操作实体仪器。
 
 ### 0.7.22：GitHub 更新附件自动下载与校验 — 2026-10-28
 

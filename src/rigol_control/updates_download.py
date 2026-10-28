@@ -29,7 +29,7 @@ CHUNK_BYTES = 256 * 1024
 _DOWNLOAD_HOSTS = frozenset(("github.com", "release-assets.githubusercontent.com"))
 _ASSET_NAME = re.compile(
     r"Lab-Control-Center-(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\."
-    r"(0|[1-9][0-9]{0,8})-windows-x64(?:-portable\.zip|\.exe)", re.ASCII)
+    r"(0|[1-9][0-9]{0,8})-windows-x64(?:-portable\.zip|-setup\.exe|\.exe)", re.ASCII)
 
 
 class DownloadError(Exception):

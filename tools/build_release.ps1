@@ -22,6 +22,8 @@ try {
         & $buildPython -m pip install --disable-pip-version-check --no-deps --no-build-isolation -e .
         if ($LASTEXITCODE -ne 0) { throw "Project installation failed" }
     }
+    & (Join-Path $PSScriptRoot 'ensure_inno_setup.ps1')
+    if ($LASTEXITCODE -ne 0) { throw "Installer compiler preparation failed" }
     $buildArguments = @("tools\build_release.py")
     if ($VaunixDll) { $buildArguments += @("--vaunix-dll", $VaunixDll) }
     & $buildPython @buildArguments

@@ -11,6 +11,7 @@ from PyQt6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPalette
 from PyQt6.QtWidgets import QApplication
 
 from .repository import DeviceRepository
+from .installation import acquire_application_mutex
 from .runtime import package_resource, prepare_data_dir, prepare_qt_environment
 from .ui.main_window import DeviceCenterWindow
 from .ui.input_behavior import InputWheelGuard
@@ -86,6 +87,7 @@ def load_ui_font() -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    acquire_application_mutex()
     data_dir = prepare_data_dir(args.data_dir)
     # All per-device default recording paths must follow --data-dir as well.
     os.environ["RIGOL_GUI_DATA_DIR"] = str(data_dir)
