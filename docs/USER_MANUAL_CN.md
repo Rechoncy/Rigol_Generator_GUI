@@ -1,7 +1,7 @@
 # DG4000 + SIGLENT SSG + Vaunix + Newport + NI 多设备联动控制软件使用说明
 
-版本：0.7.23（[GitHub 正式发行](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23)）
-更新日期：2026-10-28（新增安装程序 EXE 与保留数据的自动升级）
+版本：0.7.24（[本次发行](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.24)）
+更新日期：2026-10-28（修复保存的虚拟设备重新启动时误用真实驱动探测）
 适用范围：RIGOL DG4000 系列、鼎阳 SIGLENT SSG、Vaunix Lab Brick LMS/BLX、Newport、带模拟输入/边沿计数能力的 NI DAQ、内置虚拟实验室
 
 本软件用于统一管理多台 DG4000、鼎阳 SSG、Vaunix LMS/BLX、Newport、NI DAQ 和通用 SCPI 仪器。NI 设备可以独立检测外部触发、累计计数和采集模拟电压，但不使用 AO 电压控制发生器。每次检测到新的累计触发后，软件通过 VISA/SCPI 向 DG4000、或通过 Vaunix USB DLL 向 LMS/BLX 下发下一组参数；模拟输入数据在采集过程中逐块写入 CSV/TXT 文本，实时曲线只用于监视。
@@ -190,7 +190,18 @@ $env:VAUNIX_LMS_DLL = "C:\path\to\vnx_fmsynth.dll"
 
 ### 4.5 安装版 EXE 与保留数据升级
 
-从 [v0.7.23 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23) 下载 `Lab-Control-Center-0.7.23-windows-x64-setup.exe`。这是安装程序，和原有直接运行的独立 EXE 不同；正式附件本地副本位于 `dist/published/v0.7.23/`，原 `dist/local/v0.7.23/` 开发包保留。安装默认仅针对当前 Windows 用户，提供开始菜单入口与卸载项，内置应用所需 Python/Qt 和 Python 仪器接口，目标电脑无需另外安装 Python。真实仪器的系统驱动仍按本说明准备。
+从 [v0.7.24 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.24) 下载 `Lab-Control-Center-0.7.24-windows-x64-setup.exe`。这是安装程序，和原有直接运行的独立 EXE 不同；正式附件本地副本目录为 `dist/published/v0.7.24/`，旧 v0.7.23 正式附件及开发包保留。安装默认仅针对当前 Windows 用户，提供开始菜单入口与卸载项，内置应用所需 Python/Qt 和 Python 仪器接口，目标电脑无需另外安装 Python。真实仪器的系统驱动仍按本说明准备。
+
+**旧版本的更新能力：**
+
+| 当前版本 | 更新入口 | 首次改用安装版 |
+|---|---|---|
+| 0.7.20 | 没有联网更新功能 | 手动下载 Setup，选择旧数据目录 |
+| 0.7.21 | 检查并提示新版，打开发布页 | 手动下载 Setup，选择旧数据目录 |
+| 0.7.22 便携版/独立 EXE | 可自动下载和校验 ZIP/独立 EXE，下载不等于安装 | 另行手动运行 Setup，选择旧数据目录 |
+| 0.7.23 及后续安装版 | 支持后续更高正式版本下载后自动安装 | 沿用当前实际数据目录 |
+
+首次迁移先停止任务并退出旧程序。向导选择旧 EXE 旁的 `data/`；如果曾指定 `--data-dir` 或 `RIGOL_GUI_DATA_DIR`，则选择实际使用的目录。未登记的便携程序不会被自动卸载；确认迁移成功前保留原包，不要删除包含用户数据的旧目录。旧更新设置没有 `automatic_install` 字段时会采用该选项默认值，并保留原检查/下载选择，正常启动读取不会重写旧设置。
 
 默认程序目录为 `%LOCALAPPDATA%\Programs\LabControlCenter`，默认用户数据目录为 `%LOCALAPPDATA%\RigolGeneratorControl\data`，安装向导也可选择已有的独立数据目录。程序文件与用户数据分开；`--data-dir`、`RIGOL_GUI_DATA_DIR` 仍有优先级，自动升级沿用当前实际数据目录。不要将用户数据放在程序安装目录中。正常卸载移除软件与快捷方式，保留独立用户数据及升级备份；默认升级备份位于 `%LOCALAPPDATA%\RigolGeneratorControl\installer-backups`。
 
@@ -839,6 +850,8 @@ cmd /c run_app.cmd --smoke-test --data-dir "%TEMP%\rigol-gui-smoke"
 - [ ] 停止和断开流程已验证。
 
 ## 17. 版本说明
+
+0.7.24 修复已有 SIM DG4000/NI 配置重新启动时误用真实 VISA/DAQ 探测的问题，虚拟设备探测保持在虚拟实现中。此前真实旧版数据迁移到 v0.7.23 的首次安装保留了原文件和哈希，但其启动自检因后台探测占用拒绝一次关闭而未完成；受控心跳证明不是界面死锁。本版自身的验证结果及旧版本更新边界见[0.7.24 发行说明](../release/NOTES-0.7.24.md)。不改真实仪器协议，已发布的 v0.7.23 附件保留。
 
 0.7.23 按用户要求正式发行安装程序 EXE、便携 ZIP 和独立 EXE，并带入 0.7.21 的联网更新检查、0.7.22 的自动下载和校验。安装版后续可在下载完成、设备空闲且正常退出后自动安装；安装程序先备份用户数据，再卸载已登记的旧安装版，安装后核对并恢复缺失文件。正式下载与本版验证范围见[0.7.23 发行说明](../release/NOTES-0.7.23.md)，具体附件以同组 `release-manifest.json` 为准；历史版本记录和已有交付包保留，未进行实体仪器验收。
 

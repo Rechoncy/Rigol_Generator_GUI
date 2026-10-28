@@ -2,11 +2,11 @@
 
 这是一个面向 RIGOL DG4000、鼎阳 SIGLENT SSG、Vaunix Lab Brick LMS/BLX 信号源、Newport SMC100CC / PR50CC 旋转台与 NI DAQ 的多设备桌面控制程序。首页用于保存和管理多台设备；点击设备卡片后，会打开独立的设备设置窗口，多台设备窗口可同时存在。
 
-**Windows 正式版：** [v0.7.23](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23) 提供安装程序 EXE、便携目录 ZIP 和独立 EXE，内置 Python/Qt 与 Python 仪器接口；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。推荐使用安装程序；目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。构建与验收状态以发行附件 `release-manifest.json` 为准。具体文件、数据迁移、实机驱动及编译方法见 [发行版使用与构建说明](release/README.md)和[0.7.23 发行说明](release/NOTES-0.7.23.md)。
+**Windows 发行包：** 本次发行版本 [v0.7.24](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.24) 提供安装程序 EXE、便携目录 ZIP 和独立 EXE，内置 Python/Qt 与 Python 仪器接口；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。推荐使用安装程序；目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。构建与验收状态以发行附件 `release-manifest.json` 为准。具体文件、数据迁移、实机驱动及编译方法见 [发行版使用与构建说明](release/README.md)和[0.7.24 发行说明](release/NOTES-0.7.24.md)。
 
-当前源码版本为 **0.7.23**，新增可安装的 Windows EXE：`Lab-Control-Center-0.7.23-windows-x64-setup.exe`。安装版在发现正式新版后可自动下载、核对大小与 SHA-256，等待设备空闲并正常退出，然后备份用户数据、卸载已登记的旧版、安装新版并核对恢复数据。用户数据位于独立目录，卸载保留数据与升级备份；便携 ZIP 和独立 EXE 继续采用原有手动升级流程。具体操作见[安装与升级说明](docs/USER_MANUAL_CN.md#45-安装版-exe-与保留数据升级)和[0.7.23 版本记录](release/NOTES-0.7.23.md)。
+当前源码版本为 **0.7.24**，修复保存了虚拟设备的配置重新启动时，SIM DG4000 和 NI 被误送入真实 VISA/DAQ 探测的问题。安装版在发现正式新版后可自动下载、核对大小与 SHA-256，等待设备空闲并正常退出，然后备份用户数据、卸载已登记的旧版、安装新版并核对恢复数据。用户数据位于独立目录，卸载保留数据与升级备份；便携 ZIP 和独立 EXE 继续采用原有手动升级流程。具体操作见[安装与升级说明](docs/USER_MANUAL_CN.md#45-安装版-exe-与保留数据升级)和[0.7.24 版本记录](release/NOTES-0.7.24.md)。
 
-本次按用户授权发行 **0.7.23**，包含此前正式版的 Newport 波片架状态与手动恢复、DG4000 快速重连快照修复，以及联网检查、自动下载和安装升级。正式附件本地副本使用 `dist/published/v0.7.23/`；已验收的 `dist/local/v0.7.23/` 开发包和其他历史附件分别保留。
+本次按用户授权以 **0.7.24** 补丁交付，正式附件本地副本使用 `dist/published/v0.7.24/`；已发布的 [v0.7.23](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23)、`dist/published/v0.7.23/` 正式副本及 `dist/local/v0.7.23/` 开发包均保留，不覆盖已有版本。
 
 软件图标以波形、采样点和旋转箭头表示信号源、采集与循环扫描。仓库根目录原有的 `Lab Control Center.exe` 是供源码运行的小型启动器，依赖目标电脑的 64 位 Python 3.10+ / PyQt6；它不是上述发行附件。开发者可继续使用它或 `run_app.cmd`。
 
@@ -76,16 +76,18 @@
 
 ### 使用安装程序 EXE
 
-从 [v0.7.23 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23) 下载 `Lab-Control-Center-0.7.23-windows-x64-setup.exe`，正式附件本地副本保存于 `dist/published/v0.7.23/`，内含 Python/Qt 和 Python 仪器接口。安装默认仅针对当前 Windows 用户，程序位于 `%LOCALAPPDATA%\Programs\LabControlCenter`，数据位于 `%LOCALAPPDATA%\RigolGeneratorControl\data`。目标电脑无需安装 Python；真实设备的 VISA、NI-DAQmx、串口或 USB 驱动仍需准备。
+从 [v0.7.24 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.24) 下载 `Lab-Control-Center-0.7.24-windows-x64-setup.exe`，正式附件本地副本目录为 `dist/published/v0.7.24/`，内含 Python/Qt 和 Python 仪器接口。安装默认仅针对当前 Windows 用户，程序位于 `%LOCALAPPDATA%\Programs\LabControlCenter`，数据位于 `%LOCALAPPDATA%\RigolGeneratorControl\data`。目标电脑无需安装 Python；真实设备的 VISA、NI-DAQmx、串口或 USB 驱动仍需准备。
 
 安装版首页提供“下载后自动安装（空闲时）”，也可关闭后点击“安装更新”。升级不会强制终止实验：存在扫描、采集、后台通信或未确认清理时，先保留程序与任务；只有正常关闭被接受后才启动安装程序。卸载保留独立用户数据和备份，恢复失败或同名文件内容冲突时保留现场，不能把失败当作升级成功。旧便携版迁移步骤见[使用说明](docs/USER_MANUAL_CN.md#45-安装版-exe-与保留数据升级)。
 
+旧版的更新能力不同：0.7.20 没有联网更新入口，0.7.21 只能提示并打开发布页，0.7.22 可自动下载便携 ZIP 或独立 EXE。首次改用安装版仍需手动运行 Setup，并在向导选择旧版实际使用的 `data/` 或自定义数据目录；已经安装的 0.7.23 及后续安装版才支持后续正式新版自动安装。
+
 ### 使用便携发行版
 
-从 [v0.7.23 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23) 下载便携文件和校验清单。正式发行由版本标签对应的提交构建，生成与验收状态以同组附件 `release-manifest.json` 为准。本地保存的正式发行附件位于 `dist/published/v0.7.23/`；自行构建的输出目录为 `dist/release/`。本版文件为：
+从 [v0.7.24 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.24) 下载便携文件和校验清单。正式发行由版本标签对应的提交构建，生成与验收状态以同组附件 `release-manifest.json` 为准。本地保存的正式发行附件目录为 `dist/published/v0.7.24/`；自行构建的输出目录为 `dist/release/`。本版文件为：
 
-- `Lab-Control-Center-0.7.23-windows-x64-portable.zip`：完整解压后运行 `Lab Control Center.exe`，保留 `_internal/`。
-- `Lab-Control-Center-0.7.23-windows-x64.exe`：单文件启动，内置运行时临时解压，持久化配置保存在 EXE 旁 `data/`。
+- `Lab-Control-Center-0.7.24-windows-x64-portable.zip`：完整解压后运行 `Lab Control Center.exe`，保留 `_internal/`。
+- `Lab-Control-Center-0.7.24-windows-x64.exe`：单文件启动，内置运行时临时解压，持久化配置保存在 EXE 旁 `data/`。
 
 两种格式默认使用 EXE 旁的 `data/`；`--data-dir` 和 `RIGOL_GUI_DATA_DIR` 可以覆盖。迁移时复制程序与 `data/`，用户另选位置的采集文件需一并迁移。旧源码版 AppData 配置不会自动迁移，可用首页“导出配置 / 导入配置”。详见[便携迁移与升级](release/README.md#3-保存迁移与升级)。
 
@@ -155,7 +157,7 @@ python -m rigol_control --data-dir .\runtime-data
 
 ## Vaunix LMS/BLX 实机配置
 
-1. 使用发行清单确认内置 DLL 的 0.7.23 安装版、便携 ZIP 或单文件 EXE 时，直接使用内置 SDK 1.15 DLL。源码运行可将 Windows x64 `vnx_fmsynth.dll` 放在项目主目录，或保留仓库 SDK 目录；也可通过 `VAUNIX_LMS_DLL` 指定 DLL。
+1. 使用发行清单确认内置 DLL 的 0.7.24 安装版、便携 ZIP 或单文件 EXE 时，直接使用内置 SDK 1.15 DLL。源码运行可将 Windows x64 `vnx_fmsynth.dll` 放在项目主目录，或保留仓库 SDK 目录；也可通过 `VAUNIX_LMS_DLL` 指定 DLL。
 2. 插入 Vaunix Lab Brick 后，在首页添加 `Vaunix LMS/BLX`；资源下拉框会显示型号、序列号和 `VAUNIX::LMS::<序列号>`。资源身份使用序列号，不依赖 DLL 每次枚举得到的临时设备句柄。首页后台探测只枚举设备，不调用 `fnLMS_InitDevice` 或 `fnLMS_CloseDevice`，不会抢占或关闭正式控制会话。
 3. 连接后先在“总览”核对型号、序列号、SDK 版本、频率/功率范围以及 BLX 序列、快速脉冲、Chirp 能力；不支持的功能按钮会被禁用。
 4. “射频输出”使用 Hz/GHz 与绝对 dBm；DLL 功率参数以 0.25 dB 为编码单位，但仪器实际功率分辨率为 0.5 dB，软件会拒绝不在 0.5 dB 网格上的输出、序列和扫描值。先保持 RF 关闭，应用低风险参数后再开 RF。
@@ -207,7 +209,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1
 
 0.7.15 修复高频小步长点表的有效数字丢失，DG 幅度下发明确使用 VPP 单位，基本波频率按已知型号与波形校验，相位/PSK 限定 0–360°。触发布防时检查一次耦合并读取 CH1/CH2 实际波形，频率点按该快照校验，不增加逐点查询。DG 自动重连发现型号或序列号变化时拒绝旧设置；Vaunix 输出、扫频和完整序列在调用 SDK 前完成输入与编码校验。另修复虚拟设备状态锁冲突及后台任务派发失败后的界面状态。此前各版的触发顺序、停止重试和资源占用保护保留，未新增实机性能结论。详见[流程核对](docs/DG4000_TRIGGER_AUDIT_CN.md)及[本版说明](release/NOTES-0.7.15.md)。
 
-0.7.15 源码完整自动回归 406 项及源码自检已通过；0.7.16 的 444 项和 0.7.17 的 465 项结果分别保留在[采集修复历史](release/NOTES-0.7.16.md)与[DG 回读历史](release/NOTES-0.7.17.md)。0.7.18 正式发行验证保留在[发行说明](release/NOTES-0.7.18.md)和同组清单，0.7.19 的回读缓存修复保留在[历史说明](release/NOTES-0.7.19.md)，Newport 恢复修复保留在[0.7.20 说明](release/NOTES-0.7.20.md)。当前 0.7.23 的安装升级及实际验证范围见[本版说明](release/NOTES-0.7.23.md)和同组清单，不沿用旧版通过结果；尚未进行实体仪器验收。
+0.7.15 源码完整自动回归 406 项及源码自检已通过；0.7.16 的 444 项和 0.7.17 的 465 项结果分别保留在[采集修复历史](release/NOTES-0.7.16.md)与[DG 回读历史](release/NOTES-0.7.17.md)。0.7.18 正式发行验证保留在[发行说明](release/NOTES-0.7.18.md)和同组清单，0.7.19 的回读缓存修复保留在[历史说明](release/NOTES-0.7.19.md)，Newport 恢复修复保留在[0.7.20 说明](release/NOTES-0.7.20.md)。0.7.23 安装升级的记录保留在[历史说明](release/NOTES-0.7.23.md)；当前 0.7.24 的虚拟设备重启探测修复和实际验证范围见[本版说明](release/NOTES-0.7.24.md)及同组清单，不沿用旧版通过结果；尚未进行实体仪器验收。
 
 ## 测试
 

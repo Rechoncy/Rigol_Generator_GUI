@@ -1363,6 +1363,36 @@ def _bundle_self_test(report_path: Path) -> int:
             raise AssertionError("Main window refused to close after background work completed")
         home = None
         app.processEvents()
+        # A saved virtual laboratory restarts with disconnected records. This
+        # path differs from create_virtual_lab(), which connects them directly.
+        saved_data = {name: (data_dir / name).read_bytes()
+                      for name in ("devices.json", "device_parameters.json")
+                      if (data_dir / name).exists()}
+        with patch("pyvisa.ResourceManager") as visa_probe, \
+                patch("nidaqmx.system.System.local") as ni_probe, \
+                patch("serial.Serial") as serial_probe, \
+                patch("rigol_control.services.VaunixLmsApi") as vaunix_probe:
+            home = DeviceCenterWindow(repository)
+            home.show()
+            wait_idle()
+            reloaded = repository.list()
+            if len(reloaded) != 6 or any(home.connection_manager.is_connected(item) for item in reloaded):
+                raise AssertionError("Saved virtual restart connected a device or lost a record")
+            if any(card.status.text() != "● 可用" for card in home.cards.values()):
+                raise AssertionError("Saved virtual restart did not mark every simulator available")
+            for native_probe in (visa_probe, ni_probe, serial_probe, vaunix_probe):
+                native_probe.assert_not_called()
+            if not home.close():
+                raise AssertionError("Saved virtual restart retained a probe or refused normal close")
+            home = None
+            app.processEvents()
+        if any((data_dir / name).read_bytes() != contents for name, contents in saved_data.items()):
+            raise AssertionError("Saved virtual restart changed persisted devices or parameters")
+        report["persisted_virtual_restart"] = {
+            "devices_reloaded": True, "all_available": True, "no_automatic_connections": True,
+            "data_unchanged": True, "native_backends_untouched": True, "clean_close": True,
+            "hardware_access": False,
+        }
         if not QThreadPool.globalInstance().waitForDone(3000):
             raise TimeoutError("Qt background workers did not shut down")
         if dialog_errors:

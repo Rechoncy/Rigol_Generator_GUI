@@ -1,6 +1,6 @@
 # Windows 安装版与便携发行版使用及构建说明
 
-正式发行版本：0.7.23；目标平台：Windows 10/11 x64。
+本次发行版本：0.7.24；目标平台：Windows 10/11 x64。
 
 发行版包含运行程序所需的 Python、Qt、PyVISA、pyserial 和 nidaqmx。目标电脑无需安装 Python、pip 或创建虚拟环境，首次启动也无需联网下载 Python 组件。内置运行时只供本软件使用，不修改系统 Python。
 
@@ -8,21 +8,21 @@
 
 | 文件 | 用法 | 适合场景 |
 |---|---|---|
-| `Lab-Control-Center-0.7.23-windows-x64-setup.exe` | 运行安装向导，之后从开始菜单启动 | 日常使用，后续下载后自动安装并保留用户数据 |
-| `Lab-Control-Center-0.7.23-windows-x64-portable.zip` | 完整解压后运行目录内的 `Lab Control Center.exe` | 便携使用、实验室迁移、与文档一起保存 |
-| `Lab-Control-Center-0.7.23-windows-x64.exe` | 放在可写目录，直接双击 | 只希望分发一个程序文件 |
+| `Lab-Control-Center-0.7.24-windows-x64-setup.exe` | 运行安装向导，之后从开始菜单启动 | 日常使用，后续下载后自动安装并保留用户数据 |
+| `Lab-Control-Center-0.7.24-windows-x64-portable.zip` | 完整解压后运行目录内的 `Lab Control Center.exe` | 便携使用、实验室迁移、与文档一起保存 |
+| `Lab-Control-Center-0.7.24-windows-x64.exe` | 放在可写目录，直接双击 | 只希望分发一个程序文件 |
 | `SHA256SUMS.txt` | 对照下载文件的 SHA-256 | 核对下载是否完整 |
 | `release-manifest.json` | 查看版本、构建、依赖与验证信息 | 维护、问题报告和版本追踪 |
-| `Lab-Control-Center-0.7.23-windows-x64-source.zip` | 本次构建使用的源码与文档快照 | 维护、依赖许可要求及问题复现 |
+| `Lab-Control-Center-0.7.24-windows-x64-source.zip` | 本次构建使用的源码与文档快照 | 维护、依赖许可要求及问题复现 |
 | `RELEASE-NOTES.md` | 查看本版改动和验证范围 | 升级前阅读 |
 
-项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。正式发行文件从 [v0.7.23 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23) 下载，由版本标签对应的提交构建。发布附件的本地副本位于 `dist/published/v0.7.23/`，自行构建的输出目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以同组附件的 `release-manifest.json` 为准，完整性可用 `SHA256SUMS.txt` 核对。
+项目地址：[Rigol_Generator_GUI](https://github.com/Rechoncy/Rigol_Generator_GUI)。正式发行文件从 [v0.7.24 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.24) 下载，由版本标签对应的提交构建。发布附件的本地副本位于 `dist/published/v0.7.24/`，自行构建的输出目录为 `dist/release/`；仓库中的 `release/` 保存说明与版本记录。产物生成、实际携带内容及运行验收以同组附件的 `release-manifest.json` 为准，完整性可用 `SHA256SUMS.txt` 核对。
 
-上表公开下载文件名和下文运行示例均使用 0.7.23。本次按用户授权发布 GitHub Release，并将正式附件保存到 `dist/published/v0.7.23/`；已经验收的 `dist/local/v0.7.23/` 开发构建、历史构建与 `dist/published/v0.7.20/` 旧正式附件分别保留。安装版支持下载后自动安装、卸载旧安装版并保留/备份/核对恢复用户数据，详见[安装版操作](../docs/USER_MANUAL_CN.md#45-安装版-exe-与保留数据升级)及[本版记录](NOTES-0.7.23.md)。
+上表公开下载文件名和下文运行示例均使用 0.7.24。本次按用户授权发布 GitHub Release，并将正式附件保存到 `dist/published/v0.7.24/`；已发布的 `dist/published/v0.7.23/` 正式副本、`dist/local/v0.7.23/` 开发包、历史构建与 `dist/published/v0.7.20/` 旧正式附件分别保留，不覆盖已有版本。安装版支持下载后自动安装、卸载旧安装版并保留/备份/核对恢复用户数据，详见[安装版操作](../docs/USER_MANUAL_CN.md#45-安装版-exe-与保留数据升级)及[本版记录](NOTES-0.7.24.md)。
 
 仓库根目录原有的小型 `Lab Control Center.exe` 是源码启动器，仍需外部 Python/PyQt6；它与上述编译产物不同。使用免 Python 版本时，应下载发行附件或按第 7 节构建。
 
-从 0.7.5 起，主窗口和每个设备窗口标题均显示真实运行版本（例如 `v0.7.23`）。SSG 的“状态与诊断”页显示可复制的运行程序、模块路径，诊断 JSON 也保存这些信息。压缩包或文件夹的名称不能代替运行版本；升级后请核对标题。
+从 0.7.5 起，主窗口和每个设备窗口标题均显示真实运行版本（例如 `v0.7.24`）。SSG 的“状态与诊断”页显示可复制的运行程序、模块路径，诊断 JSON 也保存这些信息。压缩包或文件夹的名称不能代替运行版本；升级后请核对标题。
 
 ## 2. 解压与首次启动
 
@@ -32,11 +32,13 @@
 4. 实机使用按第 4 节准备对应驱动，再在软件中添加或导入设备配置。
 5. 软件启动和配置恢复不会自动开启 RF、移动旋转台或启动扫描；连接、参数应用、输出与任务仍由用户在界面中操作。
 
-0.7.23 的首页保留 GitHub 正式版自动检查、下载与 SHA-256/字节数校验。安装版选择 Setup EXE，默认可在设备空闲后自动安装；便携 ZIP 与独立 EXE 继续采用原有下载后手动迁移方式。支持关闭自动检查、下载或安装，网络异常不影响离线仪器功能，完整操作见[软件更新](../docs/USER_MANUAL_CN.md#44-联网检查软件更新)。
+0.7.24 的首页保留 GitHub 正式版自动检查、下载与 SHA-256/字节数校验。安装版选择 Setup EXE，默认可在设备空闲后自动安装；便携 ZIP 与独立 EXE 继续采用原有下载后手动迁移方式。支持关闭自动检查、下载或安装，网络异常不影响离线仪器功能，完整操作见[软件更新](../docs/USER_MANUAL_CN.md#44-联网检查软件更新)。
 
 ### 2.1 安装程序 EXE
 
-运行 `Lab-Control-Center-0.7.23-windows-x64-setup.exe`，按向导安装。默认程序目录为 `%LOCALAPPDATA%\Programs\LabControlCenter`，仅针对当前用户；用户数据独立保存在 `%LOCALAPPDATA%\RigolGeneratorControl\data`，向导可选择已有独立数据目录。保留程序与数据目录分离，目标电脑无需外部 Python。安装后通过开始菜单启动，卸载项只移除软件，保留独立数据和备份。
+运行 `Lab-Control-Center-0.7.24-windows-x64-setup.exe`，按向导安装。默认程序目录为 `%LOCALAPPDATA%\Programs\LabControlCenter`，仅针对当前用户；用户数据独立保存在 `%LOCALAPPDATA%\RigolGeneratorControl\data`，向导可选择已有独立数据目录。保留程序与数据目录分离，目标电脑无需外部 Python。安装后通过开始菜单启动，卸载项只移除软件，保留独立数据和备份。
+
+0.7.20 没有联网更新入口；0.7.21 仅检查和提示更新；0.7.22 可自动下载便携 ZIP/独立 EXE，但不能自动把便携版转为安装版。首次迁移请手动运行 Setup，并选择旧版实际数据目录；不要把下载到 `updates/` 当成已经安装。已经安装的 0.7.23 及后续安装版可下载并自动安装更高的正式版本。
 
 首页“下载后自动安装（空闲时）”默认开启，可取消后手动点击“安装更新”。新版 Setup 完整下载并通过校验后，应用等待扫描、采集、后台通信和清理完成，只有正常退出被接受后才交接给安装程序。安装程序先备份用户数据，再卸载登记的旧版、安装新版并核对恢复；不强制结束实验或自动启动 RF、扫描、运动。数据目录内的测量文件与空目录一并备份，`updates` 下载缓存除外；目录外的采集文件不移动或删除。
 
@@ -45,7 +47,7 @@
 目录包主要结构：
 
 ```text
-Lab-Control-Center-0.7.23-windows-x64-portable/
+Lab-Control-Center-0.7.24-windows-x64-portable/
 ├─ Lab Control Center.exe
 ├─ _internal/              内置 Python、Qt、Python 依赖与资源，须完整保留
 ├─ docs/                   操作和开发说明
@@ -78,7 +80,7 @@ Lab-Control-Center-0.7.23-windows-x64-portable/
 单文件版本同样支持：
 
 ```powershell
-& ".\Lab-Control-Center-0.7.23-windows-x64.exe" --data-dir "D:\LabData\ControlCenter"
+& ".\Lab-Control-Center-0.7.24-windows-x64.exe" --data-dir "D:\LabData\ControlCenter"
 ```
 
 也可为当前 PowerShell 会话设置环境变量后启动：
@@ -120,7 +122,7 @@ NI-DAQmx 关闭报错且原生句柄已丢失时，显示“原生清理未确�
 | DG4000、SIGLENT SSG、通用 SCPI | PyVISA | 支持设备的 x64 VISA 实现，例如 NI-VISA；按 USB/LAN 配置通信 |
 | NI 计数与模拟输入 | nidaqmx Python 接口 | NI-DAQmx 系统驱动及正确识别的 NI 设备 |
 | Newport SMC100CC / PR50CC | pyserial | 设备所用 USB 转串口驱动、可用 COM 端口 |
-| Vaunix LMS/BLX | Python SDK 绑定；0.7.23 发行包内置 SDK 1.15 的 Windows x64 `vnx_fmsynth.dll` | 设备要求的 Windows USB/系统驱动 |
+| Vaunix LMS/BLX | Python SDK 绑定；0.7.24 发行包内置 SDK 1.15 的 Windows x64 `vnx_fmsynth.dll` | 设备要求的 Windows USB/系统驱动 |
 
 0.7.15 构建脚本将主目录提供的 Vaunix SDK DLL 内置到便携 ZIP 和单文件 EXE，构建后须在清单中确认 `vaunix_dll_bundled=true`。目录包的位置为 `_internal/vendor/vaunix/vnx_fmsynth.dll`；单文件 EXE 启动时将它随内置运行时解压到临时目录的 `vendor/vaunix/`。清单确认携带后，无需安装 SDK、复制外置 DLL 或设置环境变量，迁移时保留完整目录包或单文件 EXE 即可携带。
 
@@ -178,9 +180,9 @@ Get-Content ".\bundle-report.json"
 校验示例：
 
 ```powershell
-Get-FileHash ".\Lab-Control-Center-0.7.23-windows-x64-setup.exe" -Algorithm SHA256
-Get-FileHash ".\Lab-Control-Center-0.7.23-windows-x64-portable.zip" -Algorithm SHA256
-Get-FileHash ".\Lab-Control-Center-0.7.23-windows-x64.exe" -Algorithm SHA256
+Get-FileHash ".\Lab-Control-Center-0.7.24-windows-x64-setup.exe" -Algorithm SHA256
+Get-FileHash ".\Lab-Control-Center-0.7.24-windows-x64-portable.zip" -Algorithm SHA256
+Get-FileHash ".\Lab-Control-Center-0.7.24-windows-x64.exe" -Algorithm SHA256
 ```
 
 ## 7. 开发者构建
@@ -208,10 +210,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1 -V
 
 ```text
 dist/release/
-├─ Lab-Control-Center-0.7.23-windows-x64-setup.exe
-├─ Lab-Control-Center-0.7.23-windows-x64-portable.zip
-├─ Lab-Control-Center-0.7.23-windows-x64.exe
-├─ Lab-Control-Center-0.7.23-windows-x64-source.zip
+├─ Lab-Control-Center-0.7.24-windows-x64-setup.exe
+├─ Lab-Control-Center-0.7.24-windows-x64-portable.zip
+├─ Lab-Control-Center-0.7.24-windows-x64.exe
+├─ Lab-Control-Center-0.7.24-windows-x64-source.zip
 ├─ RELEASE-NOTES.md
 ├─ SHA256SUMS.txt
 └─ release-manifest.json
@@ -230,6 +232,8 @@ dist/release/
 当前只提供 Windows x64；没有提供 Windows x86、Linux 或 macOS 发行包。新版本需重新构建安装程序、便携 ZIP 和独立 EXE，不应以更新根目录小启动器替代发行打包。
 
 ## 8. 本版记录
+
+0.7.24 修复已有 SIM DG4000/NI 配置重新启动时误加载 VISA/DAQ 探测的问题。首次迁移的实际复查证明 0.7.23 安装保留原数据；当时 180 秒不退出的自检是后台探测占用导致首次关闭被拒绝，受控心跳确认界面事件循环仍正常。具体复现、修复与本版验证范围见 [0.7.24 说明](NOTES-0.7.24.md)，正式构建及发布结果以本组清单和实际发布页为准。
 
 0.7.23 新增安装程序 EXE、安装版自动升级与数据备份/恢复，按用户要求作为 [v0.7.23 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.23) 发行，详见[本版记录](NOTES-0.7.23.md)；原自动下载和更新提示实现分别见[0.7.22](NOTES-0.7.22.md)及[0.7.21](NOTES-0.7.21.md)。更新仅选择比当前版本更高的正式版，不会下载旧版进行降级。
 

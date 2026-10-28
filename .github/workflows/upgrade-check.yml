@@ -1,0 +1,48 @@
+name: Published installed automatic upgrade
+
+on:
+  workflow_dispatch:
+    inputs:
+      previous_tag:
+        description: Unmodified published installed version (pinned v0.7.23)
+        required: true
+        default: v0.7.23
+      target_tag:
+        description: Published target (must be the actual latest stable release)
+        required: true
+        default: v0.7.24
+
+permissions:
+  contents: read
+
+jobs:
+  published-upgrade:
+    # The real production identity is safe only on this fresh disposable runner.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          architecture: x64
+      - name: Verify published Setup, normal automatic update, and preserved data
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+        run: |
+          python tools/verify_published_upgrade.py --previous-tag "$env:PREVIOUS_TAG" --target-tag "$env:TARGET_TAG" --diagnostics-dir "$env:RUNNER_TEMP/published-upgrade-diagnostics"
+          exit $LASTEXITCODE
+      - name: Upload published-upgrade evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: published-upgrade-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/published-upgrade-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14

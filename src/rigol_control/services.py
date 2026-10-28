@@ -9,7 +9,7 @@ from .drivers.vaunix_lms import (
     format_dll_version,
 )
 from .models import DeviceKind, DeviceRecord
-from .virtual_lab import VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE
+from .virtual_lab import VIRTUAL_DG_RESOURCE, VIRTUAL_NI_RESOURCE, is_virtual_resource
 
 
 class ProbeState(str, Enum):
@@ -172,12 +172,21 @@ class DeviceProbeService:
     """Best-effort discovery with optional instrument packages loaded lazily."""
 
     def probe(self, record: DeviceRecord) -> ProbeResult:
+        # Saved simulators are initially disconnected on application restart.
+        # Probe them locally, using the same resource rule as connection setup.
+        if is_virtual_resource(record.resource):
+            if record.kind in {DeviceKind.DG4000, DeviceKind.GENERIC_SCPI}:
+                return ProbeResult(ProbeState.ONLINE, "虚拟信号源可用",
+                                   "RIGOL TECHNOLOGIES,DG4162-VIRTUAL,SIM0001,00.01")
+            if record.kind is DeviceKind.NI_DAQ:
+                return ProbeResult(ProbeState.ONLINE, "虚拟 NI 设备可用",
+                                   "NI USB-6363 VIRTUAL · SIM0001")
         if record.kind is DeviceKind.SIGLENT_SSG:
-            if record.resource.startswith("SIM::"):
+            if is_virtual_resource(record.resource):
                 return ProbeResult(ProbeState.ONLINE, "虚拟鼎阳设备可用", "SIGLENT,SSG6082A-V,SIMSSG001,1.0")
             return ProbeResult(ProbeState.UNCHECKED, "点击连接读取身份；后台不另开仪器会话")
         if record.kind is DeviceKind.NEWPORT_SMC100:
-            if record.resource.startswith("SIM::"):
+            if is_virtual_resource(record.resource):
                 return ProbeResult(ProbeState.ONLINE, "虚拟旋转台可用", "SMC100CC VIRTUAL / PR50CC")
             # Never open a background probe session on an actively used serial port.
             return ProbeResult(ProbeState.UNCHECKED, "串口探测不打开设备；点击连接读取 SMC100CC 身份")
@@ -189,7 +198,7 @@ class DeviceProbeService:
 
     @staticmethod
     def _probe_vaunix(record: DeviceRecord) -> ProbeResult:
-        if record.resource.strip().upper().startswith("SIM::"):
+        if is_virtual_resource(record.resource):
             return ProbeResult(
                 ProbeState.ONLINE,
                 "虚拟设备可用",
