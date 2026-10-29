@@ -2,7 +2,7 @@
 
 文档版本：1.15
 
-对应软件版本：0.7.29 本地修复候选（DG 回读单位跟随与 VISA 回复同步；正式下载仍为 0.7.28，第 12 节保留各版记录）
+对应软件版本：0.7.29（DG 回读单位跟随与 VISA 回复同步；正式发行及前期候选记录见第 12 节）
 
 最后更新：2026-10-29
 适用仓库：`Rigol_Generator_GUI`
@@ -460,7 +460,14 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 
 ## 12. 版本开发日志
 
-### 0.7.29 本地修复候选：DG 单位跟随与 VISA 回复同步 — 2026-10-29
+### 0.7.29 GitHub 正式发行 — 2026-10-29
+
+- 用户明确授权将 v0.7.29 推送 GitHub 并发布新 Release。本次同步下载入口、文件示例及正式副本目录；发布文档提交参加新 v0.7.29 标签工作流，重新构建、回归、冻结与隔离安装验证后发布，不预写尚未产生的新标签构建成功或提交 SHA。
+- 正式安装 EXE、便携 ZIP、独立 EXE 与同组附件本地保存至 `dist/published/v0.7.29/`。三种程序格式内置 Python/Qt、Python 仪器接口及 Vaunix x64 SDK DLL；正式运行副本沿用用户 DATA。保留原 `dist/local/v0.7.29/` 候选（源码 `3237f58`）、0.7.28 正式/候选与历史交付，不覆盖旧包。
+- 前期 `3237f58` 候选 Windows 检查为 809 项、114.617 秒通过；`main` 候选构建为 809 项、132.680 秒通过，三种冻结自检、隔离安装验收和回复同步八项标志全部验证。以下本机 809 项/107.475 秒及首次 VRMS fixture 失败/修正记录仍保留；候选结果不代替本次新标签验收，正式结果以对应工作流及 `release-manifest.json` 为准。
+- 本次仅修改发布文档，应用、测试和版本号保持 0.7.29。仍不把截图/FIFO 替身复现当作用户 DG4162 USB 的硬件根因或实机修复证明；首次 query 起算的剩余预算不能抢断底层 I/O，回复未同步仍需停止任务后显式断开、连接、手动回读。
+
+### 0.7.29 开发修复与本地候选：DG 单位跟随与 VISA 回复同步 — 2026-10-29
 
 用户 DG4162 + USB 截图显示上方为 mVpp、底部仍为 Vpp，另有数值查询 `:SOUR1:VOLT:HIGH?` 收到 `VPP`。本轮分别建立显示和传输复现；不能从截图证明实机空帧的硬件/固件原因，也不将软件替身复现当作用户实机已验收。
 
@@ -471,9 +478,9 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 
 实际源码验证记录位于 `dist/verification/0.7.29/`：新增 6 项单位跟随 UI 回归先复现失败后通过，已有 UI/自动回读等组合 35 项、24.875 秒通过。新增 18 项传输空帧回归，连同相邻恢复/驱动共 111 项、5.795 秒通过，日志 `visa-framing-adjacent-final.log`；DG 回读驱动 27 项、0.085 秒通过，新增一项错误类型回归覆盖 HIGH/LOW/FREQ/VOLT × VPP/VRMS/DBM 的 12 个子场景，确认标记未同步且立即停止整组。最终 `full-unittest.log` 共 809 项、107.475 秒、OK，1 项因本机 Windows 符号链接权限跳过。
 
-`source-self-test.json` 成功，新增 `dg_readback_reply_alignment` 八项标志均为 true，`hardware_access=false`；原自动回读八项、显示单位和电平差检查继续通过。初次自检的 mVpp 测试场景误用前段留下的原生 VRMS 配置，保留 `source-self-test-initial-vrms-fixture.json`；仅补齐虚拟 fixture 的原生 VPP 设置后重跑成功，未把应用的 Vrms 保留规则改成错误换算。远程 CI 与冻结/安装交付仍按本版后续实际记录，不预写成功。依据为原厂 CHM 和 PyVISA 官方[通信资源说明](https://pyvisa.readthedocs.io/en/latest/introduction/resources.html)、[MessageBasedResource 源码](https://pyvisa.readthedocs.io/en/latest/_modules/pyvisa/resources/messagebased.html)。
+`source-self-test.json` 成功，新增 `dg_readback_reply_alignment` 八项标志均为 true，`hardware_access=false`；原自动回读八项、显示单位和电平差检查继续通过。初次自检的 mVpp 测试场景误用前段留下的原生 VRMS 配置，保留 `source-self-test-initial-vrms-fixture.json`；仅补齐虚拟 fixture 的原生 VPP 设置后重跑成功，未把应用的 Vrms 保留规则改成错误换算。该阶段尚未记录远程 CI 与冻结/安装交付，后续候选与正式发布安排见上方独立记录，不预写新标签成功。依据为原厂 CHM 和 PyVISA 官方[通信资源说明](https://pyvisa.readthedocs.io/en/latest/introduction/resources.html)、[MessageBasedResource 源码](https://pyvisa.readthedocs.io/en/latest/_modules/pyvisa/resources/messagebased.html)。
 
-本轮源码版本升至 0.7.29，作为本地修复候选，不创建标签或 GitHub Release；正式下载继续 0.7.28。新候选交付目录使用 `dist/local/v0.7.29/`，生成情况和实际验收以本组清单为准；保留 0.7.28 正式/候选、旧版与用户数据。详情见[0.7.29 说明](../release/NOTES-0.7.29.md)。
+该阶段源码版本升至 0.7.29，当时作为本地修复候选，不创建标签或 GitHub Release，正式下载继续 0.7.28。候选交付目录使用 `dist/local/v0.7.29/`；随后用户明确授权新正式发行，见上方正式发行记录。保留 0.7.28 正式/候选、旧版与用户数据，详情见[0.7.29 说明](../release/NOTES-0.7.29.md)。
 
 ### 0.7.28 GitHub 正式发行 — 2026-10-29
 
