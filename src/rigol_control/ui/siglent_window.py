@@ -14,12 +14,15 @@ from PyQt6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QVB
                              QHeaderView)
 
 from ..connections import DeviceConnectionManager
+from ..readback import ReadbackDeferred
 from .. import __version__
 from ..units import from_base, roundtrip_number, to_base, unit_specs
 from ..drivers.scpi import ScpiError
-from ..drivers.siglent_ssg import (SiglentSsgDriver, SsgModulation, SsgPoint, SsgSweep,
+from ..drivers.siglent_ssg import (SiglentSsgDriver, SsgModulation, SsgOutputReadback, SsgPoint, SsgSweep,
                                   SsgCommandError, VIRTUAL_SSG_RESOURCE, capabilities)
+from ..drivers.dg4000 import parse_output_state
 from .device_windows import BaseDeviceWindow, UnitValueWidget, page_shell, panel, value_spin
+from .auto_readback import AutoReadback, window_readback_activity
 from .widgets import metric_card
 
 
@@ -80,6 +83,18 @@ class SiglentWindow(BaseDeviceWindow):
             ("触发步进扫描", lambda: self._sweep_page("STEP")),
             ("列表扫描", lambda: self._sweep_page("LIST")),
             ("模拟调制", self._mod_page), ("状态与诊断", self._diagnostics_page)], parameter_repository)
+        self.auto_readback = AutoReadback(
+            self, refresh=lambda: self._refresh_output_readback(automatic=True),
+            invalidate=self._invalidate_output_readback,
+            activity=lambda: window_readback_activity(self),
+            connected=lambda: self.session.is_connected,
+            generation=lambda: self.session.connection_generation,
+            pending=lambda: self._output_readback_pending,
+            ready=lambda: ((not self._busy or self._output_readback_pending)
+                           and not self._pending_safety
+                           and len(self._call_tasks) <= (1 if self._output_readback_pending else 0)),
+        )
+        self.auto_readback_checkbox.toggled.connect(self.auto_readback.set_enabled)
         self.pages.currentChanged.connect(self._scan_page_selected)
         self.log.appendPlainText(self.runtime_info.text())
         self.poll_timer = QTimer(self)
@@ -163,7 +178,7 @@ class SiglentWindow(BaseDeviceWindow):
         row = QHBoxLayout()
         self._button(row, "应用频率", self.apply_frequency, write=True)
         self._button(row, "应用幅度", self.apply_power, write=True)
-        self._button(row, "RF 开启", lambda: self._run(lambda: self.driver.set_output(True)), write=True)
+        self._button(row, "RF 开启", lambda: self._run(lambda: self.driver.set_output(True), after_write=True), write=True)
         self._button(row, "RF 关闭", lambda: self._safety(lambda: self.driver.set_output(False)))
         layout.addLayout(row)
         self.rf_status = QLabel("射频状态：尚未回读")
@@ -174,7 +189,8 @@ class SiglentWindow(BaseDeviceWindow):
         return self._scroll(page)
 
     def _output_readback_panel(self):
-        monitor, monitor_layout = panel("仪器频率与幅度回读 · 手动快照")
+        monitor, monitor_layout = panel("仪器频率与幅度回读")
+        monitor.setProperty("skipDeviceParameterPersistence", True)
         self.output_readback_widget = monitor
         row = QHBoxLayout()
         self.output_readback_button = QPushButton("回读频率 / 幅度")
@@ -185,6 +201,9 @@ class SiglentWindow(BaseDeviceWindow):
         row.addWidget(self.output_readback_button)
         row.addWidget(self.output_readback_status, 1)
         monitor_layout.addLayout(row)
+        self.auto_readback_checkbox = QCheckBox("自动回读（下发后 / 触发空隙）")
+        self.auto_readback_checkbox.setChecked(True)
+        monitor_layout.addWidget(self.auto_readback_checkbox)
         cards = QHBoxLayout()
         for key, caption in (("frequency", "载波频率"), ("amplitude", "幅度"), ("output", "RF 输出")):
             card, value = metric_card(caption, "未知")
@@ -215,7 +234,7 @@ class SiglentWindow(BaseDeviceWindow):
             self._invalidate_output_readback("连接已变化 · 请重新回读")
             self._output_readback_generation = None
 
-    def _refresh_output_readback(self):
+    def _refresh_output_readback(self, *, automatic=False):
         if self._busy or self._output_readback_pending:
             return
         if not self.session.is_connected or not self.driver.caps.known:
@@ -224,6 +243,7 @@ class SiglentWindow(BaseDeviceWindow):
             return
         self._invalidate_output_readback("正在回读仪器频率、幅度与 RF 输出…")
         token = self._output_readback_token
+        ticket = self.auto_readback.capture(automatic)
         generation = self.session.connection_generation
         self._output_readback_generation = generation
         self._output_readback_pending = True
@@ -231,6 +251,16 @@ class SiglentWindow(BaseDeviceWindow):
         self._update_buttons()
 
         def work():
+            if automatic:
+                try:
+                    with self.session.try_transaction() as acquired:
+                        if not acquired or not self.auto_readback.can_continue(ticket):
+                            raise ReadbackDeferred()
+                        reading = self.driver.read_output_parameters(
+                            should_continue=lambda: self.auto_readback.can_continue(ticket))
+                        return reading, datetime.now().astimezone()
+                except ReadbackDeferred:
+                    return None
             with self.session.transaction():
                 if not self.session.is_connected or self.session.connection_generation != generation:
                     raise SsgCommandError("连接已变化，旧连接的回读已取消")
@@ -238,27 +268,36 @@ class SiglentWindow(BaseDeviceWindow):
 
         def completed(result):
             try:
-                if token != self._output_readback_token:
+                if result is None:
+                    self.auto_readback.finish(ticket, "deferred")
+                    if token == self._output_readback_token:
+                        self._invalidate_output_readback("自动回读等待通信 / 安全操作完成")
+                    return
+                if token != self._output_readback_token or not self.auto_readback.accepts(ticket):
+                    self.auto_readback.finish(ticket, "stale")
+                    if token == self._output_readback_token:
+                        self._invalidate_output_readback("参数或连接已变化 · 等待最新回读")
                     return
                 reading, read_at = result
                 if (not self.session.is_connected or self.session.connection_generation != generation
                         or reading.connection_generation != generation):
                     self._invalidate_output_readback("连接已变化 · 回读值未知，请重新回读")
+                    self.auto_readback.finish(ticket, "stale")
                     return
-                self.output_readback_values["frequency"].setText(f"{roundtrip_number(reading.frequency_hz)} Hz")
-                self.output_readback_values["amplitude"].setText(f"{roundtrip_number(reading.power_dbm)} dBm")
-                self.output_readback_values["output"].setText("开启" if reading.output_enabled else "关闭（未输出）")
-                self.output_readback_status.setText(f"回读时间：{read_at:%Y-%m-%d %H:%M:%S}（本地） · 点击可刷新")
+                self._display_output_readback(reading, read_at)
+                self.auto_readback.finish(ticket, "success")
             except Exception as exc:
                 self._invalidate_output_readback(f"回读显示失败 · 本次结果已丢弃：{exc}")
+                self.auto_readback.finish(ticket, "failure")
                 self._error(f"SSG 参数回读显示失败：{exc}")
             finally:
                 finish()
 
         def failed(message):
             try:
+                self.auto_readback.finish(ticket, "failure")
                 if token == self._output_readback_token:
-                    self._invalidate_output_readback(f"回读失败 · 频率、幅度和 RF 状态未知：{message}")
+                    self._invalidate_output_readback(f"回读失败 · 自动回读已暂停，频率、幅度和 RF 状态未知：{message}")
                     self._error(f"SSG 参数回读失败：{message}")
             finally:
                 finish()
@@ -270,6 +309,26 @@ class SiglentWindow(BaseDeviceWindow):
             self._finished()
 
         self.submit(work, on_success=completed, on_error=failed)
+
+    def _display_output_readback(self, reading, read_at):
+        self.output_readback_values["frequency"].setText(f"{roundtrip_number(reading.frequency_hz)} Hz")
+        self.output_readback_values["amplitude"].setText(f"{roundtrip_number(reading.power_dbm)} dBm")
+        self.output_readback_values["output"].setText("开启" if reading.output_enabled else "关闭（未输出）")
+        self.output_readback_status.setText(f"回读时间：{read_at:%Y-%m-%d %H:%M:%S}（本地） · 点击可刷新")
+
+    def _snapshot_output_readback(self, snapshot, generation):
+        """Reuse a complete RF snapshot already queried by a write/native poll."""
+        try:
+            frequency = float(snapshot[":FREQuency"])
+            power = float(snapshot[":POWer"])
+            output = parse_output_state(snapshot[":OUTPut"])
+            if not math.isfinite(frequency) or frequency <= 0 or not math.isfinite(power):
+                raise ValueError("频率或幅度不是有效有限数值")
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise SsgCommandError(f"自动回读三项参数无效：{exc}") from exc
+        if not self.session.is_connected or self.session.connection_generation != generation:
+            raise SsgCommandError("连接已变化，自动回读结果已丢弃")
+        return SsgOutputReadback(frequency, power, output, generation)
 
     def _sweep_page(self, kind):
         is_step = kind == "STEP"
@@ -331,12 +390,12 @@ class SiglentWindow(BaseDeviceWindow):
         self._button(row, "启用 / 布防", lambda: self.start_sweep(kind), write=True)
         self._button(row, "执行单次", lambda: self.start_sweep(kind, single=True), write=True)
         self._button(row, "停止扫描", lambda: self._safety(self.driver.stop))
-        self._button(row, "发送全局 *TRG", lambda: self._run(self.driver.bus_trigger), write=True)
+        self._button(row, "发送全局 *TRG", lambda: self._run(self.driver.bus_trigger, after_write=True), write=True)
         layout.addLayout(row)
         if self.record.resource == VIRTUAL_SSG_RESOURCE:
             row = QHBoxLayout()
             for label, value in (("模拟外部沿", "EXT"), ("模拟面板按键", "KEY")):
-                self._button(row, label, lambda v=value: self._run(lambda: self.session.write(":SIM:TRIGger " + v)), write=True)
+                self._button(row, label, lambda v=value: self._run(lambda: self.session.write(":SIM:TRIGger " + v), after_write=True), write=True)
             layout.addLayout(row)
         note = QLabel("外部触发线直接接仪器；*TRG 会同时触发其他 BUS 功能。停止扫描不关闭 RF。")
         note.setObjectName("Muted")
@@ -436,7 +495,7 @@ class SiglentWindow(BaseDeviceWindow):
         layout.addLayout(form)
         self._button(layout, "应用调制配置", self.apply_modulation, write=True)
         self._button(layout, "读取调制状态", self.refresh_modulation)
-        self._button(layout, "触发脉冲（全局 *TRG）", lambda: self._run(self.driver.pulse_bus_trigger), write=True)
+        self._button(layout, "触发脉冲（全局 *TRG）", lambda: self._run(self.driver.pulse_bus_trigger, after_write=True), write=True)
         bus_note = QLabel("BUS：先应用配置，再按触发按钮；每次只发送一个 *TRG。该命令也可能触发设为 BUS 的扫描或低频功能，不自动打开 RF。")
         bus_note.setWordWrap(True)
         layout.addWidget(bus_note)
@@ -548,7 +607,7 @@ class SiglentWindow(BaseDeviceWindow):
         except (ValueError, AttributeError) as exc:
             self._error(f"列表存在无效数字：{exc}")
             return
-        self._run(lambda: self.driver.prepare_sweep(config))
+        self._run(lambda: self.driver.prepare_sweep(config), after_write=True)
 
     def _sweep_config(self, kind=None):
         kind = kind or self._selected_sweep_kind
@@ -563,19 +622,19 @@ class SiglentWindow(BaseDeviceWindow):
             self._error(str(exc))
             return
         self._clear_scan_preview("重新布防，等待读取当前扫描值。")
-        self._run(self.driver.execute_single if single else self.driver.start)
+        self._run(self.driver.execute_single if single else self.driver.start, after_write=True)
 
     def apply_frequency(self):
         value = self.frequency.value()
-        self._run(lambda: self.driver.set_frequency(value))
+        self._run(lambda: self.driver.set_frequency(value), after_write=True)
 
     def apply_power(self):
         value = self.power.value()
-        self._run(lambda: self.driver.set_power(value))
+        self._run(lambda: self.driver.set_power(value), after_write=True)
 
     def apply_modulation(self):
         config = SsgModulation(**self._values("mod"))
-        self._run(lambda: self.driver.apply_modulation(config), read_modulation=True)
+        self._run(lambda: self.driver.apply_modulation(config), read_modulation=True, after_write=True)
 
     def refresh_modulation(self):
         self._run(lambda: None, read_modulation=True)
@@ -589,7 +648,8 @@ class SiglentWindow(BaseDeviceWindow):
 
     def send_raw(self):
         command = self.command.text()
-        self._run(lambda: self.driver.raw(command), callback=lambda result: self.log.appendPlainText(f"> {command}\n{result}"))
+        self._run(lambda: self.driver.raw(command), callback=lambda result: self.log.appendPlainText(f"> {command}\n{result}"),
+                  after_write=not command.strip().endswith("?"))
 
     def connect_device(self):
         self._invalidate_output_readback("正在连接 · 请连接完成后重新回读")
@@ -621,7 +681,19 @@ class SiglentWindow(BaseDeviceWindow):
     def _poll(self):
         self._sync_output_readback_connection()
         if self.session.is_connected and not self._busy and self.driver.state == "enabled":
-            self._run(lambda: None, read_current_point=self.scan_preview_auto.isChecked())
+            if ((self.auto_readback.paused or not self.auto_readback_checkbox.isChecked())
+                    and not self.scan_preview_auto.isChecked()):
+                # Keep essential scan/lease confirmation alive after a basic
+                # readback failure, without repeating the failed RF queries.
+                def state_received(state):
+                    active = self.driver.state == "enabled"
+                    self.live_status.setText("扫描：" + ("已启用 / 等待触发或运行" if active else "已关闭"))
+                    self.sweep_status.setText(f"扫描状态：{state}；频率/幅度自动回读已暂停或关闭。")
+                    if not active:
+                        self._clear_scan_preview("扫描未启用，当前扫描值不可用。")
+                self._run(self.driver.read_sweep_state, callback=state_received, read_snapshot=False)
+            else:
+                self._run(lambda: None, read_current_point=self.scan_preview_auto.isChecked())
 
     def refresh_scan_preview(self):
         if not self._busy:
@@ -670,14 +742,15 @@ class SiglentWindow(BaseDeviceWindow):
             self.log.appendPlainText(message)
             self.statusBar().showMessage(message, 20000)
         def dispatch():
-            self._run(work, callback=finished, read_snapshot=False)
+            self._run(work, callback=finished, read_snapshot=False, after_write=True)
         if self._busy:
             self._pending_safety.append(dispatch)
             self.statusBar().showMessage("停止 / RF 关闭已排队，当前通信结束后优先执行")
         else:
             dispatch()
 
-    def _run(self, operation, callback=None, *, read_modulation=False, read_current_point=False, read_snapshot=True):
+    def _run(self, operation, callback=None, *, read_modulation=False, read_current_point=False, read_snapshot=True,
+             after_write=False):
         if self._busy:
             return
         try:
@@ -687,10 +760,20 @@ class SiglentWindow(BaseDeviceWindow):
             return
         self._busy = True
         self._update_buttons()
+        generation = self.session.connection_generation
         def work():
             phase = "操作"
             try:
-                result = operation()
+                if after_write:
+                    with self.session.transaction():
+                        try:
+                            result = operation()
+                        finally:
+                            # Unknown acceptance must invalidate older reads,
+                            # while the failed write is never replayed.
+                            self.connection_manager.note_output_change(self.record)
+                else:
+                    result = operation()
                 phase = "状态读取"
                 snapshot = self.driver.snapshot(include_modulation=read_modulation,
                                                 include_current_point=read_current_point) if read_snapshot else None
@@ -712,7 +795,21 @@ class SiglentWindow(BaseDeviceWindow):
                 self._show_identity()
                 if snapshot is not None:
                     self._show_snapshot(snapshot)
+                    if (self.auto_readback_checkbox.isChecked() and not self.auto_readback.paused
+                            and not self._pending_safety
+                            and (after_write or self.driver.state == "enabled")):
+                        # These three basic replies are already in the native
+                        # snapshot. Reuse them rather than appending queries.
+                        reading = self._snapshot_output_readback(snapshot, generation)
+                        ticket = self.auto_readback.capture()
+                        self._display_output_readback(reading, datetime.now().astimezone())
+                        self.auto_readback.finish(ticket, "success")
+                elif after_write and not validation_error:
+                    self.auto_readback.request()
                 if validation_error:
+                    if after_write or self.driver.state == "enabled":
+                        self._invalidate_output_readback("本次状态回读未完成 · 参数未知，自动回读已暂停")
+                        self.auto_readback.finish(self.auto_readback.capture(), "failure")
                     if read_current_point:
                         self.scan_preview_auto.setChecked(False)
                         self._clear_scan_preview("当前值读取未完成，自动刷新已停止；详见状态与诊断。")
@@ -728,6 +825,8 @@ class SiglentWindow(BaseDeviceWindow):
                 # frozen entry point exits on them. Contain this operation here.
                 self.scan_preview_auto.setChecked(False)
                 self._clear_scan_preview("结果处理失败，当前值未知；自动刷新已停止。")
+                self._invalidate_output_readback("本次回读显示失败 · 参数未知，自动回读已暂停")
+                self.auto_readback.finish(self.auto_readback.capture(), "failure")
                 self.driver_status.setText("● 已连接 · 本次结果显示失败" if self.session.is_connected else "● 未连接 · 本次结果显示失败")
                 self.rf_status.setText("本次结果未能完整显示，RF / 幅度以仪器回读或面板为准。")
                 self._error(f"结果处理失败：{exc}\n{traceback.format_exc()}")
@@ -737,6 +836,7 @@ class SiglentWindow(BaseDeviceWindow):
                 self._finished()
         def failure(message):
             self._invalidate_output_readback("通信失败 · 回读值未知")
+            self.auto_readback.finish(self.auto_readback.capture(), "failure")
             self.scan_preview_auto.setChecked(False)
             self._clear_scan_preview("通信失败，当前值未知；自动刷新已停止。")
             self._show_identity()
@@ -949,6 +1049,8 @@ class SiglentWindow(BaseDeviceWindow):
                     pass  # A changed or invalid cell must be interpreted from its visible text.
 
     def closeEvent(self, event):
+        self.auto_readback_checkbox.setChecked(False)
+        self.auto_readback.stop()
         if self._busy or self._call_tasks or self._pending_safety or self.connection_manager.lease_owner(self.record.id) == self.owner:
             self._error("扫描启用或状态未确认：请停止并成功回读后关闭窗口")
             event.ignore()

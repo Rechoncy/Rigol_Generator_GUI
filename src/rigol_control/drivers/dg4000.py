@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
 from .scpi import ScpiSession
+from ..readback import ReadbackDeferred, check_readback_allowed
 from ..units import roundtrip_number
 
 
@@ -417,7 +419,9 @@ class DG4000Driver:
     def output_states(self) -> tuple[bool, bool]:
         return (self.output_enabled(1), self.output_enabled(2))
 
-    def read_output_parameters(self, channels=(1, 2)) -> tuple[DG4000OutputReadback, ...]:
+    def read_output_parameters(
+        self, channels=(1, 2), *, should_continue: Callable[[], bool] | None = None,
+    ) -> tuple[DG4000OutputReadback, ...]:
         """Read a complete channel group without writes or automatic recovery.
 
         All queries share a transaction with parameter stepping. Recognized
@@ -437,10 +441,15 @@ class DG4000Driver:
             validate_channel(channel)
 
         def query(command: str) -> str:
+            check_readback_allowed(should_continue)
             try:
-                return self.session.query(command, recover=False)
+                result = self.session.query(command, recover=False)
+            except ReadbackDeferred:
+                raise
             except Exception as exc:
                 raise RuntimeError(f"DG4000 回读失败 [{command}]：{exc}") from exc
+            check_readback_allowed(should_continue)
+            return result
 
         def number(command: str, *, non_negative: bool = False) -> float:
             raw = query(command)
@@ -500,6 +509,7 @@ class DG4000Driver:
             )
 
         results = []
+        check_readback_allowed(should_continue)
         with self.session.transaction():
             generation = self.session.connection_generation
             for channel in selected:
@@ -531,6 +541,7 @@ class DG4000Driver:
                 ))
             if self.session.connection_generation != generation:
                 raise RuntimeError("DG4000 回读期间连接已变化，本组回读结果已丢弃")
+            check_readback_allowed(should_continue)
         return tuple(results)
 
     def set_output_load(self, channel: int, load_ohms: int | None) -> None:

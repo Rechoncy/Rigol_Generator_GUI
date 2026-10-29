@@ -53,7 +53,7 @@ class DgNativeChannelUiTests(unittest.TestCase):
     def test_native_sweep_and_burst_snapshot_selected_channel_before_async_write(self) -> None:
         queued = []
 
-        def submit(operation, *, on_success=None, on_error=None):
+        def submit(operation, *, on_success=None, on_error=None, after_write=False):
             queued.append((operation, on_success))
 
         self.window.submit = submit

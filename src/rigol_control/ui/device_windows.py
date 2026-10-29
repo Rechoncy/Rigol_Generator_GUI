@@ -61,6 +61,7 @@ from ..drivers.ni_counter import NIDaqEdgeCounter
 from ..drivers.scpi import ScpiSession
 from ..models import DeviceKind, DeviceRecord
 from ..repository import DeviceParameterRepository, default_data_dir
+from ..readback import ReadbackDeferred
 from ..scan import (
     MAX_SCAN_AXES,
     ScanAxis,
@@ -75,6 +76,7 @@ from ..trigger import ControllerState, TriggerSnapshot, TriggerStepController
 from ..units import default_unit, from_base, roundtrip_number, to_base, unit_spec, unit_specs
 from ..virtual_lab import is_virtual_resource
 from .snapshot_bridge import SnapshotBridge
+from .auto_readback import AutoReadback, window_readback_activity
 from .waveform import WaveformPlot
 from .widgets import CallTask, metric_card
 
@@ -669,11 +671,13 @@ class DG4000Window(BaseDeviceWindow):
         self.trigger_bridge = TriggerBridge()
         self.trigger_bridge.updated.connect(self._trigger_updated)
         self._last_trigger_error: str | None = None
+        self._last_local_auto_step = None
         self._ui_connected = False
         self._output_readback_pending = False
         self._output_readback_token = 0
         self._output_readback_generation: int | None = None
         self._output_readback_snapshot: tuple[DG4000OutputReadback, ...] = ()
+        self._output_readback_ticket = None
         self.output_readback_values: dict[int, dict[str, QLabel]] = {}
         self.output_readback_units: dict[int, QComboBox] = {}
         self._ni_source_signature: tuple[tuple[str, str, str, bool], ...] = ()
@@ -692,6 +696,18 @@ class DG4000Window(BaseDeviceWindow):
         ]
         super().__init__(record, navigation, parameter_repository)
         self.trigger_bridge.setParent(self)
+        self.auto_readback = AutoReadback(
+            self, refresh=lambda: self._refresh_output_readback(automatic=True),
+            invalidate=self._invalidate_output_readback,
+            activity=lambda: window_readback_activity(self),
+            connected=lambda: self.driver.is_connected,
+            generation=lambda: self.driver.session.connection_generation,
+            pending=lambda: self._output_readback_pending,
+            ready=lambda: (len(self._call_tasks) <= int(self._output_readback_pending)
+                           and not self._trigger_stop_in_progress and not self._trigger_pending_stop
+                           and self._trigger_start_task is None),
+        )
+        self.auto_readback_checkbox.toggled.connect(self.auto_readback.set_enabled)
         if self.driver.is_connected:
             identity = (
                 self.connection_manager.info(record).identity
@@ -727,6 +743,7 @@ class DG4000Window(BaseDeviceWindow):
         on_success: Callable[[Any], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         allow_during_scan: bool = False,
+        after_write: bool = False,
     ) -> None:
         if allow_during_scan:
             super().submit(operation, on_success=on_success, on_error=on_error)
@@ -743,9 +760,27 @@ class DG4000Window(BaseDeviceWindow):
             # command cannot slip between the isolation check and arming.
             with self.driver.session.transaction():
                 self._require_manual_access()
-                return operation()
+                try:
+                    return operation()
+                finally:
+                    if after_write and self.connection_manager is not None:
+                        # Mark before releasing the I/O lock, including an
+                        # unknown accepted result; never replay the command.
+                        self.connection_manager.note_output_change(self.record)
 
-        super().submit(guarded_operation, on_success=on_success, on_error=on_error)
+        def completed(result):
+            if after_write and self.connection_manager is None:
+                self.auto_readback.request()
+            if on_success:
+                on_success(result)
+
+        def failed(message):
+            if after_write:
+                self._invalidate_output_readback("参数下发失败 · 输出状态未知，自动回读已暂停")
+                self.auto_readback.finish(self.auto_readback.capture(), "failure")
+            (on_error or self._show_hardware_error)(message)
+
+        super().submit(guarded_operation, on_success=completed, on_error=failed)
 
     def sync_connection_state(self) -> None:
         """Reflect connection changes made from the device center."""
@@ -1062,7 +1097,7 @@ class DG4000Window(BaseDeviceWindow):
         return scroll
 
     def _output_readback_panel(self) -> QWidget:
-        monitor, monitor_layout = panel("仪器频率与幅度回读 · 手动快照")
+        monitor, monitor_layout = panel("仪器频率与幅度回读 · 自动 / 手动快照")
         monitor.setProperty("skipDeviceParameterPersistence", True)
         self.output_readback_widget = monitor
         actions = QHBoxLayout()
@@ -1074,6 +1109,9 @@ class DG4000Window(BaseDeviceWindow):
         self.output_readback_status.setWordWrap(True)
         self.output_readback_status.setObjectName("Muted")
         actions.addWidget(self.output_readback_button)
+        self.auto_readback_checkbox = QCheckBox("自动回读（下发后 / 触发空隙）")
+        self.auto_readback_checkbox.setChecked(True)
+        actions.addWidget(self.auto_readback_checkbox)
         actions.addWidget(self.output_readback_status, 1)
         monitor_layout.addLayout(actions)
         channels = QHBoxLayout()
@@ -1103,7 +1141,8 @@ class DG4000Window(BaseDeviceWindow):
             channels.addWidget(card)
         monitor_layout.addLayout(channels)
         note = QLabel(
-            "回读仪器配置，不覆盖上方编辑值。峰峰电压可本地切换 Vpp / mVpp；dBm / Vrms 保留仪器单位。"
+            "回读仪器配置，不覆盖上方编辑值。自动回读合并下发事件，触发积压时让位；失败后暂停，可手动重试。"
+            "峰峰电压可本地切换 Vpp / mVpp；dBm / Vrms 保留仪器单位。"
             "单位未返回时，以高低电平差计算峰峰电压并标记为兼容回读，不推算 dBm。"
             "输出关闭时数值仅为配置。扫频或调制时的瞬时信号须由测量设备确认。"
         )
@@ -1129,6 +1168,7 @@ class DG4000Window(BaseDeviceWindow):
         self._output_readback_token += 1
         self._output_readback_generation = None
         self._output_readback_snapshot = ()
+        self._output_readback_ticket = None
         for combo in self.output_readback_units.values():
             combo.setEnabled(False)
         for values in self.output_readback_values.values():
@@ -1143,6 +1183,11 @@ class DG4000Window(BaseDeviceWindow):
         if not readings:
             return False
         generation = self.driver.session.connection_generation
+        if (self._output_readback_ticket is not None
+                and not self.auto_readback.cache_is_current(self._output_readback_ticket)):
+            self._invalidate_output_readback("参数或连接已变化 · 回读值未知，请重新回读")
+            self._set_output_metrics(None)
+            return False
         if (not self.driver.is_connected or generation != self._output_readback_generation
                 or any(item.connection_generation != generation for item in readings)):
             self._invalidate_output_readback("连接已变化 · 回读值未知，请重新回读")
@@ -1183,7 +1228,7 @@ class DG4000Window(BaseDeviceWindow):
                 values["amplitude"].setToolTip(f"仪器当前幅度参数：{amplitude}；未切换单位或负载")
         return True
 
-    def _refresh_output_readback(self) -> None:
+    def _refresh_output_readback(self, automatic: bool = False) -> None:
         if self._output_readback_pending:
             return
         if not self.driver.is_connected:
@@ -1192,6 +1237,7 @@ class DG4000Window(BaseDeviceWindow):
             return
         self._invalidate_output_readback("正在回读 CH1 / CH2…")
         token = self._output_readback_token
+        ticket = self.auto_readback.capture(automatic)
         generation = self.driver.session.connection_generation
         # The new request already belongs to this connection; the status timer
         # must preserve it even if a fast reconnect has not yet been observed.
@@ -1200,6 +1246,16 @@ class DG4000Window(BaseDeviceWindow):
         self._update_output_readback_buttons()
 
         def read_parameters():
+            if automatic:
+                with self.driver.session.try_transaction() as acquired:
+                    if not acquired or not self.auto_readback.can_continue(ticket):
+                        return ReadbackDeferred()
+                    try:
+                        readings = self.driver.read_output_parameters(
+                            should_continue=lambda: self.auto_readback.can_continue(ticket))
+                    except ReadbackDeferred as exc:
+                        return exc
+                    return readings, datetime.now().astimezone()
             with self.driver.session.transaction():
                 if not self.driver.is_connected or self.driver.session.connection_generation != generation:
                     raise RuntimeError("连接已变化，已取消旧连接的回读，请重新回读")
@@ -1209,8 +1265,21 @@ class DG4000Window(BaseDeviceWindow):
         def completed(result):
             self._output_readback_pending = False
             self._update_output_readback_buttons()
+            if isinstance(result, ReadbackDeferred):
+                self.auto_readback.finish(ticket, "deferred")
+                if token == self._output_readback_token:
+                    self._invalidate_output_readback("自动回读等待触发/通信空隙 · 当前值未知")
+                return
             readings, read_at = result
+            current = self.auto_readback.accepts(ticket)
+            self.auto_readback.finish(ticket, "success" if current else "stale")
             if token != self._output_readback_token:
+                return
+            if not current:
+                message = ("连接已变化 · 回读值未知，请重新回读"
+                           if not self.driver.is_connected or self.driver.session.connection_generation != generation
+                           else "参数或任务已变化 · 等待新的回读，当前值未知")
+                self._invalidate_output_readback(message)
                 return
             if (not self.driver.is_connected or self.driver.session.connection_generation != generation
                     or any(item.connection_generation != generation for item in readings)):
@@ -1218,6 +1287,7 @@ class DG4000Window(BaseDeviceWindow):
                 self._set_output_metrics(None)
                 return
             self._output_readback_snapshot = tuple(readings)
+            self._output_readback_ticket = ticket
             if not self._render_output_readback():
                 return
             compatible_channels = [f"CH{item.channel}" for item in readings
@@ -1228,15 +1298,16 @@ class DG4000Window(BaseDeviceWindow):
                 if compatible_channels else ""
             )
             self.output_readback_status.setText(
-                f"回读时间：{read_at:%Y-%m-%d %H:%M:%S}（本地）{compatibility} · 点击可刷新"
+                f"{'自动' if automatic else ''}回读时间：{read_at:%Y-%m-%d %H:%M:%S}（本地）{compatibility} · 点击可刷新"
             )
 
         def failed(message: str) -> None:
             self._output_readback_pending = False
             self._update_output_readback_buttons()
+            self.auto_readback.finish(ticket, "failure")
             if token != self._output_readback_token:
                 return
-            self._invalidate_output_readback(f"回读失败 · 频率、幅度和输出状态未知：{message}")
+            self._invalidate_output_readback(f"回读失败 · 自动回读已暂停，可手动重试 · 当前值未知：{message}")
             self._set_output_metrics(None)
             self.statusBar().showMessage(f"DG4000 参数回读失败：{message}", 10000)
 
@@ -1293,7 +1364,7 @@ class DG4000Window(BaseDeviceWindow):
             )
             self.statusBar().showMessage(f"CH{channel} 参数已下发", 4000)
 
-        self.submit(apply, on_success=applied)
+        self.submit(apply, on_success=applied, after_write=True)
 
     def _modulation_page(self) -> QWidget:
         page, layout = page_shell("调制", "覆盖 DG4000 的模拟调制、数字键控和脉宽调制设置。")
@@ -1389,6 +1460,7 @@ class DG4000Window(BaseDeviceWindow):
             on_success=lambda _=None: self.statusBar().showMessage(
                 f"{mode} 参数已下发到 CH{channel}", 4000
             ),
+            after_write=True,
         )
 
     def _sweep_burst_page(self) -> QWidget:
@@ -1520,6 +1592,7 @@ class DG4000Window(BaseDeviceWindow):
         self.submit(
             lambda: self.driver.write_channel_settings(channel, commands),
             on_success=lambda _=None: self.statusBar().showMessage(f"CH{channel} 扫频已启用", 4000),
+            after_write=True,
         )
 
     def _apply_burst(
@@ -1544,6 +1617,7 @@ class DG4000Window(BaseDeviceWindow):
         self.submit(
             lambda: self.driver.write_channel_settings(channel, commands),
             on_success=lambda _=None: self.statusBar().showMessage(f"CH{channel} 脉冲串已启用", 4000),
+            after_write=True,
         )
 
     def _trigger_step_page(self) -> QWidget:
@@ -2224,6 +2298,9 @@ class DG4000Window(BaseDeviceWindow):
             return
         controller.add_callback(self.trigger_bridge.begin_session())
         self.controller = controller
+        if self.connection_manager is not None:
+            self.connection_manager.watch_output_task(self._trigger_lease_owner, [self.record], controller)
+        self.auto_readback.reset()
         self._last_trigger_error = None
         self.trigger_start.setEnabled(False)
         self.trigger_start.setText("启动中…")
@@ -2327,6 +2404,11 @@ class DG4000Window(BaseDeviceWindow):
         self.statusBar().showMessage(message, 15000)
 
     def _trigger_updated(self, snapshot: TriggerSnapshot) -> None:
+        if self.connection_manager is None and snapshot.applied_count:
+            marker = (id(self.controller), snapshot.applied_count)
+            if marker != self._last_local_auto_step:
+                self._last_local_auto_step = marker
+                self.auto_readback.request()
         self.trigger_metrics["received"].setText(str(snapshot.received_count))
         self.trigger_metrics["applied"].setText(str(snapshot.applied_count))
         self.trigger_metrics["backlog"].setText(str(snapshot.backlog))
@@ -2576,6 +2658,7 @@ class DG4000Window(BaseDeviceWindow):
                 f"{'高阻' if load_ohms is None else f'{load_ohms} Ω'}",
                 5000,
             ),
+            after_write=True,
         )
 
     def _apply_all_output_loads(self) -> None:
@@ -2590,6 +2673,7 @@ class DG4000Window(BaseDeviceWindow):
             on_success=lambda _=None: self.statusBar().showMessage(
                 "CH1/CH2 负载阻抗已同时下发", 5000
             ),
+            after_write=True,
         )
 
     def _system_page(self) -> QWidget:
@@ -2667,9 +2751,11 @@ class DG4000Window(BaseDeviceWindow):
             if not command.endswith("?"):
                 self._refresh_output_states()
 
-        self.submit(operation, on_success=completed)
+        self.submit(operation, on_success=completed, after_write=not command.endswith("?"))
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.auto_readback_checkbox.setChecked(False)
+        self.auto_readback.stop()
         if self._call_tasks or (self.controller is not None and not self.controller.is_quiescent):
             self._stop_trigger()
             self.statusBar().showMessage("后台任务尚未停止，请等待完成后再关闭窗口。", 8000)

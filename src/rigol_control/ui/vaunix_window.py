@@ -47,6 +47,7 @@ from ..drivers.vaunix_lms import (
 )
 from ..models import DeviceKind, DeviceRecord
 from ..repository import DeviceParameterRepository
+from ..readback import ReadbackDeferred
 from ..scan import ScanPoint
 from ..sequence import MAX_SCAN_POINTS, linear_scan_points
 from ..trigger import ControllerState, TriggerSnapshot, TriggerStepController
@@ -61,6 +62,7 @@ from .device_windows import (
     unit_value_spin,
 )
 from .snapshot_bridge import SnapshotBridge
+from .auto_readback import AutoReadback, window_readback_activity
 from .widgets import CallTask
 
 
@@ -106,6 +108,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
         self.trigger_bridge = VaunixTriggerBridge()
         self.trigger_bridge.updated.connect(self._trigger_updated)
         self._last_trigger_error: str | None = None
+        self._last_local_auto_step = None
         navigation = [
             ("总览", self._overview_page),
             ("射频输出", self._output_page),
@@ -116,6 +119,18 @@ class VaunixLmsWindow(BaseDeviceWindow):
             ("状态与存储", self._system_page),
         ]
         super().__init__(record, navigation, parameter_repository)
+        self.auto_readback = AutoReadback(
+            self, refresh=lambda: self._refresh_output_readback(automatic=True),
+            invalidate=self._invalidate_output_readback,
+            activity=lambda: window_readback_activity(self),
+            connected=lambda: self.device.is_connected,
+            generation=lambda: self.device.connection_generation,
+            pending=lambda: self._output_readback_pending,
+            ready=lambda: (len(self._call_tasks) <= (1 if self._output_readback_pending else 0)
+                           and not self._trigger_stop_in_progress and not self._trigger_pending_stop
+                           and self._trigger_start_task is None),
+        )
+        self.auto_readback_checkbox.toggled.connect(self.auto_readback.set_enabled)
         self.trigger_bridge.setParent(self)
         if self.device.is_connected:
             self._connected(self.device.identity)
@@ -136,7 +151,8 @@ class VaunixLmsWindow(BaseDeviceWindow):
             raise DeviceBusyError("Vaunix 正在执行触发任务，请先停止任务再执行手动操作。")
 
     def submit(self, operation: Callable[[], Any], *, on_success: Callable[[Any], None] | None = None,
-               on_error: Callable[[str], None] | None = None, allow_during_scan: bool = False) -> None:
+               on_error: Callable[[str], None] | None = None, allow_during_scan: bool = False,
+               after_write: bool = False) -> None:
         if allow_during_scan:
             super().submit(operation, on_success=on_success, on_error=on_error)
             return
@@ -149,9 +165,28 @@ class VaunixLmsWindow(BaseDeviceWindow):
         def guarded_operation() -> Any:
             with self.device.transaction():
                 self._require_manual_access()
-                return operation()
+                try:
+                    return operation()
+                finally:
+                    # A failed write may already have been accepted. Make
+                    # older snapshots stale before releasing the I/O lock.
+                    if after_write and self.connection_manager is not None:
+                        self.connection_manager.note_output_change(self.record)
 
-        super().submit(guarded_operation, on_success=on_success, on_error=on_error)
+        def succeeded(result):
+            if after_write and self.connection_manager is None:
+                self.auto_readback.request()
+            if on_success:
+                on_success(result)
+
+        def failed(message):
+            if after_write:
+                self.auto_readback.finish(self.auto_readback.capture(), "failure")
+                self._invalidate_output_readback("下发未完成 · 回读值未知，自动回读已暂停")
+                self._clear_output_metrics()
+            (on_error or self._show_hardware_error)(message)
+
+        super().submit(guarded_operation, on_success=succeeded, on_error=failed)
 
     def _overview_page(self) -> QWidget:
         page, layout = page_shell(
@@ -255,7 +290,8 @@ class VaunixLmsWindow(BaseDeviceWindow):
         return scroll
 
     def _output_readback_panel(self) -> QWidget:
-        monitor, monitor_layout = panel("仪器频率与幅度回读 · 手动快照")
+        monitor, monitor_layout = panel("仪器频率与幅度回读")
+        monitor.setProperty("skipDeviceParameterPersistence", True)
         self.output_readback_widget = monitor
         actions = QHBoxLayout()
         self.output_readback_button = QPushButton("回读频率 / 幅度")
@@ -268,6 +304,9 @@ class VaunixLmsWindow(BaseDeviceWindow):
         actions.addWidget(self.output_readback_button)
         actions.addWidget(self.output_readback_status, 1)
         monitor_layout.addLayout(actions)
+        self.auto_readback_checkbox = QCheckBox("自动回读（下发后 / 触发空隙）")
+        self.auto_readback_checkbox.setChecked(True)
+        monitor_layout.addWidget(self.auto_readback_checkbox)
         cards = QHBoxLayout()
         for name, caption, color in (
             ("frequency", "频率", "#55d9cc"),
@@ -314,7 +353,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
         for name in ("frequency", "power", "rf"):
             self.overview_metrics[name].setText("未知")
 
-    def _refresh_output_readback(self) -> None:
+    def _refresh_output_readback(self, *, automatic: bool = False) -> None:
         if self._output_readback_pending:
             return
         if not self.device.is_connected:
@@ -324,6 +363,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
             return
         self._invalidate_output_readback("正在回读频率、幅度与 RF 状态…")
         token = self._output_readback_token
+        ticket = self.auto_readback.capture(automatic)
         generation = self.device.connection_generation
         # This request already targets the current connection. A main-window
         # timer observing that same generation must not invalidate the new read
@@ -333,6 +373,16 @@ class VaunixLmsWindow(BaseDeviceWindow):
         self._update_output_readback_buttons()
 
         def read_parameters():
+            if automatic:
+                try:
+                    with self.device.try_transaction() as acquired:
+                        if not acquired or not self.auto_readback.can_continue(ticket):
+                            raise ReadbackDeferred()
+                        reading = self.device.read_output_parameters(
+                            should_continue=lambda: self.auto_readback.can_continue(ticket))
+                        return reading, datetime.now().astimezone()
+                except ReadbackDeferred:
+                    return None
             with self.device.transaction():
                 if not self.device.is_connected or self.device.connection_generation != generation:
                     raise RuntimeError("连接已变化，已取消旧连接的回读，请重新回读")
@@ -341,13 +391,22 @@ class VaunixLmsWindow(BaseDeviceWindow):
         def completed(result):
             self._output_readback_pending = False
             self._update_output_readback_buttons()
+            if result is None:
+                self.auto_readback.finish(ticket, "deferred")
+                if token == self._output_readback_token:
+                    self._invalidate_output_readback("自动回读等待触发 / 通信空隙")
+                return
             reading, read_at = result
-            if token != self._output_readback_token:
+            if token != self._output_readback_token or not self.auto_readback.accepts(ticket):
+                self.auto_readback.finish(ticket, "stale")
+                if token == self._output_readback_token:
+                    self._invalidate_output_readback("参数或连接已变化 · 等待最新回读")
                 return
             if (not self.device.is_connected or self.device.connection_generation != generation
                     or reading.connection_generation != generation):
                 self._invalidate_output_readback("连接已变化 · 回读值未知，请重新回读")
                 self._clear_output_metrics()
+                self.auto_readback.finish(ticket, "stale")
                 return
             frequency = f"{roundtrip_number(reading.frequency_hz)} Hz"
             amplitude = f"{roundtrip_number(reading.power_dbm)} dBm"
@@ -362,13 +421,15 @@ class VaunixLmsWindow(BaseDeviceWindow):
             self.output_readback_status.setText(
                 f"回读时间：{read_at:%Y-%m-%d %H:%M:%S}（本地） · 点击可刷新"
             )
+            self.auto_readback.finish(ticket, "success")
 
         def failed(message: str) -> None:
             self._output_readback_pending = False
             self._update_output_readback_buttons()
+            self.auto_readback.finish(ticket, "failure")
             if token != self._output_readback_token:
                 return
-            self._invalidate_output_readback(f"回读失败 · 频率、幅度和输出状态未知：{message}")
+            self._invalidate_output_readback(f"回读失败 · 自动回读已暂停，频率、幅度和输出状态未知：{message}")
             self._clear_output_metrics()
             self.statusBar().showMessage(f"Vaunix 参数回读失败：{message}", 10000)
 
@@ -956,8 +1017,8 @@ class VaunixLmsWindow(BaseDeviceWindow):
             apply,
             on_success=lambda _=None: (
                 self.statusBar().showMessage("Vaunix 输出参数已应用", 4000),
-                self._refresh_metrics_only(),
             ),
+            after_write=True,
         )
 
     def _apply_sweep(self) -> None:
@@ -979,6 +1040,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
             on_success=lambda _=None: self.statusBar().showMessage(
                 "Vaunix 扫频参数已应用", 4000
             ),
+            after_write=True,
         )
 
     def _set_sweep_running(self, enabled: bool) -> None:
@@ -990,6 +1052,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
                 "扫频/Chirp 已启动" if enabled else "扫频/Chirp 已停止",
                 4000,
             ),
+            after_write=True,
         )
 
     def _apply_chirp(self) -> None:
@@ -1005,6 +1068,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
             on_success=lambda _=None: self.statusBar().showMessage(
                 "Chirp 参数已应用", 4000
             ),
+            after_write=True,
         )
 
     def _apply_pulse(self) -> None:
@@ -1020,6 +1084,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
             on_success=lambda _=None: self.statusBar().showMessage(
                 "脉冲调制参数已应用", 4000
             ),
+            after_write=True,
         )
 
     def _append_sequence_row(
@@ -1108,6 +1173,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
             on_success=lambda _=None: self.statusBar().showMessage(
                 "BLX 序列已写入", 4000
             ),
+            after_write=True,
         )
 
     def _control_sequence(self, control: int) -> None:
@@ -1118,6 +1184,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
             on_success=lambda _=None: self.statusBar().showMessage(
                 "序列控制命令已发送", 4000
             ),
+            after_write=True,
         )
 
     def _save_settings(self) -> None:
@@ -1349,6 +1416,8 @@ class VaunixLmsWindow(BaseDeviceWindow):
                     rising=self.trigger_edge.currentIndex() == 0,
                 )
             controller = TriggerStepController(counter, self.device, scan_points=points)
+            if self.connection_manager is not None:
+                self.connection_manager.watch_output_task(self._lease_owner, [self.record], controller)
         except Exception as exc:
             if self.connection_manager is not None:
                 self.connection_manager.release_devices(self._lease_owner)
@@ -1356,6 +1425,7 @@ class VaunixLmsWindow(BaseDeviceWindow):
             return
         controller.add_callback(self.trigger_bridge.begin_session())
         self.controller = controller
+        self.auto_readback.reset()
         self.trigger_start_button.setEnabled(False)
         self.trigger_start_button.setText("启动中…")
         self.trigger_stop_button.setEnabled(False)
@@ -1454,6 +1524,11 @@ class VaunixLmsWindow(BaseDeviceWindow):
         self.statusBar().showMessage(message, 15000)
 
     def _trigger_updated(self, snapshot: TriggerSnapshot) -> None:
+        if self.connection_manager is None and snapshot.applied_count:
+            marker = (id(self.controller), snapshot.applied_count)
+            if marker != self._last_local_auto_step:
+                self._last_local_auto_step = marker
+                self.auto_readback.request()
         self.trigger_metrics["received"].setText(str(snapshot.received_count))
         self.trigger_metrics["applied"].setText(str(snapshot.applied_count))
         self.trigger_metrics["backlog"].setText(str(snapshot.backlog))
@@ -1555,6 +1630,8 @@ class VaunixLmsWindow(BaseDeviceWindow):
                     self.trigger_table.setItem(row, column, QTableWidgetItem(str(value)))
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.auto_readback_checkbox.setChecked(False)
+        self.auto_readback.stop()
         if self._call_tasks or (self.controller is not None and not self.controller.is_quiescent):
             self._stop_trigger()
             self.statusBar().showMessage("后台任务尚未停止，请等待完成后再关闭窗口。", 8000)

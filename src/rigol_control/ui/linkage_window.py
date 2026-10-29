@@ -813,6 +813,7 @@ class LinkageTaskWindow(QMainWindow):
                 dispatch_mode=self.dispatch_mode.currentData(),
                 logger=LinkageRunLogger(log_path),
             )
+            self.connection_manager.watch_output_task(owner, dg_records, controller)
             controller.add_callback(self.bridge.begin_session())
             self.controller = controller
             self._prepare_runtime_table(dg_records)

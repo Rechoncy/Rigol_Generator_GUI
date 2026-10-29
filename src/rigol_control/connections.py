@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import RLock
+from typing import Any
 
 from .drivers.dg4000 import DG4000Driver
 from .drivers.newport_smc100 import Smc100Device, VirtualSmc100Device, parse_resource
@@ -12,6 +13,7 @@ from .drivers.ni_counter import NIDaqEdgeCounter
 from .drivers.scpi import ScpiSession
 from .drivers.vaunix_lms import VaunixLmsDevice, VirtualVaunixLmsDevice
 from .models import DeviceKind, DeviceRecord
+from .output_activity import OutputActivityTracker, OutputReadbackActivity
 from .services import DeviceProbeService, ProbeResult, ProbeState
 from .virtual_lab import (
     VirtualAnalogInput,
@@ -69,6 +71,7 @@ class DeviceConnectionManager:
         self._transitions: dict[str, str] = {}
         self._closing_all = False
         self._lock = RLock()
+        self._output_activity = OutputActivityTracker()
 
     @staticmethod
     def physical_resource(record: DeviceRecord) -> str:
@@ -367,11 +370,54 @@ class DeviceConnectionManager:
                 self._leases[device_id] = owner
 
     def release_devices(self, owner: str) -> None:
+        # Snapshot access must happen outside the manager lock: observers may
+        # run concurrently with controller startup, shutdown and UI callbacks.
+        token = self._output_activity.observe_owner(owner)
         with self._lock:
+            if not self._output_activity.release_observed(owner, token):
+                raise DeviceBusyError("输出任务尚未确认静止，已保留设备占用；请完成停止后重试")
             for device_id in [
                 key for key, current_owner in self._leases.items() if current_owner == owner
             ]:
                 self._leases.pop(device_id, None)
+
+    def note_output_change(self, record: DeviceRecord) -> int:
+        """Invalidate preceding output evidence after an attempted mutation.
+
+        A failed command can have unknown acceptance. Callers pause automatic
+        reads on failure rather than replaying that write.
+        """
+        return self._output_activity.note(self.physical_resource(record))
+
+    def watch_output_task(self, owner: str, records: Iterable[DeviceRecord], controller: Any) -> None:
+        """Watch a leased controller before its asynchronous start is queued."""
+        outputs = tuple(
+            (record.id, self.physical_resource(record), record.kind is DeviceKind.VAUNIX_LMS)
+            for record in records
+            if record.kind in {DeviceKind.DG4000, DeviceKind.VAUNIX_LMS, DeviceKind.SIGLENT_SSG}
+        )
+        if not outputs:
+            raise ValueError("输出活动监视至少需要一台信号源")
+        initial = self._output_activity.read(controller)
+        with self._lock:
+            if any(self._lease_for_resource_locked(device_id) != owner for device_id, _, _ in outputs):
+                raise DeviceBusyError("请先占用参与设备，再注册输出活动监视")
+            if not self._output_activity.register(owner, outputs, controller, initial):
+                raise DeviceBusyError("该占用者仍有另一个输出任务，请先完成停止")
+
+    def output_readback_activity(self, record: DeviceRecord) -> OutputReadbackActivity:
+        """Return cached write/task evidence; never enumerate or query hardware."""
+        with self._lock:
+            leases = tuple(
+                (self._physical_resources.get(device_id, f"device:{device_id}"), owner,
+                 self._known_records.get(device_id) is not None
+                 and self._known_records[device_id].kind is DeviceKind.VAUNIX_LMS)
+                for device_id, owner in self._leases.items()
+            )
+        return self._output_activity.activity(
+            self.physical_resource(record), vaunix=record.kind is DeviceKind.VAUNIX_LMS,
+            leases=leases,
+        )
 
     def lease_owner(self, device_id: str) -> str | None:
         with self._lock:

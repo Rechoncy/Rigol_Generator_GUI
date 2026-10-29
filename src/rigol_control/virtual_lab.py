@@ -345,6 +345,15 @@ class VirtualScpiSession:
         with self._lock:
             yield self
 
+    @contextmanager
+    def try_transaction(self):
+        acquired = self._lock.acquire(blocking=False)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                self._lock.release()
+
     def write_many(self, commands, *, recover: bool = False, after_recover=None) -> None:
         del recover, after_recover
         with self._lock:

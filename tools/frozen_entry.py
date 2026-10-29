@@ -395,6 +395,11 @@ def _bundle_self_test(report_path: Path) -> int:
         report["virtual_windows"] = [type(window).__name__ for window in home.open_windows.values()]
         if len(home.open_windows) != 6:
             raise AssertionError("Expected six open virtual device windows")
+        # Isolate the historical manual-query assertions below. The new
+        # automatic path is enabled and accepted separately before shutdown.
+        for window in home.open_windows.values():
+            if hasattr(window, "auto_readback_checkbox"):
+                window.auto_readback_checkbox.setChecked(False)
         titles = [home.windowTitle()] + [window.windowTitle() for window in home.open_windows.values()]
         if not all(title.endswith(f"v{__version__}") for title in titles):
             raise AssertionError(f"Window titles do not identify the running version: {titles}")
@@ -1607,6 +1612,84 @@ def _bundle_self_test(report_path: Path) -> int:
             "dispatch_failure_clears_pending": True, "failed_stop_retains_ownership": True,
             "explicit_stop_retry_completes": True, "no_automatic_motion_replay": True,
             "unreferenced_stop_preserves_homing": True,
+            "hardware_access": False,
+        }
+        def wait_readback(window, expected_frequency):
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                app.processEvents()
+                values = window.output_readback_values
+                label = values[2]["frequency"] if isinstance(next(iter(values)), int) else values["frequency"]
+                if label.text() == expected_frequency and not window._call_tasks:
+                    return
+                time.sleep(.01)
+            raise AssertionError(f"Automatic readback did not show {expected_frequency}")
+
+        dg.auto_readback_checkbox.setChecked(True)
+        dg.channel_controls[2]["frequency"].setValue(34567)
+        dg._apply_channel(2)
+        wait_readback(dg, "34567 Hz")
+        before_auto_ch1 = generator.snapshot().channels[0]
+        class AutoReadCounter:
+            count = 0
+            def start(self): pass
+            def stop(self): pass
+            def read_count(self): return self.count
+        auto_counter = AutoReadCounter()
+        auto_controller = TriggerStepController(auto_counter, dg.driver, StepParameter.FREQUENCY, 2, [1100, 2200])
+        home.connection_manager.acquire_devices("bundle-auto-readback", [dg.record.id])
+        home.connection_manager.watch_output_task("bundle-auto-readback", [dg.record], auto_controller)
+        dg.controller = auto_controller
+        dg.auto_readback.reset()
+        try:
+            auto_controller.start()
+            generator.commands.clear()
+            quiescent_until = time.monotonic() + .25
+            while time.monotonic() < quiescent_until:
+                app.processEvents()
+                time.sleep(.01)
+            if generator.commands or auto_controller.snapshot().applied_count:
+                raise AssertionError("Arming without an edge performed automatic I/O")
+            auto_counter.count = 5
+            wait_readback(dg, "1100 Hz")
+            if (auto_controller.snapshot().applied_count != 5
+                    or generator.snapshot().channels[0] != before_auto_ch1
+                    or list(generator.commands).count(":SOUR1:VOLT:UNIT?") != 2):
+                raise AssertionError("Automatic trigger readback changed CH1, lost edges or read every point")
+        finally:
+            auto_controller.stop()
+            dg.controller = None
+            home.connection_manager.release_devices("bundle-auto-readback")
+        dg.auto_readback_checkbox.setChecked(False)
+        dg._apply_channel(2)
+        wait_idle(require_connected=True)
+        if any(value.text() != "未知" for values in dg.output_readback_values.values() for value in values.values()):
+            raise AssertionError("Disabled automatic readback kept a superseded snapshot")
+        vaunix.auto_readback_checkbox.setChecked(True)
+        vaunix.output_frequency.setValue(5123456000)
+        vaunix._apply_output()
+        wait_readback(vaunix, "5123456000 Hz")
+        ssg.auto_readback_checkbox.setChecked(True)
+        ssg.frequency.setValue(1200000000)
+        original_ssg_basic = ssg.driver.read_output_parameters
+        def forbidden_extra_basic(*args, **kwargs):
+            raise AssertionError("SSG automatic display added redundant basic queries")
+        ssg.driver.read_output_parameters = forbidden_extra_basic
+        try:
+            ssg.apply_frequency()
+            wait_readback(ssg, "1200000000 Hz")
+        finally:
+            ssg.driver.read_output_parameters = original_ssg_basic
+        for window in (dg, vaunix, ssg):
+            for controls in (window._persistent_controls(), window._persistent_controls(use_explicit_keys=False)):
+                if window.auto_readback_checkbox in controls.values():
+                    raise AssertionError("Automatic readback preference changed device parameter persistence")
+            window.auto_readback_checkbox.setChecked(False)
+        report["automatic_output_readback"] = {
+            "dg_parameter_apply_refreshes": True, "trigger_burst_coalesced": True,
+            "no_query_before_first_trigger": True, "first_p0_and_ch1_preserved": True,
+            "disable_invalidates_old_snapshot": True, "vaunix_parameter_apply_refreshes": True,
+            "siglent_reuses_existing_snapshot": True, "controls_not_persisted": True,
             "hardware_access": False,
         }
         if home.connection_manager.active_leases():

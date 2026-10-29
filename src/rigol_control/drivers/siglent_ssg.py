@@ -5,11 +5,13 @@ Command references and conservative capability limits: docs/SIGLENT_SSG_CN.md.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 import math
 import re
 import time
 
 from .scpi import ScpiError, ScpiSession
+from ..readback import ReadbackDeferred, check_readback_allowed
 from ..units import to_base
 
 VIRTUAL_SSG_RESOURCE = "SIM::SIGLENT::SSG6082A-V"
@@ -187,7 +189,7 @@ class SiglentSsgDriver:
         self.prepared = None
         return self.caps
 
-    def read_output_parameters(self) -> SsgOutputReadback:
+    def read_output_parameters(self, *, should_continue: Callable[[], bool] | None = None) -> SsgOutputReadback:
         """Read RF parameters without changing scan state or recovering a session.
 
         SSG3000X C01A 3.4.3.2/3.4.4.2/3.3.1 define Hz, dBm and 1|0.
@@ -197,10 +199,15 @@ class SiglentSsgDriver:
         self._known()
 
         def query(command):
+            check_readback_allowed(should_continue)
             try:
-                return self.session.query(command, recover=False)
+                result = self.session.query(command, recover=False)
+            except ReadbackDeferred:
+                raise
             except Exception as exc:
                 raise SsgCommandError(f"SSG 参数回读失败 [{command}]：{exc}") from exc
+            check_readback_allowed(should_continue)
+            return result
 
         def number(command, *, positive=False):
             raw = query(command)
@@ -212,6 +219,7 @@ class SiglentSsgDriver:
                 raise SsgCommandError(f"SSG 数值回读无效 [{command}]：{raw!r}") from exc
             return value
 
+        check_readback_allowed(should_continue)
         with self.session.transaction():
             generation = self.session.connection_generation
             frequency = number(":FREQuency?", positive=True)
@@ -223,6 +231,7 @@ class SiglentSsgDriver:
                 raise SsgCommandError(f"SSG 输出状态回读无效 [:OUTPut?]：{output!r}") from exc
             if self.session.connection_generation != generation:
                 raise SsgCommandError("SSG 回读期间连接已变化，本次结果已丢弃")
+            check_readback_allowed(should_continue)
             return SsgOutputReadback(frequency, power, enabled, generation)
 
     def _known(self):

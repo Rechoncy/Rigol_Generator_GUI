@@ -11,6 +11,7 @@ from threading import Lock, RLock
 from typing import Any, Callable
 
 from .dg4000 import StepParameter, StepValue
+from ..readback import check_readback_allowed
 from ..runtime import bundle_root, executable_dir, is_frozen
 
 
@@ -368,6 +369,26 @@ class VaunixLmsDevice:
         """Serialize a related UI operation with task arming and device writes."""
         with self._lock:
             yield self
+
+    @contextmanager
+    def try_transaction(self):
+        """Yield only when neither this device nor the shared DLL is occupied."""
+        acquired = self._lock.acquire(blocking=False)
+        api_lock = None
+        try:
+            if acquired and self._api is not None:
+                candidate = self._api._lock
+                if candidate.acquire(blocking=False):
+                    api_lock = candidate
+                else:
+                    yield False
+                    return
+            yield acquired
+        finally:
+            if api_lock is not None:
+                api_lock.release()
+            if acquired:
+                self._lock.release()
 
     @property
     def connection_generation(self) -> int:
@@ -742,22 +763,25 @@ class VaunixLmsDevice:
                 device_status=status,
             )
 
-    def read_output_parameters(self) -> VaunixOutputReadback:
+    def read_output_parameters(self, *, should_continue: Callable[[], bool] | None = None) -> VaunixOutputReadback:
         """Read SDK settings without writes, retries, or connection recovery.
 
         SDK manual section 3.6 uses 10 Hz unsigned frequency units and 0.25 dB
         absolute power units. GetPowerLevel instead returns relative attenuation.
         The DLL updates its settings while sweeping; this is not an RF measurement.
         """
+        check_readback_allowed(should_continue)
         with self._lock:
             api, device_id = self._require()
             generation = self._connection_generation
 
             def read_int(name: str) -> int:
+                check_readback_allowed(should_continue)
                 value = getattr(api.dll, name)(device_id)
                 if not isinstance(value, int):
                     raise VaunixLmsError(f"{name} 返回无效整数 {value!r}")
                 _raise_get_error(name, value)
+                check_readback_allowed(should_continue)
                 return value
 
             with api._lock:
@@ -774,6 +798,7 @@ class VaunixLmsDevice:
                 raise VaunixLmsError("fnLMS_GetDeviceStatus 表示回读期间 USB 已断开，请重新连接")
             if generation != self._connection_generation:
                 raise VaunixLmsError("Vaunix 连接已变化，请重新回读")
+            check_readback_allowed(should_continue)
             return _validated_output_readback(
                 frequency * 10.0, power * POWER_ENCODING_DB, rf,
                 final_status, generation, self.capabilities,
@@ -1023,6 +1048,15 @@ class VirtualVaunixLmsDevice:
         with self._lock:
             yield self
 
+    @contextmanager
+    def try_transaction(self):
+        acquired = self._lock.acquire(blocking=False)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                self._lock.release()
+
     @property
     def connection_generation(self) -> int:
         with self._status_lock:
@@ -1246,9 +1280,11 @@ class VirtualVaunixLmsDevice:
                 device_status=snapshot.device_status,
             )
 
-    def read_output_parameters(self) -> VaunixOutputReadback:
+    def read_output_parameters(self, *, should_continue: Callable[[], bool] | None = None) -> VaunixOutputReadback:
+        check_readback_allowed(should_continue)
         with self._lock:
             self._delay()
+            check_readback_allowed(should_continue)
             status = DEV_CONNECTED | DEV_OPENED | PLL_LOCKED
             if self.sweep_active:
                 status |= SWP_ACTIVE

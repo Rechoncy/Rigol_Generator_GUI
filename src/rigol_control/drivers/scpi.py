@@ -139,6 +139,16 @@ class ScpiSession:
         with self._lock:
             yield self
 
+    @contextmanager
+    def try_transaction(self):
+        """Acquire an optional read's I/O transaction without queuing behind writes."""
+        acquired = self._lock.acquire(blocking=False)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                self._lock.release()
+
     def write_many(self, commands: Iterable[str], *, recover: bool = False, after_recover: Callable[[], None] | None = None) -> None:
         normalized = [self._normalize(command) for command in commands]
         with self._lock:

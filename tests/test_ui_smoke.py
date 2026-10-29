@@ -395,13 +395,16 @@ class UiSmokeTests(unittest.TestCase):
             def __init__(self, resource):
                 self.resource = resource
                 self.is_connected = False
+                self.connection_generation = 0
 
             def connect(self):
                 self.is_connected = True
+                self.connection_generation += 1
                 return "RIGOL,DG4162,TEST,1.0"
 
             def disconnect(self):
                 self.is_connected = False
+                self.connection_generation += 1
 
             def query(self, command, *, recover=False):
                 del recover
