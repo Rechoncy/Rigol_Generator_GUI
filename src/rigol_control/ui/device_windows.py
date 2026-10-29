@@ -1132,17 +1132,25 @@ class DG4000Window(BaseDeviceWindow):
             self.output_readback_values[channel] = values
             display_unit = QComboBox()
             display_unit.addItems(["Vpp", "mVpp"])
+            amplitude_editor = self.channel_controls[channel]["amplitude"]
+            display_unit.setCurrentText(amplitude_editor.current_unit())
             display_unit.setEnabled(False)
-            display_unit.setToolTip("仅换算已回读的峰峰电压显示；dBm / Vrms 保留仪器单位，不改变仪器设置")
+            display_unit.setToolTip(
+                "跟随本通道幅度编辑单位，也可单独选择；仅本地换算峰峰电压显示。"
+                "dBm / Vrms 保留仪器单位，不改变仪器设置"
+            )
             display_unit.currentTextChanged.connect(self._render_output_readback)
             self.output_readback_units[channel] = display_unit
+            amplitude_editor.unit_combo.currentIndexChanged.connect(
+                lambda _index, selected=channel: self._follow_channel_amplitude_unit(selected)
+            )
             form.addRow("峰峰电压显示", display_unit)
             card_layout.addLayout(form)
             channels.addWidget(card)
         monitor_layout.addLayout(channels)
         note = QLabel(
             "回读仪器配置，不覆盖上方编辑值。自动回读合并下发事件，触发积压时让位；失败后暂停，可手动重试。"
-            "峰峰电压可本地切换 Vpp / mVpp；dBm / Vrms 保留仪器单位。"
+            "峰峰电压显示跟随对应通道的幅度编辑单位，也可单独切换 Vpp / mVpp；dBm / Vrms 保留仪器单位。"
             "单位未返回时，以高低电平差计算峰峰电压并标记为兼容回读，不推算 dBm。"
             "输出关闭时数值仅为配置。扫频或调制时的瞬时信号须由测量设备确认。"
         )
@@ -1150,6 +1158,18 @@ class DG4000Window(BaseDeviceWindow):
         note.setObjectName("Muted")
         monitor_layout.addWidget(note)
         return monitor
+
+    def _follow_channel_amplitude_unit(self, channel: int) -> None:
+        """Follow an explicit editor-unit change without writing or querying."""
+        display_unit = self.output_readback_units[channel]
+        blocked = display_unit.blockSignals(True)
+        try:
+            display_unit.setCurrentText(self.channel_controls[channel]["amplitude"].current_unit())
+        finally:
+            display_unit.blockSignals(blocked)
+        # Parameter restoration runs inside the base constructor, before the
+        # automatic-read scheduler exists. An empty snapshot is a no-op here.
+        self._render_output_readback()
 
     def _show_output_readback(self) -> None:
         self._select_page(1)

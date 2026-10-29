@@ -2,7 +2,7 @@
 
 文档版本：1.15
 
-对应软件版本：0.7.28（事件驱动自动回读；本次正式发行与前期候选记录见第 12 节）
+对应软件版本：0.7.29 本地修复候选（DG 回读单位跟随与 VISA 回复同步；正式下载仍为 0.7.28，第 12 节保留各版记录）
 
 最后更新：2026-10-29
 适用仓库：`Rigol_Generator_GUI`
@@ -459,6 +459,21 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 实体输出测试必须由实验负责人确认幅度、偏置、负载、端接方式、PFI 电平、接地和被测电路耐压。自动测试不能替代这些电气检查。
 
 ## 12. 版本开发日志
+
+### 0.7.29 本地修复候选：DG 单位跟随与 VISA 回复同步 — 2026-10-29
+
+用户 DG4162 + USB 截图显示上方为 mVpp、底部仍为 Vpp，另有数值查询 `:SOUR1:VOLT:HIGH?` 收到 `VPP`。本轮分别建立显示和传输复现；不能从截图证明实机空帧的硬件/固件原因，也不将软件替身复现当作用户实机已验收。
+
+- CH1/CH2 的回读显示在初始化及上方幅度单位改变时，跟随各自 Vpp/mVpp。底部手动覆盖保留到上方下一次切单位；只重画有效缓存，不新增仪器查询、写入或 DATA 持久化，原生负 dBm/Vrms 保留，不猜跨单位转换。
+- FIFO 回复替身复现旧 `VisaBackend.query()` 只读一帧：多条空结束帧使 `UNIT?` 先回空，后续 `HIGH?` 取到前条 `VPP`。按 PyVISA 官方实现，对明确必须非空的身份/完成/DG 基础参数及预检查询，在同一请求内续读空帧；不重发 query、不设置仪器单位、不 clear、不引入猜测的固定等待。总查询超时从首次 query 起算，续读仅用剩余预算，并设 16 个空帧上限，结束后恢复原 timeout。Python 无法抢断已开始的底层 I/O 或 `query_delay`，不承诺绝对墙钟上界；未知通用 SCPI 合法空回复保留。
+- 续读未完成或回复关联不能确认时，专用 `ScpiResponseSyncError` 阻止后续 query，不进入自动查询恢复；普通 write 保留，原普通 I/O 和幂等写入恢复规则不作无关重构。DG 数值字段收到 VPP/VRMS/DBM 会提示疑似错位，整组失效并暂停自动回读，不丢掉非空回复继续寻找想要的类型。
+- NI/联动任务不自动重放、不自动重连、不提前释放占用；显式恢复为停止任务并等待清理，断开连接、重新连接、再手动回读。取消后重新勾选自动不能消除会话回复未同步标记。原首触发 P0、累计计数、CH2 隔离与停止失败保留占用规则保持。
+
+实际源码验证记录位于 `dist/verification/0.7.29/`：新增 6 项单位跟随 UI 回归先复现失败后通过，已有 UI/自动回读等组合 35 项、24.875 秒通过。新增 18 项传输空帧回归，连同相邻恢复/驱动共 111 项、5.795 秒通过，日志 `visa-framing-adjacent-final.log`；DG 回读驱动 27 项、0.085 秒通过，新增一项错误类型回归覆盖 HIGH/LOW/FREQ/VOLT × VPP/VRMS/DBM 的 12 个子场景，确认标记未同步且立即停止整组。最终 `full-unittest.log` 共 809 项、107.475 秒、OK，1 项因本机 Windows 符号链接权限跳过。
+
+`source-self-test.json` 成功，新增 `dg_readback_reply_alignment` 八项标志均为 true，`hardware_access=false`；原自动回读八项、显示单位和电平差检查继续通过。初次自检的 mVpp 测试场景误用前段留下的原生 VRMS 配置，保留 `source-self-test-initial-vrms-fixture.json`；仅补齐虚拟 fixture 的原生 VPP 设置后重跑成功，未把应用的 Vrms 保留规则改成错误换算。远程 CI 与冻结/安装交付仍按本版后续实际记录，不预写成功。依据为原厂 CHM 和 PyVISA 官方[通信资源说明](https://pyvisa.readthedocs.io/en/latest/introduction/resources.html)、[MessageBasedResource 源码](https://pyvisa.readthedocs.io/en/latest/_modules/pyvisa/resources/messagebased.html)。
+
+本轮源码版本升至 0.7.29，作为本地修复候选，不创建标签或 GitHub Release；正式下载继续 0.7.28。新候选交付目录使用 `dist/local/v0.7.29/`，生成情况和实际验收以本组清单为准；保留 0.7.28 正式/候选、旧版与用户数据。详情见[0.7.29 说明](../release/NOTES-0.7.29.md)。
 
 ### 0.7.28 GitHub 正式发行 — 2026-10-29
 

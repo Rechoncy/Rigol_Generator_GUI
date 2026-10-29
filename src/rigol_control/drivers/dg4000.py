@@ -458,6 +458,15 @@ class DG4000Driver:
                 if not math.isfinite(value) or (non_negative and value < 0):
                     raise ValueError()
             except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+                if isinstance(raw, str) and raw.strip().strip("\"'").upper() in {"VPP", "VRMS", "DBM"}:
+                    marker = getattr(self.session, "mark_response_unsynchronized", None)
+                    if marker is not None:
+                        marker()
+                    raise ValueError(
+                        f"DG4000 数值回读无效 [{command}]：{raw!r}；"
+                        "数值查询收到幅度单位，疑似回复错位，整组结果已作废。"
+                        "停止任务后断开并重新连接再回读；mVpp 显示选择不会使电平查询返回单位。"
+                    ) from exc
                 raise ValueError(f"DG4000 数值回读无效 [{command}]：{raw!r}") from exc
             return value
 

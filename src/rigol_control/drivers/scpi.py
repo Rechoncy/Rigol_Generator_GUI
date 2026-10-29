@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
+import math
+import re
 from threading import Lock, RLock
+import time
 from typing import Protocol
 
 
@@ -12,6 +15,10 @@ class ScpiError(RuntimeError):
 
 class ScpiConnectionError(ScpiError):
     pass
+
+
+class ScpiResponseSyncError(ScpiError):
+    """A pending reply cannot safely be associated with a subsequent query."""
 
 
 class ScpiBackend(Protocol):
@@ -28,7 +35,27 @@ BackendFactory = Callable[[str, int], ScpiBackend]
 class VisaBackend:
     """Thin lazy PyVISA adapter, isolated so the application can run without it."""
 
+    MAX_EMPTY_RESPONSE_FRAMES = 16
+    _NONEMPTY_QUERY = re.compile(
+        r"(?:\*(?:IDN|OPC)|COUP:STAT|OUTP[12](?::STAT)?|"
+        r"SOUR[12]:(?:FREQ|FUNC|VOLT:UNIT|"
+        r"VOLT(?::LEV)?(?::IMM)?(?::(?:AMPL|HIGH|LOW))?))\?"
+    )
+    _HEADER_ALIASES = {
+        "FREQUENCY": "FREQ", "FUNCTION": "FUNC", "VOLTAGE": "VOLT",
+        "LEVEL": "LEV", "IMMEDIATE": "IMM", "AMPLITUDE": "AMPL",
+        "COUPLING": "COUP", "STATE": "STAT",
+    }
+
     def __init__(self, resource: str, timeout_ms: int) -> None:
+        try:
+            timeout = float(timeout_ms)
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError()
+            self._query_timeout_ms = math.ceil(timeout)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ScpiConnectionError("VISA 查询超时必须为正数毫秒") from exc
+        self._reply_unsynchronized = False
         try:
             import pyvisa  # type: ignore[import-not-found]
         except ImportError as exc:
@@ -51,7 +78,79 @@ class VisaBackend:
         return self._instrument.write(command)
 
     def query(self, command: str) -> str:
-        return str(self._instrument.query(command))
+        if self._reply_unsynchronized:
+            raise ScpiResponseSyncError("VISA 回复关联未确认；请显式断开并重新连接后再查询")
+        if not self._requires_nonempty_response(command):
+            # Unknown console queries can legitimately return an empty string.
+            return str(self._instrument.query(command))
+
+        deadline = time.monotonic() + self._query_timeout_ms / 1000
+        original_timeout = self._instrument.timeout
+        read_cap = self._query_timeout_ms
+        try:
+            original_ms = float(original_timeout)
+            if math.isfinite(original_ms) and original_ms > 0:
+                read_cap = min(read_cap, original_ms)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        attempted = failed = False
+        try:
+            self._instrument.timeout = max(1, int(read_cap))
+            attempted = True
+            # PyVISA query performs one write, its configured query_delay and
+            # one read. A terminator-only frame can make that read empty.
+            response = str(self._instrument.query(command))
+            empty_frames = 0
+            while not response.strip():
+                empty_frames += 1
+                remaining = deadline - time.monotonic()
+                if empty_frames >= self.MAX_EMPTY_RESPONSE_FRAMES:
+                    raise ScpiResponseSyncError(
+                        f"VISA 查询连续收到空回复帧 [{command}]；回复关联未确认，请断开重连"
+                    )
+                if remaining <= 0:
+                    raise ScpiResponseSyncError(
+                        f"VISA 查询等待有效回复超时 [{command}]；回复关联未确认，请断开重连"
+                    )
+                self._instrument.timeout = max(1, int(min(read_cap, remaining * 1000)))
+                try:
+                    # Continue the pending response; never send the query again
+                    # or discard a nonempty value in search of a preferred type.
+                    response = str(self._instrument.read())
+                except Exception as exc:
+                    raise ScpiResponseSyncError(
+                        f"VISA 查询空帧后的回复未读完 [{command}]；请断开重连：{exc}"
+                    ) from exc
+            return response
+        except Exception:
+            failed = True
+            if attempted:
+                self.mark_response_unsynchronized()
+            raise
+        finally:
+            try:
+                self._instrument.timeout = original_timeout
+            except Exception:
+                self.mark_response_unsynchronized()
+                if not failed:
+                    raise
+
+    @classmethod
+    def _requires_nonempty_response(cls, command: str) -> bool:
+        normalized = command.strip().upper().removeprefix(":")
+        if not normalized.endswith("?"):
+            return False
+        headers = []
+        for header in normalized[:-1].split(":"):
+            numbered = re.fullmatch(r"(SOURCE|SOUR|OUTPUT|OUTP)([12])", header)
+            if numbered:
+                header = ("SOUR" if numbered[1] in {"SOURCE", "SOUR"} else "OUTP") + numbered[2]
+            headers.append(cls._HEADER_ALIASES.get(header, header))
+        return cls._NONEMPTY_QUERY.fullmatch(":".join(headers) + "?") is not None
+
+    def mark_response_unsynchronized(self) -> None:
+        """Invalidate reply association in memory; do not clear or read VISA."""
+        self._reply_unsynchronized = True
 
     def close(self) -> None:
         try:
@@ -160,6 +259,10 @@ class ScpiSession:
         with self._lock:
             try:
                 result = self._query_locked(normalized)
+            except ScpiResponseSyncError:
+                # A delayed reply must never be attributed to a replayed/new
+                # query. Only an explicit reconnect creates a fresh backend.
+                raise
             except ScpiError as first_error:
                 if not recover or self.recovery_attempts < 1:
                     raise
@@ -174,6 +277,13 @@ class ScpiSession:
                 self._identity = result
                 self._publish_status(True)
             return result
+
+    def mark_response_unsynchronized(self) -> None:
+        """Optionally invalidate a backend's response association without I/O."""
+        with self._lock:
+            marker = getattr(self._backend, "mark_response_unsynchronized", None)
+            if callable(marker):
+                marker()
 
     def _write_locked(
         self,
@@ -234,6 +344,8 @@ class ScpiSession:
         backend = self._require_backend()
         try:
             return str(backend.query(command)).strip()
+        except ScpiResponseSyncError:
+            raise
         except Exception as exc:
             raise ScpiError(f"SCPI 查询失败 [{command}]：{exc}") from exc
 

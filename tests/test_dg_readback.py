@@ -109,6 +109,24 @@ class DgOutputReadbackTests(unittest.TestCase):
         ])
         self.assertEqual([item.channel for item in self.driver.read_output_parameters((2, 1))], [2, 1])
 
+    def test_unit_reply_in_numeric_field_marks_unsynchronized_and_stops_the_group(self):
+        original = self.backend.responses.copy()
+        for command in (":SOUR1:FREQ?", ":SOUR1:VOLT?", ":SOUR1:VOLT:HIGH?", ":SOUR1:VOLT:LOW?"):
+            for reply in ("VPP", "VRMS", "DBM"):
+                with self.subTest(command=command, reply=reply):
+                    self.backend.responses = original.copy()
+                    if command.endswith((":HIGH?", ":LOW?")):
+                        self.backend.responses[":SOUR1:VOLT:UNIT?"] = ""
+                    self.backend.responses[command] = reply
+                    self.backend.events.clear()
+                    with patch.object(self.session, "mark_response_unsynchronized", create=True) as marker:
+                        with self.assertRaisesRegex(ValueError, "疑似回复错位.*断开并重新连接"):
+                            self.driver.read_output_parameters((1,))
+                        marker.assert_called_once_with()
+                    self.assertEqual(self.backend.events[-1], ("query", command))
+                    self.assertTrue(all(kind == "query" for kind, _ in self.backend.events))
+                    self.assertEqual(self.opened, [self.backend])
+
     def test_empty_unit_recovers_query_only_vpp_from_negative_voltage_levels(self):
         self.backend.responses[":SOUR1:VOLT:HIGH?"] = "-1.0"
         self.backend.responses[":SOUR1:VOLT:LOW?"] = "-5.0"

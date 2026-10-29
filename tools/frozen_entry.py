@@ -1692,6 +1692,97 @@ def _bundle_self_test(report_path: Path) -> int:
             "siglent_reuses_existing_snapshot": True, "controls_not_persisted": True,
             "hardware_access": False,
         }
+        # Follow the editor's milli prefix without querying or changing output.
+        from rigol_control.units import roundtrip_number
+        # Earlier native-unit acceptance deliberately leaves CH2 in Vrms.
+        # This fixture specifically tests a Vpp value with an mVpp display.
+        generator.amplitude_units[2] = "VPP"
+        generator.commands.clear()
+        follow_before = generator.snapshot().channels
+        dg.channel_controls[2]["amplitude"].set_unit("mVpp")
+        if dg.output_readback_units[2].currentText() != "mVpp" or generator.commands:
+            raise AssertionError("DG readback did not follow the editor's mVpp choice locally")
+        dg.output_readback_button.click()
+        wait_idle(require_connected=True)
+        span = float(generator.channels[2]["amplitude_vpp"])
+        if dg.output_readback_values[2]["amplitude"].text() != f"{roundtrip_number(span / .001)} mVpp":
+            raise AssertionError("DG readback did not display the configured amplitude in mVpp")
+        generator.commands.clear()
+        dg.channel_controls[2]["amplitude"].set_unit("Vpp")
+        dg.channel_controls[2]["amplitude"].set_unit("mVpp")
+        if generator.commands or generator.snapshot().channels != follow_before:
+            raise AssertionError("DG editor/display unit switch performed hardware I/O")
+
+        # Exercise the actual packaged VISA adapter against FIFO response frames.
+        # This does not create or enumerate a physical VISA resource.
+        from collections import deque
+        from rigol_control.drivers.dg4000 import DG4000Driver
+        from rigol_control.drivers.scpi import ScpiResponseSyncError, ScpiSession, VisaBackend
+        class FramedReadbackResource:
+            timeout = 5000
+            def __init__(self):
+                self.frames = deque()
+                self.commands = []
+                self.replies = {
+                    "*IDN?": "RIGOL,DG4162,BUNDLE-FIFO,1.0",
+                    ":SOUR1:VOLT:UNIT?": "VPP", ":SOUR1:FREQ?": "1000",
+                    ":SOUR1:VOLT?": "0.125", ":OUTP1?": "0",
+                }
+            def write(self, command):
+                self.commands.append(command)
+                if command in self.replies:
+                    self.frames.extend((self.replies[command], ""))
+            def query(self, command):
+                self.write(command)
+                return self.read()
+            def read(self):
+                if not self.frames:
+                    raise TimeoutError("BUNDLE_EMPTY_RESPONSE_QUEUE")
+                return self.frames.popleft()
+            def close(self): pass
+        fifo = FramedReadbackResource()
+        class FramedReadbackManager:
+            def open_resource(self, *args, **kwargs): return fifo
+            def close(self): pass
+        with patch("pyvisa.ResourceManager", return_value=FramedReadbackManager()):
+            fifo_session = ScpiSession("USB::BUNDLE-FIFO")
+            try:
+                fifo_session.connect()
+                fifo_reading, = DG4000Driver(fifo_session).read_output_parameters((1,))
+                expected_queries = ["*IDN?", ":SOUR1:VOLT:UNIT?", ":SOUR1:FREQ?",
+                                    ":SOUR1:VOLT?", ":OUTP1?", ":SOUR1:VOLT:UNIT?"]
+                if (fifo.commands != expected_queries or fifo_reading.amplitude != .125
+                        or fifo_reading.amplitude_unit != "VPP" or fifo_reading.amplitude_source != "native"
+                        or fifo.timeout != 5000):
+                    raise AssertionError("VISA blank frames replayed a query or shifted its response")
+                fifo.replies[":SOUR1:VOLT:UNIT?"] = ""
+                try:
+                    fifo_session.query(":SOUR1:VOLT:UNIT?", recover=False)
+                except ScpiResponseSyncError:
+                    pass
+                else:
+                    raise AssertionError("Unfinished empty response was accepted as an instrument unit")
+                pending_commands = list(fifo.commands)
+                try:
+                    fifo_session.query(":SOUR1:VOLT:HIGH?", recover=True)
+                except ScpiResponseSyncError:
+                    pass
+                else:
+                    raise AssertionError("An unsynchronized response allowed a subsequent query")
+                if fifo.commands != pending_commands or fifo.timeout != 5000:
+                    raise AssertionError("Unsynchronized reply was retried or changed the timeout")
+                fifo_session.write(":OUTP1 OFF")
+                if fifo.commands[-1] != ":OUTP1 OFF":
+                    raise AssertionError("Reply quarantine prevented an explicit safety write")
+            finally:
+                fifo_session.disconnect()
+        report["dg_readback_reply_alignment"] = {
+            "channel_editor_mvpp_followed": True, "display_switch_query_free": True,
+            "blank_frame_query_not_replayed": True, "native_unit_and_value_aligned": True,
+            "no_level_fallback_for_queued_unit": True, "unsynchronized_query_blocked": True,
+            "safety_write_allowed": True, "original_timeout_restored": True,
+            "hardware_access": False,
+        }
         if home.connection_manager.active_leases():
             raise AssertionError("Virtual windows retained an unexpected device operation lease")
         if not home.close():
