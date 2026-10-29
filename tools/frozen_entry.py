@@ -1069,12 +1069,66 @@ def _bundle_self_test(report_path: Path) -> int:
             "bad_levels_invalidate_group": True, "native_retry_clears_compatibility_notice": True,
             "hardware_access": False,
         }
+        # mVpp is a local display prefix; UNIT? still returns VPP/VRMS/DBM.
+        # Exercise the actual widgets without writing units or assuming a load.
+        display_units_before = generator.amplitude_units.copy()
+        native_vpp = dg._output_readback_snapshot[0].amplitude
+        native_vrms_text = dg.output_readback_values[2]["amplitude"].text()
+        generator.commands.clear()
+        dg.output_readback_units[1].setCurrentText("mVpp")
+        if (float(dg.output_readback_values[1]["amplitude"].text().split()[0]) != native_vpp / .001
+                or not dg.output_readback_values[1]["amplitude"].text().endswith(" mVpp")
+                or dg.output_readback_values[2]["amplitude"].text() != native_vrms_text
+                or dg.output_readback_units[2].isEnabled()
+                or generator.commands):
+            raise AssertionError("DG display switch performed I/O, lost mVpp scaling or converted native Vrms")
+        for explicit in (False, True):
+            persisted = dg._persistent_controls(use_explicit_keys=explicit).values()
+            if any(combo in persisted for combo in dg.output_readback_units.values()):
+                raise AssertionError("DG display choice entered device parameter persistence")
+        generator.amplitude_units[2] = "DBM"
+
+        def negative_dbm(command, **kwargs):
+            return "-37.25" if command == ":SOUR2:VOLT?" else original_dg_query(command, **kwargs)
+
+        dg.driver.session.query = negative_dbm
+        try:
+            dg.output_readback_button.click()
+            wait_idle(require_connected=True)
+            generator.commands.clear()
+            dg.output_readback_units[2].setCurrentText("mVpp")
+            if (dg.output_readback_values[2]["amplitude"].text() != "-37.25 dBm"
+                    or dg.output_readback_units[2].isEnabled() or generator.commands):
+                raise AssertionError("DG display choice replaced the native negative dBm value")
+        finally:
+            generator.amplitude_units.update(display_units_before)
+            dg.driver.session.query = original_dg_query
+        dg.driver.session.query = blank_dg_units
+        try:
+            dg.output_readback_button.click()
+            wait_idle(require_connected=True)
+            for channel in (1, 2):
+                label = dg.output_readback_values[channel]["amplitude"]
+                if not label.text().endswith(" mVpp（电平差）") or "单位未知" not in label.toolTip():
+                    raise AssertionError("DG mVpp level-span display hid the unknown native unit")
+        finally:
+            dg.driver.session.query = original_dg_query
+        dg.output_readback_units[1].setCurrentText("Vpp")
+        dg.output_readback_units[2].setCurrentText("Vpp")
+        dg.output_readback_button.click()
+        wait_idle(require_connected=True)
+        if (generator.snapshot().channels != readback_before
+                or generator.amplitude_units != display_units_before
+                or dg._device_parameter_snapshot() != editors_before):
+            raise AssertionError("DG display selection changed source settings or editors")
         # A complete cached read must expire even if the connection timer misses
         # the disconnected interval. Conversely, it must retain a new request
         # that already targets the replacement connection.
         home.connection_manager.disconnect(dg.record)
         home.connection_manager.connect(dg.record)
         generator.commands.clear()
+        # Do this before the status timer gets a chance to observe the reconnect.
+        dg.output_readback_units[1].setCurrentText("mVpp")
         dg.sync_connection_state()
         if (any(value.text() != "未知" for values in dg.output_readback_values.values()
                 for value in values.values())
@@ -1113,6 +1167,12 @@ def _bundle_self_test(report_path: Path) -> int:
         report["dg_readback_connection_generation"] = {
             "completed_snapshot_invalidated": True, "no_io_during_sync": True,
             "fresh_read_survives_sync": True, "hardware_access": False,
+        }
+        report["dg_readback_display_units"] = {
+            "vpp_to_mvpp_without_io": True, "native_dbm_preserved": True,
+            "native_vrms_preserved": True, "level_span_mvpp_labeled": True,
+            "display_controls_not_persisted": True, "stale_cache_invalidated": True,
+            "hardware_access": False,
         }
         from rigol_control.scan import ScanPoint
         vaunix = next(w for w in home.open_windows.values() if type(w).__name__ == "VaunixLmsWindow")

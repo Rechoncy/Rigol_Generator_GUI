@@ -1,8 +1,8 @@
 # DG4000 + SIGLENT SSG + Vaunix + Newport + NI 多设备联动控制：开发日志与维护指南
 
-文档版本：1.13
+文档版本：1.14
 
-对应软件版本：0.7.26 本地修复候选（DG4000 幅度单位空回复的高低电平差兼容；阶段记录见第 12 节）
+对应软件版本：0.7.27 本地修复候选（DG4000 回读 Vpp/mVpp 本地显示与原生 dBm 保留；阶段记录见第 12 节）
 
 最后更新：2026-10-29
 适用仓库：`Rigol_Generator_GUI`
@@ -459,6 +459,18 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 实体输出测试必须由实验负责人确认幅度、偏置、负载、端接方式、PFI 电平、接地和被测电路耐压。自动测试不能替代这些电气检查。
 
 ## 12. 版本开发日志
+
+### 0.7.27：DG4000 回读 mVpp/dBm 显示 — 2026-10-29
+
+- 用户要求回读兼容 mVpp/dBm。DG4000 编程手册 `VOLTage:UNIT?` 的原生单位为 VPP、VRMS、DBM，MVPP 是数值前缀表达，不能把它当成仪器返回的第四种单位。本轮在显示层处理电压前缀，保留原驱动对原生单位的判断。
+- DG 回读区每通道提供 Vpp/mVpp 本地选择；仅转换 `amplitude_unit=VPP` 的有效缓存，mVpp 为原值乘以 1000，反向显示使用原缓存，不累计缩放。原生 DBM 负数原样显示 dBm，VRMS 保留 Vrms，不猜负载或波形、不按 50 Ω 正弦关系跨功率和电压换算。
+- 选择只重绘快照，不发 SCPI、不重新回读、不覆盖编辑参数、仪器单位或输出，也不写用户 DATA。整个回读区继续跳过持久化，新控件不进入设备参数或配置包；断连、连接代次、失败与迟到结果的失效规则保留，显示切换不能复活旧缓存。
+- 空 `UNIT?` 的高低电平差兼容保留；其 Vpp/mVpp 仍标明高低电平差来源和仪器原单位未知，不能从中推断 dBm。此快照是基本波配置参数，不代表触发时刻或调制/扫频的瞬时物理输出。
+- 源码版本提升到 0.7.27，本轮为本地候选，不创建标签或 Release，正式下载仍为 v0.7.25；0.7.25/0.7.26 候选及正式包分别保留，新版不覆盖旧交付。既有 0.7.26 历史记录不改写为本版验证。
+- 四模块针对性回归（`test_dg_readback_ui`、`test_dg_readback`、`test_dg_parameter_semantics`、`test_input_wheel`）60 项、12.290 秒通过，`targeted.log` 包含本版新增 7 项 UI 回归（共 22 项回读 UI、26 项回读驱动等）。完整 unittest 执行 717 项、86.609 秒、OK，一项因本机 Windows 符号链接权限跳过，见 `full-unittest.log`。
+- 初次源码自检在创建临时虚拟设备时，`devices.json.tmp` 原子替换为 `devices.json` 遇 `WinError 5`，因而虚拟实验室未完整建立、新增显示检查未执行到；保留原失败报告 `source-self-test-initial-file-lock.json`。受控重跑的 `source-self-test.json` 成功；未据此改写存储逻辑或武断确定异常原因。
+- 重跑自检新增 `dg_readback_display_units` 六项标志全部为 true，覆盖无 I/O 的 Vpp/mVpp 切换、原生 dBm/Vrms 保留、差值来源说明、不持久化及缓存失效，`hardware_access=false`；原 `dg_readback_voltage_levels` 七项亦继续通过。虚拟界面预览 `readback-display-preview.png` 显示 `125 mVpp` 与 `-20 dBm` 并列，不作为实体输出测量。
+- 本版源码证据目录为 `dist/verification/0.7.27/`，远程 CI、冻结和隔离安装检查分别以本版实际新日志及同组 `release-manifest.json`、`SHA256SUMS.txt` 记录，不用源码或历史结果替代产物验收，不预写产物检查成功，也不声称用户 DG4162 USB 实机已确认修复。
 
 ### 0.7.26：DG4000 幅度单位空回复的只读兼容 — 2026-10-29
 

@@ -86,6 +86,115 @@ class DgReadbackUiTests(unittest.TestCase):
         self.assertEqual(self.generator.amplitude_units, {1: "VRMS", 2: "DBM"})
         self.assertTrue(all(command.endswith("?") for command in self.generator.commands))
 
+    def test_peak_voltage_display_switches_cached_values_without_io_or_persistence(self):
+        editors = self.window._device_parameter_snapshot()
+        before = self.generator.snapshot().channels
+        self.refresh()
+        status = self.window.output_readback_status.text()
+        self.generator.commands.clear()
+        units = self.window.output_readback_units
+        units[1].setCurrentText("mVpp")
+        self.assertEqual(self.window.output_readback_values[1]["amplitude"].text(), "2500 mVpp")
+        self.assertEqual(self.window.output_readback_values[2]["amplitude"].text(), "0.125 Vpp")
+        units[2].setCurrentText("mVpp")
+        self.assertEqual(self.window.output_readback_values[2]["amplitude"].text(), "125 mVpp")
+        units[1].setCurrentText("Vpp")
+        self.assertEqual(self.window.output_readback_values[1]["amplitude"].text(), "2.5 Vpp")
+        self.assertEqual(list(self.generator.commands), [])
+        self.assertEqual(self.generator.snapshot().channels, before)
+        self.assertEqual(self.window._device_parameter_snapshot(), editors)
+        self.assertEqual(self.window.output_readback_status.text(), status)
+        for legacy in (False, True):
+            controls = self.window._persistent_controls(use_explicit_keys=not legacy)
+            self.assertTrue(all(control not in controls.values() for control in units.values()))
+
+    def test_native_dbm_and_vrms_ignore_peak_display_choice(self):
+        self.refresh()
+        for combo in self.window.output_readback_units.values():
+            combo.setCurrentText("mVpp")
+        self.generator.amplitude_units.update({1: "DBM", 2: "VRMS"})
+        original = self.window.driver.session.query
+
+        def native(command, **kwargs):
+            if command == ":SOUR1:VOLT?":
+                return "-37.25"
+            if command == ":SOUR2:VOLT?":
+                return "0.0125"
+            return original(command, **kwargs)
+
+        with patch.object(self.window.driver.session, "query", side_effect=native):
+            self.refresh()
+        self.assertEqual(self.window.output_readback_values[1]["amplitude"].text(), "-37.25 dBm")
+        self.assertEqual(self.window.output_readback_values[2]["amplitude"].text(), "0.0125 Vrms")
+        self.assertTrue(all(not combo.isEnabled() for combo in self.window.output_readback_units.values()))
+        self.generator.commands.clear()
+        # Programmatic changes must also preserve native units, even though the UI is disabled.
+        for combo in self.window.output_readback_units.values():
+            combo.setCurrentText("Vpp")
+        self.assertEqual(self.window.output_readback_values[1]["amplitude"].text(), "-37.25 dBm")
+        self.assertEqual(self.window.output_readback_values[2]["amplitude"].text(), "0.0125 Vrms")
+        self.assertEqual(list(self.generator.commands), [])
+
+    def test_level_span_can_display_mvpp_without_inventing_dbm(self):
+        original = self.window.driver.session.query
+        with patch.object(self.window.driver.session, "query", side_effect=lambda command, **kwargs:
+                          "" if command.endswith(":VOLT:UNIT?") else original(command, **kwargs)):
+            self.refresh()
+        self.generator.commands.clear()
+        self.window.output_readback_units[2].setCurrentText("mVpp")
+        label = self.window.output_readback_values[2]["amplitude"]
+        self.assertEqual(label.text(), "125 mVpp（电平差）")
+        self.assertIn("单位未知", label.toolTip())
+        self.assertNotIn("dBm", label.text())
+        self.assertEqual(list(self.generator.commands), [])
+
+    def test_display_switch_before_sync_rejects_reconnected_cache_without_io(self):
+        self.refresh()
+        self.manager.disconnect(self.record)
+        self.manager.connect(self.record)
+        self.generator.commands.clear()
+        self.window.output_readback_units[1].setCurrentText("mVpp")
+        self.assert_unknown()
+        self.assertIn("连接已变化", self.window.output_readback_status.text())
+        self.assertEqual(self.window.overview_metrics["channel_1"].text(), "未知")
+        self.assertEqual(list(self.generator.commands), [])
+        self.assertTrue(all(not combo.isEnabled() for combo in self.window.output_readback_units.values()))
+
+    def test_display_switch_before_sync_rejects_disconnected_cache_without_io(self):
+        self.refresh()
+        self.manager.disconnect(self.record)
+        self.generator.commands.clear()
+        self.window.output_readback_units[1].setCurrentText("mVpp")
+        self.assert_unknown()
+        self.assertEqual(list(self.generator.commands), [])
+
+    def test_pending_or_failed_read_cannot_restore_cached_values_by_display_switch(self):
+        self.refresh()
+        queued = []
+        with patch.object(self.window, "submit", side_effect=lambda operation, **callbacks: queued.append(callbacks)):
+            self.window._refresh_output_readback()
+        self.generator.commands.clear()
+        self.window.output_readback_units[1].setCurrentText("mVpp")
+        self.assert_unknown()
+        queued[0]["on_error"]("TEST_FAILED_READ")
+        self.window.output_readback_units[1].setCurrentText("Vpp")
+        self.assert_unknown()
+        self.assertIn("TEST_FAILED_READ", self.window.output_readback_status.text())
+        self.assertEqual(list(self.generator.commands), [])
+
+    def test_display_conversion_overflow_invalidates_snapshot_without_io(self):
+        original = self.window.driver.session.query
+        with patch.object(self.window.driver.session, "query", side_effect=lambda command, **kwargs:
+                          "1e308" if command == ":SOUR2:VOLT?" else original(command, **kwargs)):
+            self.refresh()
+        self.generator.commands.clear()
+        self.window.output_readback_units[2].setCurrentText("mVpp")
+        self.assert_unknown()
+        self.assertIn("显示换算失败", self.window.output_readback_status.text())
+        self.window.output_readback_units[2].setCurrentText("Vpp")
+        self.assert_unknown()
+        self.assertEqual(list(self.generator.commands), [])
+
     def test_empty_units_show_explicit_level_difference_without_changing_settings(self):
         self.generator.channels[1]["offset_v"] = 1.0
         self.generator.channels[2].update(offset_v=-0.25, function="SQU")
