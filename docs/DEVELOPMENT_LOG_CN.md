@@ -1,10 +1,10 @@
 # DG4000 + SIGLENT SSG + Vaunix + Newport + NI 多设备联动控制：开发日志与维护指南
 
-文档版本：1.11
+文档版本：1.12
 
-对应软件版本：0.7.24（保存的虚拟设备重启探测修复；沿用安装版保留数据升级；阶段记录见第 12 节）
+对应软件版本：0.7.25 修复候选（GitHub API 限流后的官方清单备用检查；阶段记录见第 12 节）
 
-最后更新：2026-10-28
+最后更新：2026-10-29
 适用仓库：`Rigol_Generator_GUI`
 
 ## 1. 文档目的
@@ -28,7 +28,7 @@
 - 用 NI 外部触发推进 Newport PR50CC 小角度循环扫描，保持首点并在末点下一触发回跳；可在同一任务内记录连续模拟输入。
 - 通过版本化配置包迁移设备、参数、保存任务和连接恢复列表，导入不自动开启输出或运动。
 - 提供内置 Python/Qt 的 Windows x64 安装程序 EXE、目录 ZIP 和单文件 EXE，目标电脑免 Python 安装；保留原有源码启动器供开发使用。
-- 异步检查公开 GitHub 最新正式 Release，发现更高版本时在首页提示并后台下载适用附件，验证大小与 SHA-256 后独立保存，由用户手动升级；离线继续使用仪器功能。
+- 异步检查公开 GitHub 最新正式 Release，发现更高版本时在首页提示并后台下载适用附件，验证大小与 SHA-256 后独立保存；安装版在设备空闲并正常退出后保留数据升级，便携格式手动迁移。API 限流时可尝试受限官方清单；离线继续使用仪器功能。
 - 在无硬件、无 PyVISA、无 NI-DAQmx 的环境中提供可重复的虚拟联调路径。
 
 ### 2.2 非目标和边界
@@ -395,7 +395,7 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 | 配置迁移 | 往返、备份、损坏包、写入失败/中断恢复、连接恢复和运行互斥 | `test_config_archive.py`、`test_config_archive_ui.py` |
 | Windows 源码入口 | 目录迁移、特殊字符路径、解释器回退、失败日志 | `test_windows_launcher.py` |
 | 便携发行 | 冻结路径、数据目录优先级、权限错误、厂商 DLL 定位、打包文件选择 | `test_runtime.py`、`test_release_build.py` |
-| 联网更新 | 正式版本比较、受限异步请求、附件 URL/大小/SHA-256 校验、进度、取消、重试、偏好及窗口关闭 | `test_updates.py`、下载服务及更新区 UI 回归；测试不访问真实 GitHub |
+| 联网更新 | 正式版本比较、受限异步请求、API 限流/官方清单、退避/缓存、附件 URL/大小/SHA-256 校验、进度、取消、重试、偏好及窗口关闭 | 更新检查、下载服务及更新区 UI 回归；默认测试不访问真实 GitHub，实网诊断单独记录 |
 | 安装与保留数据升级 | 安装标记/目录、已校验安装请求、任务忙时等待、退出交接、数据备份/恢复、同名冲突和卸载保留 | `test_installer_update_ui.py`、`test_install_update.py`、`test_installation_controller.py`、`test_install_data.py`、`test_installer_build.py`，实际 Setup 在隔离标识/临时路径验收 |
 | 编译产物自检 | 依赖来自包内、Qt 插件/图标、六台虚拟设备和窗口、普通 GUI 启动 | `tools/frozen_entry.py`、`tools/build_release.py` |
 
@@ -459,6 +459,18 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 实体输出测试必须由实验负责人确认幅度、偏置、负载、端接方式、PFI 电平、接地和被测电路耐压。自动测试不能替代这些电气检查。
 
 ## 12. 版本开发日志
+
+### 0.7.25：GitHub API 限流后的更新检查 — 2026-10-29
+
+- 用户反馈安装后检查更新提示 GitHub 暂时限制请求。首次 urllib 只读诊断取得 API HTTP 403、`X-RateLimit-Limit: 60`、`X-RateLimit-Remaining: 0`；相同仓库的官方 `releases/latest/download/release-manifest.json` 返回 200、正式版本 0.7.24。随后使用真实 v0.7.24 源码 Qt 更新检查器，API 返回 200、剩余额度 58；代理/网络路径或限流状态可能不同，不能据 urllib 结果声称已完整复现用户安装环境。
+- 原有自动检查是启动约 3 秒一次、运行中每 6 小时一次，正在检查时合并请求；未发现自动请求风暴。确认原版把所有 HTTP 403/429 都当作限流，失败后立即允许继续请求，且首次检查失败时没有发布页按钮。GitHub 匿名 REST API 额度按出口 IP 共享，其他应用、同网络及代理用户的请求也会消耗额度，不能把额度耗尽归结为本应用单独发了 60 次请求。
+- 本轮新增官方发行清单备用检查，限制官方 HTTPS、项目路径、正式版本、跳转数量、响应大小和总检查时间；从清单构造规范附件元数据，下载与安装继续校验字节数和 SHA-256。取消、关闭与迟到结果保持原规则，不以任何网络失败触发自动安装。
+- 按 `Retry-After`/`X-RateLimit-Reset` 安排 API 退避，成功缓存 60 秒、失败冷却 30 秒，均仅保存在本进程内存，不写 DATA。区分普通访问拒绝和真实限流；首次失败也提供固定仓库发布页入口。系统代理按实际请求地址解析，不改变全局设置；不提供或内置 GitHub 令牌，不上传仪器参数或用户数据。
+- 重复或缓存的同版通知保留已验证 Setup 和待安装请求，避免重新检查清掉等待中的安装；安装失败后重新检查同一更新不自动重放，保留显式“安装更新”重试。核心更新相关针对性回归执行 102 项，最后的更新区与安装 UI 回归为 38 项，均通过；新增界面修复纳入以下完整最终回归。
+- 版本提升到 0.7.25；本轮为源码和本地修复交付，沿用维护推送授权，不创建新标签或 Release，正式下载仍为 v0.7.24。文档说明旧更新器已限流时可能需要手动取得新 Setup 或等待额度恢复，保留原用户数据后安装，不要求先手动卸载或删除配置。公开规则来源为 [GitHub API 限流说明](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)和[官方发行附件固定链接](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)。
+- 完整源码 unittest 执行 692 项、131.669 秒、OK，仅一项因本机 Windows 符号链接权限跳过，记录为 `unittest-final.log`。最终源码虚拟自检 `source-self-test-final.json` 成功；新增 `github_rate_limit_fallback` 的六项标志与 `installed_update_lifecycle` 的保留待安装请求、失败显式重试两项均为 true，新增检查网络/硬件访问为 false。
+- Qt 真实联网验收 `live-qt-update-check.json` 成功：普通检查经 API 200、剩余额度 57，1.438 秒；独立场景仅注入 API 403，后续真实官方最新清单 302、固定正式标签清单 302、CDN 200，3.158 秒，确认正式 v0.7.24。ZIP/独立 EXE/Setup 的大小与 SHA-256 均与正式发布附件相同；立即重复检查命中缓存，无新增请求。该独立联网工具不读取用户数据、不构造仪器主界面、不下载应用附件、不执行安装器或访问硬件。
+- 本轮正常推送源码后，使用 `main` 的手动构建流程生成候选 Setup、便携 ZIP、独立 EXE 与源码快照，不创建新标签或 Release。Windows CI、冻结自检、普通启动及隔离安装验收结果随同组 `release-manifest.json` 和验证文件记录；证据目录 `dist/verification/0.7.25/`，源码与冻结验收分别使用实际新结果，不覆盖已交付 v0.7.24。
 
 ### 0.7.24：保存的虚拟设备重启探测与旧版迁移复查 — 2026-10-28
 

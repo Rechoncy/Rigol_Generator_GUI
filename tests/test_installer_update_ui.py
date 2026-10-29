@@ -70,6 +70,28 @@ class InstallerUpdatePanelTests(unittest.TestCase):
         self.assertEqual(self.downloader.calls[0][0], self.asset)
         self.assertFalse(self.requests, "Download start must never be treated as install-ready")
 
+    def test_repeated_result_keeps_verified_setup_and_single_pending_install(self):
+        path = self.ready()
+        self.assertEqual(len(self.requests), 1)
+        self.checker.update_available.emit(self.release)
+        self.checker.update_available.emit(self.release)
+        self.assertEqual(len(self.downloader.calls), 1)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.panel._downloaded_path, path)
+        self.assertEqual(self.panel._downloaded_asset, self.asset)
+        self.assertTrue(self.panel._install_request_pending)
+
+    def test_cached_recheck_does_not_replay_failed_install_without_explicit_click(self):
+        path = self.ready()
+        self.panel.set_install_status("测试安装准备失败", retry=True)
+        self.checker.update_available.emit(self.release)
+        self.assertEqual(len(self.downloader.calls), 1)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.panel._downloaded_path, path)
+        self.assertFalse(self.panel._install_request_pending)
+        self.panel.install_button.click()
+        self.assertEqual(len(self.requests), 2)
+
     def test_only_verified_completion_emits_once_and_never_opens_or_launches(self):
         with patch("rigol_control.ui.update_panel.QDesktopServices.openUrl") as browser:
             path = self.ready()

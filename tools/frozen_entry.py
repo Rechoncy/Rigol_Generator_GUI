@@ -452,6 +452,13 @@ def _bundle_self_test(report_path: Path) -> int:
             if load_update_preference(data_dir) != (True, ""):
                 raise AssertionError("Automatic update preference could not be re-enabled")
             update.checker.up_to_date.emit(__version__)
+            update.checker.failed.emit("离线自检：首次检查失败")
+            if update.release_button.isHidden():
+                raise AssertionError("First failed update check hid the official release page")
+            update.release_button.click()
+            if opened_urls[-1] != "https://github.com/Rechoncy/Rigol_Generator_GUI/releases/latest":
+                raise AssertionError("Failed initial check did not use the fixed latest release URL")
+            update.checker.up_to_date.emit(__version__)
         finally:
             QDesktopServices.openUrl = original_open_url
             update.checker.check = original_check
@@ -459,6 +466,7 @@ def _bundle_self_test(report_path: Path) -> int:
             "startup_network_disabled_in_self_test": True,
             "newer_release_notice": True, "numeric_version_ordering": True,
             "failure_keeps_device_controls": True, "manual_retry_available": True,
+            "first_failure_offers_official_release_page": True,
             "preference_persisted": True, "tls_backend_available": True,
             "tls_backends": QSslSocket.availableBackends(),
             "tls_active_backend": QSslSocket.activeBackend(),
@@ -489,6 +497,115 @@ def _bundle_self_test(report_path: Path) -> int:
         downloadable = parse_release(download_payload, __version__)
         if downloadable is None or len(downloadable.assets) != 3:
             raise AssertionError("Valid update attachments were not recognized")
+        # Use the real checker state machine with in-memory responses. Exercise
+        # API rate limiting, a pinned official manifest redirect and the exact
+        # Setup metadata consumed by download/install, without any HTTP traffic.
+        from PyQt6.QtCore import QObject, QUrl, pyqtSignal
+        from PyQt6.QtNetwork import QNetworkReply, QNetworkRequest
+        from rigol_control.updates import LATEST_MANIFEST_URL, REPOSITORY_URL, UpdateChecker
+        from rigol_control.updates_download import _validate_asset
+
+        class OfflineUpdateReply(QObject):
+            readyRead = pyqtSignal()
+            finished = pyqtSignal()
+
+            def __init__(self, url):
+                super().__init__()
+                self.request_url = url
+                self.status, self.target, self.headers = 200, "", {}
+                self.data = bytearray()
+
+            def setReadBufferSize(self, limit):
+                pass
+
+            def read(self, limit):
+                chunk = bytes(self.data[:limit])
+                del self.data[:limit]
+                return chunk
+
+            def attribute(self, code):
+                if code == QNetworkRequest.Attribute.HttpStatusCodeAttribute:
+                    return self.status
+                if code == QNetworkRequest.Attribute.RedirectionTargetAttribute:
+                    return QUrl(self.target) if self.target else None
+                return None
+
+            def rawHeader(self, name):
+                return self.headers.get(bytes(name).lower(), b"")
+
+            def url(self):
+                return QUrl(self.request_url)
+
+            def error(self):
+                return (QNetworkReply.NetworkError.ContentAccessDenied if self.status == 403
+                        else QNetworkReply.NetworkError.NoError)
+
+            def abort(self):
+                self.finished.emit()
+
+            def deleteLater(self):
+                pass
+
+            def deliver(self, data=b""):
+                self.data.extend(data)
+                self.readyRead.emit()
+                self.finished.emit()
+
+        class OfflineUpdateManager:
+            def __init__(self):
+                self.requests, self.replies = [], []
+
+            def get(self, request):
+                self.requests.append(request.url().toString())
+                reply = OfflineUpdateReply(self.requests[-1])
+                self.replies.append(reply)
+                return reply
+
+        offline_manager = OfflineUpdateManager()
+        rate_checker = UpdateChecker(manager=offline_manager, current_version=__version__)
+        fallback_releases, fallback_errors = [], []
+        rate_checker.update_available.connect(fallback_releases.append)
+        rate_checker.failed.connect(fallback_errors.append)
+        try:
+            if not rate_checker.check():
+                raise AssertionError("Offline rate-limit probe did not start")
+            limited = offline_manager.replies[-1]
+            limited.status = 403
+            limited.headers[b"x-ratelimit-remaining"] = b"0"
+            limited.deliver(b'{"message":"API rate limit exceeded"}')
+            if offline_manager.requests[-1] != LATEST_MANIFEST_URL:
+                raise AssertionError("Limited API did not switch to the official latest manifest")
+            redirect = offline_manager.replies[-1]
+            redirect.status = 302
+            redirect.target = f"{REPOSITORY_URL}/releases/download/v99.0.0/release-manifest.json"
+            redirect.deliver()
+            manifest_payload = {
+                "version": "99.0.0", "platform": "windows-x64", "source_commit": "1" * 40,
+                "source_dirty": False,
+                "artifacts": [{"file": name, "bytes": len(download_bytes), "sha256": download_digest}
+                              for name in asset_names],
+            }
+            offline_manager.replies[-1].deliver(json.dumps(manifest_payload).encode("utf-8"))
+            if fallback_errors or len(fallback_releases) != 1:
+                raise AssertionError(f"Official manifest fallback failed: {fallback_errors}")
+            if fallback_releases[0] != downloadable:
+                raise AssertionError("Fallback changed the verified package metadata")
+            for fixture_asset in fallback_releases[0].assets:
+                _validate_asset(fixture_asset)
+            if not any(item.name.endswith("-setup.exe") for item in fallback_releases[0].assets):
+                raise AssertionError("Fallback omitted the installed edition's Setup")
+            rate_checker.check()
+            app.processEvents()
+            if len(offline_manager.requests) != 3 or len(fallback_releases) != 2:
+                raise AssertionError("Repeated check did not reuse the recent verified result")
+        finally:
+            rate_checker.close()
+        report["github_rate_limit_fallback"] = {
+            "limited_api_uses_official_manifest": True, "release_tag_pinned": True,
+            "setup_size_and_sha256_preserved": True, "download_contract_unchanged": True,
+            "repeated_check_uses_cache": True, "first_failure_release_page": True,
+            "network_access": False, "hardware_access": False,
+        }
         download_calls = []
         opened_folders = []
         downloader = update.downloader
@@ -678,6 +795,18 @@ def _bundle_self_test(report_path: Path) -> int:
             installed_panel.request_install()
             if len(setup_requests) != 1:
                 raise AssertionError("Duplicate installer-ready action replayed an installation request")
+            installed_panel.checker.update_available.emit(setup_release)
+            if (len(setup_downloads) != 1 or len(setup_requests) != 1
+                    or not installed_panel._install_request_pending
+                    or installed_panel._downloaded_path != setup_fixture_path):
+                raise AssertionError("Repeated version notice reset a verified pending installer")
+            installed_panel.set_install_status("离线自检：安装准备失败", retry=True)
+            installed_panel.checker.update_available.emit(setup_release)
+            if len(setup_downloads) != 1 or len(setup_requests) != 1:
+                raise AssertionError("Checking again automatically replayed a failed installer")
+            installed_panel.install_button.click()
+            if len(setup_requests) != 2:
+                raise AssertionError("Explicit Install did not allow retry of the verified package")
         finally:
             setup_downloader._active = False
             setup_downloader.start = original_setup_start
@@ -721,6 +850,8 @@ def _bundle_self_test(report_path: Path) -> int:
             "external_data_preserved": True, "backup_restore_verified": True,
             "setup_asset_selected": True, "clean_close_required": True,
             "busy_install_deferred": True, "no_installer_execution": True,
+            "repeated_check_keeps_pending_installer": True,
+            "failed_install_requires_explicit_retry": True,
             "no_hardware_access": True, "hardware_access": False, "network_access": False,
         }
         # Verify the global input policy on the real six device windows,

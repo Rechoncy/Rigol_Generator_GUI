@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import QCheckBox, QFrame, QHBoxLayout, QLabel, QProgressBar
 from .. import __version__
 from ..runtime import is_installed
 from ..update_settings import UpdatePreferences, load_update_preferences, save_update_preferences
-from ..updates import ReleaseAsset, ReleaseInfo, UpdateChecker
+from ..updates import REPOSITORY_URL, ReleaseAsset, ReleaseInfo, UpdateChecker
 from ..updates_download import UpdateDownloader
 
 
@@ -89,7 +89,7 @@ class UpdatePanel(QFrame):
         result.addWidget(self.status, 1)
         self.release_button = QPushButton("打开发布页")
         self.release_button.setObjectName("PrimaryButton")
-        self.release_button.setToolTip("在浏览器查看更新说明并选择下载便携 ZIP 或 EXE")
+        self.release_button.setToolTip("在浏览器查看正式发布页，选择安装程序、便携 ZIP 或独立 EXE")
         self.release_button.hide()
         self.release_button.clicked.connect(self.open_release)
         result.addWidget(self.release_button)
@@ -249,12 +249,14 @@ class UpdatePanel(QFrame):
 
     def _failed(self, message: str) -> None:
         if not self._closed:
+            self.release_button.show()
             self._set_status(f"检查未完成：{message}。可稍后重试，设备功能仍可使用。")
 
     def open_release(self) -> None:
-        if self._available is not None and not self._closed:
-            if not QDesktopServices.openUrl(QUrl(self._available.url)):
-                self._set_status(f"无法打开浏览器，请访问 {self._available.url}")
+        if not self._closed:
+            url = self._available.url if self._available is not None else f"{REPOSITORY_URL}/releases/latest"
+            if not QDesktopServices.openUrl(QUrl(url)):
+                self._set_status(f"无法打开浏览器，请访问 {url}")
 
     def stop(self) -> None:
         self._closed = True
@@ -281,6 +283,11 @@ class UpdatePanel(QFrame):
             return
         asset = self._download_asset()
         if asset is None:
+            return
+        if automatic and self._downloaded_path is not None and self._downloaded_asset == asset:
+            # A cached/repeated version notice must keep a verified package and
+            # any pending install decision. An installation error still needs
+            # the explicit Install action; checking again must not replay it.
             return
         self._automatic_download_request = automatic
         self._downloaded_path = None

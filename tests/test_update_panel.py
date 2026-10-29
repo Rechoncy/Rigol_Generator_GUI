@@ -224,6 +224,29 @@ class UpdatePanelTests(unittest.TestCase):
         self.assertIn("无需更新", self.panel.status.text())
         self.assertFalse(self.panel.release_button.isVisible())
 
+    def test_first_check_failure_offers_official_latest_page_without_auto_browser(self):
+        with patch("rigol_control.ui.update_panel.QDesktopServices.openUrl", return_value=True) as browser:
+            self.panel.check()
+            self.checker.finish(self.checker.failed, "GitHub API 请求额度暂时用完")
+            self.assertTrue(self.panel.release_button.isVisible())
+            self.assertIsNone(self.panel._available)
+            self.assertFalse(self.panel.downloader.downloading)
+            self.assertNotIn("无需更新", self.panel.status.text())
+            browser.assert_not_called()
+            self.panel.release_button.click()
+            self.assertEqual(browser.call_args.args[0].toString(),
+                             "https://github.com/Rechoncy/Rigol_Generator_GUI/releases/latest")
+            self.panel.stop()
+            self.panel.open_release()
+            self.assertEqual(browser.call_count, 1)
+
+    def test_failed_browser_open_before_version_known_keeps_fixed_release_link_visible(self):
+        self.checker.finish(self.checker.failed, "offline")
+        with patch("rigol_control.ui.update_panel.QDesktopServices.openUrl", return_value=False):
+            self.panel.open_release()
+        self.assertIn("https://github.com/Rechoncy/Rigol_Generator_GUI/releases/latest", self.panel.status.text())
+        self.assertTrue(self.panel.release_button.isVisible())
+
     def test_save_failure_visible_and_close_cancels_timers(self):
         self.panel.start_automatic_checks()
         with patch("rigol_control.ui.update_panel.save_update_preferences", side_effect=OSError("denied")):
