@@ -1008,6 +1008,67 @@ def _bundle_self_test(report_path: Path) -> int:
             "query_only": True, "editors_unchanged": True, "failed_snapshot_invalidated": True,
             "bad_reply_visible": True, "retry_without_reconnect": True, "hardware_access": False,
         }
+        # Reproduce an empty UNIT? from the reported DG4162/USB scenario
+        # without accessing USB: use the same real driver/UI on a virtual DG.
+        # HIGH?/LOW? have documented voltage units, so their difference can be
+        # displayed as a labeled configuration span without guessing native units.
+        level_calls = []
+        units_before_levels = generator.amplitude_units.copy()
+
+        def blank_dg_units(command, **kwargs):
+            level_calls.append(command)
+            return "\r\n" if command.endswith(":VOLT:UNIT?") else original_dg_query(command, **kwargs)
+
+        dg.driver.session.query = blank_dg_units
+        try:
+            dg.output_readback_button.click()
+            wait_idle(require_connected=True)
+            if "兼容回读" not in dg.output_readback_status.text() or len(level_calls) != 14:
+                raise AssertionError("Empty DG units did not use the bounded level-query snapshot")
+            for channel in (1, 2):
+                amplitude_label = dg.output_readback_values[channel]["amplitude"]
+                if (not amplitude_label.text().endswith(" Vpp（电平差）")
+                        or "单位未知" not in amplitude_label.toolTip()):
+                    raise AssertionError("Derived DG amplitude hid its source or invented a native unit")
+                expected_span = float(generator.channels[channel]["amplitude_vpp"])
+                displayed_span = float(amplitude_label.text().split(" ", 1)[0])
+                if abs(displayed_span - expected_span) > max(abs(expected_span) * 1e-7, 1e-12):
+                    raise AssertionError("DG level difference did not match the configured voltage span")
+            if (not all(command.endswith("?") for command in level_calls)
+                    or any(command in level_calls for command in (":SOUR1:VOLT?", ":SOUR2:VOLT?"))
+                    or generator.snapshot().channels != readback_before
+                    or generator.amplitude_units != units_before_levels
+                    or dg._device_parameter_snapshot() != editors_before
+                    or dg.driver.session.connection_generation != generation_before):
+                raise AssertionError("DG level fallback changed settings, guessed units or reconnected")
+
+            def invalid_dg_level(command, **kwargs):
+                if command == ":SOUR2:VOLT:HIGH?":
+                    return "BUNDLE_BAD_DG_HIGH_LEVEL"
+                return blank_dg_units(command, **kwargs)
+
+            dg.driver.session.query = invalid_dg_level
+            dg.output_readback_button.click()
+            wait_idle(require_connected=True)
+            if (any(value.text() != "未知" for values in dg.output_readback_values.values()
+                    for value in values.values())
+                    or "BUNDLE_BAD_DG_HIGH_LEVEL" not in dg.output_readback_status.text()):
+                raise AssertionError("Bad DG level data retained a partially successful channel group")
+        finally:
+            dg.driver.session.query = original_dg_query
+        dg.output_readback_button.click()
+        wait_idle(require_connected=True)
+        if (not dg.output_readback_values[2]["amplitude"].text().endswith(" Vrms")
+                or "兼容回读" in dg.output_readback_status.text()
+                or generator.snapshot().channels != readback_before):
+            raise AssertionError("Native DG retry retained a stale compatibility label or changed settings")
+        report["dg_readback_voltage_levels"] = {
+            "empty_unit_uses_documented_voltage_queries": True,
+            "derived_vpp_source_labeled": True, "native_unit_explicitly_unknown": True,
+            "query_only_no_reconnect": True, "configuration_and_editors_unchanged": True,
+            "bad_levels_invalidate_group": True, "native_retry_clears_compatibility_notice": True,
+            "hardware_access": False,
+        }
         # A complete cached read must expire even if the connection timer misses
         # the disconnected interval. Conversely, it must retain a new request
         # that already targets the replacement connection.

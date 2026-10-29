@@ -179,8 +179,10 @@ class BasicWaveform:
 class DG4000OutputReadback:
     """Instrument basic-waveform settings, not a physical output measurement.
 
-    ``amplitude`` is expressed in the returned instrument ``amplitude_unit``;
-    it must not be treated as Vpp when the instrument reports VRMS or DBM.
+    ``amplitude_unit`` describes the displayed amplitude. Normally it is the
+    instrument's reported VPP/VRMS/DBM unit. If that query returns empty,
+    ``voltage_levels`` identifies a Vpp difference derived from documented
+    high/low voltage queries; the instrument's native unit remains unknown.
     """
 
     channel: int
@@ -189,6 +191,13 @@ class DG4000OutputReadback:
     amplitude_unit: str
     output_enabled: bool
     connection_generation: int
+    amplitude_source: str = "native"
+    voltage_high_v: float | None = None
+    voltage_low_v: float | None = None
+
+    @property
+    def native_amplitude_unit(self) -> str | None:
+        return self.amplitude_unit if self.amplitude_source == "native" else None
 
 
 def validate_channel(channel: int) -> None:
@@ -411,11 +420,13 @@ class DG4000Driver:
     def read_output_parameters(self, channels=(1, 2)) -> tuple[DG4000OutputReadback, ...]:
         """Read a complete channel group without writes or automatic recovery.
 
-        All queries share a transaction with parameter stepping. A unit change
-        between the bracketing queries rejects the group rather than labeling
-        an amplitude with an uncertain unit. The returned frequency is the
-        basic-waveform setting; sweep/modulation instantaneous values are not
-        measured by these commands.
+        All queries share a transaction with parameter stepping. Recognized
+        native units are bracketed; conflicting units reject the group. An
+        empty unit reply uses the manual's HIGH?/LOW? voltage levels instead,
+        bracketed for consistency, without interpreting a unitless VOLT? value.
+        No settings, retries or automatic reconnection are used. These queries
+        describe basic-waveform settings, not instantaneous sweep/modulation
+        values or physical measurements.
         """
         selected = tuple(channels)
         if not selected or len(selected) != len(set(selected)):
@@ -441,12 +452,52 @@ class DG4000Driver:
                 raise ValueError(f"DG4000 数值回读无效 [{command}]：{raw!r}") from exc
             return value
 
-        def unit(command: str) -> tuple[str, str]:
+        def unit(command: str) -> tuple[str | None, str]:
             raw = query(command)
-            value = raw.strip().strip('"').upper() if isinstance(raw, str) else ""
+            if not isinstance(raw, str):
+                raise ValueError(f"DG4000 幅度单位回读无效 [{command}]：{raw!r}")
+            value = raw.strip()
+            if value.startswith(('"', "'")):
+                if len(value) < 2 or value[-1] != value[0]:
+                    raise ValueError(f"DG4000 幅度单位回读无效 [{command}]：{raw!r}")
+                value = value[1:-1].strip()
+            value = value.upper()
+            if not value:
+                return None, raw
             if value not in {"VPP", "VRMS", "DBM"}:
                 raise ValueError(f"DG4000 幅度单位回读无效 [{command}]：{raw!r}")
             return value, raw
+
+        def output(command: str) -> bool:
+            raw = query(command)
+            try:
+                return parse_output_state(raw)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError(f"DG4000 输出状态回读无效 [{command}]：{raw!r}") from exc
+
+        def voltage_levels(channel: int, generation: int) -> DG4000OutputReadback:
+            high_command = f":SOUR{channel}:VOLT:HIGH?"
+            low_command = f":SOUR{channel}:VOLT:LOW?"
+            before_high, before_low = number(high_command), number(low_command)
+            amplitude = before_high - before_low
+            if before_high < before_low or not math.isfinite(amplitude):
+                raise ValueError(
+                    f"DG4000 高低电平回读无效 [{high_command}/{low_command}]："
+                    f"HIGH={before_high!r} V，LOW={before_low!r} V"
+                )
+            frequency = number(f":SOUR{channel}:FREQ?", non_negative=True)
+            enabled = output(f":OUTP{channel}?")
+            after_high, after_low = number(high_command), number(low_command)
+            if (before_high, before_low) != (after_high, after_low):
+                raise ValueError(
+                    f"DG4000 回读期间高低电平变化 [{high_command}/{low_command}]："
+                    f"{(before_high, before_low)!r} -> {(after_high, after_low)!r}；请重试回读"
+                )
+            return DG4000OutputReadback(
+                channel=channel, frequency_hz=frequency, amplitude=amplitude,
+                amplitude_unit="VPP", output_enabled=enabled, connection_generation=generation,
+                amplitude_source="voltage_levels", voltage_high_v=before_high, voltage_low_v=before_low,
+            )
 
         results = []
         with self.session.transaction():
@@ -454,17 +505,20 @@ class DG4000Driver:
             for channel in selected:
                 unit_command = f":SOUR{channel}:VOLT:UNIT?"
                 before_unit, before_raw = unit(unit_command)
+                if before_unit is None:
+                    results.append(voltage_levels(channel, generation))
+                    continue
                 frequency_command = f":SOUR{channel}:FREQ?"
                 frequency = number(frequency_command, non_negative=True)
                 amplitude_command = f":SOUR{channel}:VOLT?"
                 amplitude = number(amplitude_command, non_negative=before_unit != "DBM")
-                output_command = f":OUTP{channel}?"
-                output_raw = query(output_command)
-                try:
-                    enabled = parse_output_state(output_raw)
-                except (AttributeError, TypeError, ValueError) as exc:
-                    raise ValueError(f"DG4000 输出状态回读无效 [{output_command}]：{output_raw!r}") from exc
+                enabled = output(f":OUTP{channel}?")
                 after_unit, after_raw = unit(unit_command)
+                if after_unit is None:
+                    # The previously read native amplitude has no confirmed
+                    # unit. Discard that channel's values and take fresh ones.
+                    results.append(voltage_levels(channel, generation))
+                    continue
                 if before_unit != after_unit:
                     raise ValueError(
                         f"DG4000 回读期间幅度单位变化 [{unit_command}]："

@@ -192,6 +192,12 @@ class VirtualGenerator:
         suffix = source_match.group(2)
         if suffix in {"VOLT:UNIT", "VOLTAGE:UNIT"}:
             return self.amplitude_units[int(source_match.group(1))]
+        level = re.fullmatch(r"VOLT(?:AGE)?(?::LEV(?:EL)?)?(?::IMM(?:EDIATE)?)?:(HIGH|LOW)", suffix)
+        if level:
+            # HIGH?/LOW? are voltages, independent of the selected amplitude
+            # display unit, waveform RMS conversion or configured load.
+            half_amplitude = float(channel["amplitude_vpp"]) / 2
+            return str(float(channel["offset_v"]) + (half_amplitude if level.group(1) == "HIGH" else -half_amplitude))
         if suffix in {"VOLT", "VOLTAGE", "VOLTAGE:LEVEL:IMMEDIATE:AMPLITUDE"}:
             unit = self.amplitude_units[int(source_match.group(1))]
             amplitude = float(channel["amplitude_vpp"])

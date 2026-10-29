@@ -86,6 +86,85 @@ class DgReadbackUiTests(unittest.TestCase):
         self.assertEqual(self.generator.amplitude_units, {1: "VRMS", 2: "DBM"})
         self.assertTrue(all(command.endswith("?") for command in self.generator.commands))
 
+    def test_empty_units_show_explicit_level_difference_without_changing_settings(self):
+        self.generator.channels[1]["offset_v"] = 1.0
+        self.generator.channels[2].update(offset_v=-0.25, function="SQU")
+        self.generator.amplitude_units.update({1: "VRMS", 2: "DBM"})
+        before = self.generator.snapshot().channels
+        units = self.generator.amplitude_units.copy()
+        editors = self.window._device_parameter_snapshot()
+        original = self.window.driver.session.query
+        calls = []
+
+        def blank_unit(command, **kwargs):
+            calls.append(command)
+            return "\r\n" if command.endswith(":VOLT:UNIT?") else original(command, **kwargs)
+
+        with patch.object(self.window.driver.session, "query", side_effect=blank_unit):
+            self.refresh()
+        self.assertEqual(self.window.output_readback_values[1]["amplitude"].text(), "2.5 Vpp（电平差）")
+        self.assertEqual(self.window.output_readback_values[2]["amplitude"].text(), "0.125 Vpp（电平差）")
+        self.assertIn("单位未知", self.window.output_readback_values[1]["amplitude"].toolTip())
+        self.assertIn("配置", self.window.output_readback_values[2]["amplitude"].toolTip())
+        self.assertIn("兼容回读", self.window.output_readback_status.text())
+        self.assertEqual(self.window.output_readback_values[1]["frequency"].text(), "100000000.000001 Hz")
+        self.assertEqual(self.window.output_readback_values[2]["output"].text(), "关闭（未输出）")
+        self.assertEqual(self.generator.snapshot().channels, before)
+        self.assertEqual(self.generator.amplitude_units, units)
+        self.assertEqual(self.window._device_parameter_snapshot(), editors)
+        self.assertTrue(all(command.endswith("?") for command in calls))
+        self.assertNotIn(":SOUR1:VOLT?", calls)
+        self.assertNotIn(":SOUR2:VOLT?", calls)
+
+    def test_native_success_clears_previous_level_compatibility_notice(self):
+        original = self.window.driver.session.query
+        with patch.object(self.window.driver.session, "query", side_effect=lambda command, **kwargs:
+                          "" if command == ":SOUR1:VOLT:UNIT?" else original(command, **kwargs)):
+            self.refresh()
+        self.assertIn("电平差", self.window.output_readback_values[1]["amplitude"].text())
+        self.generator.amplitude_units[1] = "VRMS"
+        self.refresh()
+        self.assertTrue(self.window.output_readback_values[1]["amplitude"].text().endswith(" Vrms"))
+        self.assertNotIn("单位未知", self.window.output_readback_values[1]["amplitude"].toolTip())
+        self.assertNotIn("兼容回读", self.window.output_readback_status.text())
+
+    def test_bad_level_reply_invalidates_group_and_allows_explicit_retry(self):
+        self.refresh()
+        generation = self.window.driver.session.connection_generation
+        original = self.window.driver.session.query
+
+        def invalid(command, **kwargs):
+            if command == ":SOUR1:VOLT:UNIT?":
+                return ""
+            if command == ":SOUR1:VOLT:HIGH?":
+                return "INVALID_HIGH_LEVEL"
+            return original(command, **kwargs)
+
+        with patch.object(self.window.driver.session, "query", side_effect=invalid), patch.object(QMessageBox, "warning") as warning:
+            self.refresh()
+            warning.assert_not_called()
+        self.assert_unknown()
+        self.assertIn(":SOUR1:VOLT:HIGH?", self.window.output_readback_status.text())
+        self.assertIn("INVALID_HIGH_LEVEL", self.window.output_readback_status.text())
+        self.assertEqual(self.window.driver.session.connection_generation, generation)
+        self.refresh()
+        self.assertEqual(self.window.output_readback_values[1]["amplitude"].text(), "2.5 Vpp")
+
+    def test_level_fallback_preserves_active_lease_and_prepared_writer(self):
+        writer = self.window.driver.prepare_trigger()
+        self.manager.acquire_devices("readback-test", [self.record.id])
+        generation = self.window.driver.session.connection_generation
+        original = self.window.driver.session.query
+        with patch.object(self.window.driver.session, "query", side_effect=lambda command, **kwargs:
+                          "" if command.endswith(":VOLT:UNIT?") else original(command, **kwargs)):
+            self.refresh()
+        self.assertIn("兼容回读", self.window.output_readback_status.text())
+        self.assertEqual(self.manager.lease_owner(self.record.id), "readback-test")
+        self.assertEqual(self.window.driver.session.connection_generation, generation)
+        writer.apply_steps([StepValue(StepParameter.FREQUENCY, 2, 34567)])
+        self.assertEqual(self.generator.channels[2]["frequency_hz"], 34567)
+        self.assertEqual(self.generator.channels[1]["frequency_hz"], 100000000.000001)
+
     def test_slow_read_keeps_qt_responsive_and_coalesces_repeated_requests(self):
         entered, release = Event(), Event()
         original = self.window.driver.session.query

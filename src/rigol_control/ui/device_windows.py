@@ -1083,6 +1083,8 @@ class DG4000Window(BaseDeviceWindow):
                 if name != "output":
                     value.setStyleSheet("font-size:16px; font-weight:600;")
                 value.setMinimumHeight(value.fontMetrics().height() + 4)
+                if name == "amplitude":
+                    value.setWordWrap(True)
                 form.addRow(caption, value)
                 values[name] = value
             self.output_readback_values[channel] = values
@@ -1090,7 +1092,8 @@ class DG4000Window(BaseDeviceWindow):
             channels.addWidget(card)
         monitor_layout.addLayout(channels)
         note = QLabel(
-            "回读仪器参数，不覆盖上方编辑值。幅度按仪器当前 Vpp / Vrms / dBm 单位显示；"
+            "回读仪器配置，不覆盖上方编辑值。幅度通常按仪器当前 Vpp / Vrms / dBm 单位显示；"
+            "单位未返回时，以高低电平差计算 Vpp 并标记为兼容回读。"
             "输出关闭时数值仅为配置。扫频或调制时的瞬时信号须由测量设备确认。"
         )
         note.setWordWrap(True)
@@ -1154,19 +1157,34 @@ class DG4000Window(BaseDeviceWindow):
                 self._invalidate_output_readback("连接已变化 · 回读值未知，请重新回读")
                 self._set_output_metrics(None)
                 return
+            compatible_channels = []
             for item in readings:
                 values = self.output_readback_values[item.channel]
                 frequency = f"{roundtrip_number(item.frequency_hz)} Hz"
                 amplitude_unit = {"VPP": "Vpp", "VRMS": "Vrms", "DBM": "dBm"}[item.amplitude_unit]
                 amplitude = f"{roundtrip_number(item.amplitude)} {amplitude_unit}"
+                if item.amplitude_source == "voltage_levels":
+                    amplitude += "（电平差）"
+                    compatible_channels.append(f"CH{item.channel}")
                 values["frequency"].setText(frequency)
                 values["amplitude"].setText(amplitude)
                 values["output"].setText("开启" if item.output_enabled else "关闭（未输出）")
                 values["frequency"].setToolTip(f"仪器基本波频率参数：{frequency}；不是扫频/调制瞬时实测值")
-                values["amplitude"].setToolTip(f"仪器当前幅度参数：{amplitude}；未切换单位或负载")
+                if item.amplitude_source == "voltage_levels":
+                    values["amplitude"].setToolTip(
+                        f"高电平 {roundtrip_number(item.voltage_high_v)} V − "
+                        f"低电平 {roundtrip_number(item.voltage_low_v)} V，计算配置电平差。"
+                        "仪器当前幅度单位未知；未切换单位或负载，不是瞬时输出实测值。"
+                    )
+                else:
+                    values["amplitude"].setToolTip(f"仪器当前幅度参数：{amplitude}；未切换单位或负载")
             self._set_output_metrics(tuple(item.output_enabled for item in readings))
+            compatibility = (
+                f" · 兼容回读：{'、'.join(compatible_channels)} 幅度为高低电平差，仪器当前幅度单位未知"
+                if compatible_channels else ""
+            )
             self.output_readback_status.setText(
-                f"回读时间：{read_at:%Y-%m-%d %H:%M:%S}（本地） · 点击可刷新"
+                f"回读时间：{read_at:%Y-%m-%d %H:%M:%S}（本地）{compatibility} · 点击可刷新"
             )
 
         def failed(message: str) -> None:
