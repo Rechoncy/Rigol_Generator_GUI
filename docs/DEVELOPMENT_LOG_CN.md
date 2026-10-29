@@ -2,7 +2,7 @@
 
 文档版本：1.12
 
-对应软件版本：0.7.25 修复候选（GitHub API 限流后的官方清单备用检查；阶段记录见第 12 节）
+对应软件版本：0.7.25（GitHub API 限流后的官方清单备用检查；本次正式发行与前期候选记录见第 12 节）
 
 最后更新：2026-10-29
 适用仓库：`Rigol_Generator_GUI`
@@ -460,17 +460,24 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 
 ## 12. 版本开发日志
 
-### 0.7.25：GitHub API 限流后的更新检查 — 2026-10-29
+### 0.7.25 GitHub 正式发行 — 2026-10-29
+
+- 用户在本地修复交付完成后明确要求“发布到 GitHub”，本次据此创建 v0.7.25 正式标签与 Release，替代开发阶段不创建标签/Release 的安排。README、使用说明和发行下载文件名同步至 [v0.7.25](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.25)；保留下方真实源码测试、联网诊断及本地候选记录。
+- 正式发布流程从本次文档提交重新构建 Setup、便携 ZIP、独立 EXE、源码快照、发行说明、构建清单及 SHA-256 共七份附件，执行完整回归、冻结与隔离安装检查，成功后才上传。新标签的实际构建和发布结果以对应 GitHub 工作流及正式组 `release-manifest.json` 为准，不预写通过结果，也不将此前候选产物的检查替代新构建验收。
+- 正式附件本地副本使用 `dist/published/v0.7.25/`，原 `dist/local/v0.7.25/` 候选（源码提交 `47884b2`）和旧 v0.7.24 正式附件分别保留，不覆盖已有交付。此次只同步正式发行文档，不修改应用源码、版本号、测试或仪器协议。
+- 正式 Release 可由旧更新器检测；旧 v0.7.24 已受 API 限流时，仍应等待恢复或从发行页手动运行新 Setup 并保留原数据，不能要求未升级的旧程序预先具备本版备用检查逻辑。
+
+### 0.7.25 开发修复与本地候选：GitHub API 限流后的更新检查 — 2026-10-29
 
 - 用户反馈安装后检查更新提示 GitHub 暂时限制请求。首次 urllib 只读诊断取得 API HTTP 403、`X-RateLimit-Limit: 60`、`X-RateLimit-Remaining: 0`；相同仓库的官方 `releases/latest/download/release-manifest.json` 返回 200、正式版本 0.7.24。随后使用真实 v0.7.24 源码 Qt 更新检查器，API 返回 200、剩余额度 58；代理/网络路径或限流状态可能不同，不能据 urllib 结果声称已完整复现用户安装环境。
 - 原有自动检查是启动约 3 秒一次、运行中每 6 小时一次，正在检查时合并请求；未发现自动请求风暴。确认原版把所有 HTTP 403/429 都当作限流，失败后立即允许继续请求，且首次检查失败时没有发布页按钮。GitHub 匿名 REST API 额度按出口 IP 共享，其他应用、同网络及代理用户的请求也会消耗额度，不能把额度耗尽归结为本应用单独发了 60 次请求。
 - 本轮新增官方发行清单备用检查，限制官方 HTTPS、项目路径、正式版本、跳转数量、响应大小和总检查时间；从清单构造规范附件元数据，下载与安装继续校验字节数和 SHA-256。取消、关闭与迟到结果保持原规则，不以任何网络失败触发自动安装。
 - 按 `Retry-After`/`X-RateLimit-Reset` 安排 API 退避，成功缓存 60 秒、失败冷却 30 秒，均仅保存在本进程内存，不写 DATA。区分普通访问拒绝和真实限流；首次失败也提供固定仓库发布页入口。系统代理按实际请求地址解析，不改变全局设置；不提供或内置 GitHub 令牌，不上传仪器参数或用户数据。
 - 重复或缓存的同版通知保留已验证 Setup 和待安装请求，避免重新检查清掉等待中的安装；安装失败后重新检查同一更新不自动重放，保留显式“安装更新”重试。核心更新相关针对性回归执行 102 项，最后的更新区与安装 UI 回归为 38 项，均通过；新增界面修复纳入以下完整最终回归。
-- 版本提升到 0.7.25；本轮为源码和本地修复交付，沿用维护推送授权，不创建新标签或 Release，正式下载仍为 v0.7.24。文档说明旧更新器已限流时可能需要手动取得新 Setup 或等待额度恢复，保留原用户数据后安装，不要求先手动卸载或删除配置。公开规则来源为 [GitHub API 限流说明](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)和[官方发行附件固定链接](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)。
+- 开发修复阶段版本提升到 0.7.25，先按维护授权推送源码和交付本地候选，当时未创建标签或 Release，正式下载仍为 v0.7.24；随后用户明确授权正式发布，见上方发行记录。文档说明旧更新器已限流时可能需要手动取得新 Setup 或等待额度恢复，保留原用户数据后安装，不要求先手动卸载或删除配置。公开规则来源为 [GitHub API 限流说明](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)和[官方发行附件固定链接](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)。
 - 完整源码 unittest 执行 692 项、131.669 秒、OK，仅一项因本机 Windows 符号链接权限跳过，记录为 `unittest-final.log`。最终源码虚拟自检 `source-self-test-final.json` 成功；新增 `github_rate_limit_fallback` 的六项标志与 `installed_update_lifecycle` 的保留待安装请求、失败显式重试两项均为 true，新增检查网络/硬件访问为 false。
 - Qt 真实联网验收 `live-qt-update-check.json` 成功：普通检查经 API 200、剩余额度 57，1.438 秒；独立场景仅注入 API 403，后续真实官方最新清单 302、固定正式标签清单 302、CDN 200，3.158 秒，确认正式 v0.7.24。ZIP/独立 EXE/Setup 的大小与 SHA-256 均与正式发布附件相同；立即重复检查命中缓存，无新增请求。该独立联网工具不读取用户数据、不构造仪器主界面、不下载应用附件、不执行安装器或访问硬件。
-- 本轮正常推送源码后，使用 `main` 的手动构建流程生成候选 Setup、便携 ZIP、独立 EXE 与源码快照，不创建新标签或 Release。Windows CI、冻结自检、普通启动及隔离安装验收结果随同组 `release-manifest.json` 和验证文件记录；证据目录 `dist/verification/0.7.25/`，源码与冻结验收分别使用实际新结果，不覆盖已交付 v0.7.24。
+- 开发阶段正常推送源码后，使用 `main` 的手动构建流程生成候选 Setup、便携 ZIP、独立 EXE 与源码快照，未创建标签或 Release。候选的 Windows CI、冻结自检、普通启动及隔离安装验收结果随同组 `release-manifest.json` 和验证文件记录；证据目录 `dist/verification/0.7.25/`，源码与冻结验收分别使用实际新结果，不覆盖已交付 v0.7.24。正式发行采用上方说明的新文档提交与新标签构建。
 
 ### 0.7.24：保存的虚拟设备重启探测与旧版迁移复查 — 2026-10-28
 
