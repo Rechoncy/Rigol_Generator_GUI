@@ -1,10 +1,10 @@
 # DG4000 + SIGLENT SSG + Vaunix + Newport + NI 多设备联动控制：开发日志与维护指南
 
-文档版本：1.15
+文档版本：1.16
 
-对应软件版本：0.7.29（DG 回读单位跟随与 VISA 回复同步；正式发行及前期候选记录见第 12 节）
+对应软件版本：0.7.30 本地候选（VISA 共享资源管理器关闭隔离；当前公开正式版仍为 0.7.29，记录见第 12 节）
 
-最后更新：2026-10-29
+最后更新：2026-11-09
 适用仓库：`Rigol_Generator_GUI`
 
 ## 1. 文档目的
@@ -83,6 +83,7 @@ UI 线程只负责控件状态和提交后台工作。VISA 写入、NI 计数监
 | `src/rigol_control/connections.py` | 共享连接、同资源别名租约、连接/断开保留、虚拟/实机工厂 | 活动占用阻止断开/close_all；连接过渡阻止新任务；SSG 继续遵循其状态证据 |
 | `src/rigol_control/services.py` | VISA/NI 资源发现与设备探测 | 未安装厂商驱动时必须返回可解释状态 |
 | `src/rigol_control/drivers/scpi.py` | 单 VISA 会话串行化、查询和批量写入 | 不允许多个线程绕过会话锁直接访问同一资源 |
+| `src/rigol_control/drivers/visa_resource_manager.py` | 应用内共享 PyVISA 管理器的租用计数和最后释放 | 连接、搜索和探测都必须经此入口；某台清理不能关闭仍有使用者的管理器 |
 | `src/rigol_control/drivers/dg4000.py` | DG4000 类型化命令、负载、步进参数命令映射 | 新命令需同时覆盖格式校验和 fake backend 测试 |
 | `src/rigol_control/drivers/siglent_ssg.py` | 分型号能力、原生扫描、调制、BUS、回读与虚拟后端 | 普通 3000X 不发 -V 命令；触发不重发、列表全量校验、参数验证后启用 |
 | `src/rigol_control/drivers/vaunix_lms.py` | Vaunix SDK 1.15 ctypes 绑定、稳定序列号连接、完整 LMS/BLX 控制和虚拟设备 | DLL 句柄不是稳定身份；频率为 10 Hz 单位；功率编码为 0.25 dB、实际分辨率为 0.5 dB |
@@ -387,6 +388,7 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 | 驱动 | SCPI 命令、型号范围、NI 配置、Vaunix 能力和失效连接、Newport 现场回包 | `test_hardware_core.py`、`test_vaunix.py`、`test_vaunix_recovery.py`、`test_newport.py` |
 | 控制器 | DG/Vaunix 有序积压、Newport 回跳/忙时停止、连续文本和缓存丢弃 | `test_analog.py`、`test_linkage.py`、`test_newport.py` |
 | 基础设施 | 资源发现、连接共享、设备租约、原子仓库 | `test_discovery.py`、`test_connections.py`、`test_repository.py` |
+| VISA 生命周期 | 双连接隔离、发现/探测/初始化失败清理、最后释放与并发 | `test_visa_manager_lifetime.py`；冻结自检 `visa_session_lifetime` |
 | 虚拟实验室 | DG/Vaunix/Newport 状态、触发、四通道采集、默认 50 Ω | `test_virtual_lab.py`、`test_vaunix.py`、`test_newport.py` |
 | UI 端到端 | 六台虚拟设备、动态范围、DG/Vaunix 联动、Newport 身份与运动状态 | `test_ui_smoke.py`、`test_newport_ui.py` |
 | 鼎阳 SSG | 原生扫描、两级触发、型号约束、脉冲 BUS、配置保存、失联租约 | `test_siglent_ssg.py`、`test_ssg3021x_compatibility.py`、`test_siglent_ui.py` |
@@ -399,7 +401,7 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 | 安装与保留数据升级 | 安装标记/目录、已校验安装请求、任务忙时等待、退出交接、数据备份/恢复、同名冲突和卸载保留 | `test_installer_update_ui.py`、`test_install_update.py`、`test_installation_controller.py`、`test_install_data.py`、`test_installer_build.py`，实际 Setup 在隔离标识/临时路径验收 |
 | 编译产物自检 | 依赖来自包内、Qt 插件/图标、六台虚拟设备和窗口、普通 GUI 启动 | `tools/frozen_entry.py`、`tools/build_release.py` |
 
-当前新增回归重点为适用附件选择、严格下载来源、大小与 SHA-256 校验、取消/超时后迟到结果、文件保存及不覆盖、UI 自动下载偏好和关闭生命周期；保留原有更新检查、Newport 恢复、DG/SSG/Vaunix 回读、NI 清理、CH2 隔离和任务租约回归。历史版本结果保留在第 12 节，不作为本版全量或冻结产物检查结果。本轮实际验证见[0.7.22 记录](../release/NOTES-0.7.22.md)，未进行本版实机验收。
+当前新增回归重点为共享 VISA 管理器的双连接隔离、搜索/探测与打开失败的清理、最后释放、重复清理及并发边界，冻结入口另以模拟资源检查八项生命周期标志。保留原有更新检查、下载与安装、Newport 恢复、DG/SSG/Vaunix 回读、NI 清理、CH2 隔离和任务租约回归。历史版本结果保留在第 12 节，不作为本版全量或冻结产物检查结果。本轮实际验证见[0.7.30 记录](../release/NOTES-0.7.30.md)，未进行十几天实机连续运行验收。
 
 关键回归契约：
 
@@ -459,6 +461,19 @@ Windows 源码也可运行 `run_app.cmd`。便携构建入口为 `powershell -No
 实体输出测试必须由实验负责人确认幅度、偏置、负载、端接方式、PFI 电平、接地和被测电路耐压。自动测试不能替代这些电气检查。
 
 ## 12. 版本开发日志
+
+### 0.7.30 本地候选：多台 VISA 设备的共享资源管理器关闭隔离 — 2026-11-09
+
+用户在 0.7.29 连续运行十几天后，连接 RIGOL 时出现 `SCPI 查询失败 [*IDN?]：VI_ERROR_TMO`。截图还显示其他设备上次探测为“可用”，不能据此断定这些会话当前仍正常；未发现可证明“十几天必然到期”的软件周期，实际 USB/VISA 失联原因尚未在用户实机复现。
+
+- 审查确认一个独立可复现缺陷：PyVISA 的 `ResourceManager` 可在同一底层库中共享，`close()` 会关闭其管理的全部资源。原 `VisaBackend.close()`、构造失败清理，以及 `DeviceDiscoveryService` 搜索和 `DeviceProbeService` 临时探测的 `finally` 都直接关闭 manager；断开 B 或完成一次搜索/探测，可能使 A 的已保存会话失效，而 A 的内存连接状态仍是上次结果。依据为 PyVISA 官方[ResourceManager.close 说明](https://pyvisa.readthedocs.io/en/stable/api/resourcemanager.html)及本地已安装库源码，不根据猜测调整 DG 协议或超时。
+- 所有应用内 VISA 入口改为统一租用管理器，按共享对象管理使用计数；成功连接、临时搜索/探测及失败路径都只释放自己的租用，最后一个使用者才关闭 manager。设备资源仍单独打开和关闭，重复清理不会重复释放其他连接的使用计数；并发获取与最后释放需要串行保护，仪器查询不持有全局生命周期锁。
+- 保留原首触发 P0、有序累计计数、CH2 隔离、停止失败占用及 SSG 原生扫描规则；不会为恢复通信而重放触发、未知接受结果的写入、输出开关或扫描启动。无定时重连、复位、清缓冲或额外身份轮询。
+- 恢复步骤写入总使用说明第 4.3 节：先停止涉及任务并确认后台收尾，再显式断开、连接和手动回读；持续超时仅在实验空闲、正常退出被接受后重启应用，仍失败则检查 USB/系统 VISA 和仪器。截图中的 GitHub 网络失败是独立状态。
+- 本轮本机验证记录在 `dist/verification/0.7.30/`：新增生命周期回归先失败后通过，最终 18 项、0.229 秒；生命周期与相邻传输/连接/发现组合 67 项、0.726 秒通过。完整 `full-unittest.log` 共 **827 项、119.412 秒、OK**，其中 1 项因本机 Windows 符号链接权限跳过。2026-11-09 的完整源码 `source-self-test.json` 成功，版本 `0.7.30`、`frozen=false`、`hardware_access=false`，新增 `visa_session_lifetime` 八项标志及全部既有自检通过。
+- 版本为 0.7.30 本地修复候选。Windows CI、三种冻结程序和隔离安装验收随候选构建执行，结果以对应工作流、同组 `release-manifest.json` 和本轮证据文件记录为准，不以本机源码通过或历史 0.7.29 结果替代候选产物验收。三种候选程序文件、源码快照与校验清单单独保存到 `dist/local/v0.7.30/`，保留已交付版本及用户数据。当前公开正式版仍为 v0.7.29；未创建标签或 GitHub Release，未进行十几天实机连续运行验收。
+
+实施与验证状态见[0.7.30 说明](../release/NOTES-0.7.30.md)。
 
 ### 0.7.29 GitHub 正式发行 — 2026-10-29
 

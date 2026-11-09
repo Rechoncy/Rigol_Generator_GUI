@@ -51,6 +51,7 @@ class VisaReplyFramingTests(unittest.TestCase):
         manager.open_resource.return_value = instrument
         with patch("pyvisa.ResourceManager", return_value=manager):
             backend = VisaBackend("USB::SIMULATED", timeout_ms)
+        self.addCleanup(backend.close)
         return backend
 
     @staticmethod

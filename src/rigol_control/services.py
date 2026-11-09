@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from .drivers.visa_resource_manager import acquire_visa_manager
 from .drivers.vaunix_lms import (
     VIRTUAL_VAUNIX_RESOURCE,
     VaunixLmsApi,
@@ -121,9 +122,10 @@ class DeviceDiscoveryService:
             import pyvisa  # type: ignore[import-not-found]
         except ImportError as exc:
             raise DiscoveryError("未安装 PyVISA，暂时无法自动搜索；仍可手动输入资源地址") from exc
-        manager = None
+        lease = None
         try:
-            manager = pyvisa.ResourceManager()
+            lease = acquire_visa_manager()
+            manager = lease.manager
             resources = sorted(str(item) for item in manager.list_resources())
             return [
                 DiscoveredResource(
@@ -135,9 +137,9 @@ class DeviceDiscoveryService:
         except Exception as exc:
             raise DiscoveryError(f"VISA 资源搜索失败：{exc}") from exc
         finally:
-            if manager is not None:
+            if lease is not None:
                 try:
-                    manager.close()
+                    lease.release()
                 except Exception:
                     pass
 
@@ -243,10 +245,11 @@ class DeviceProbeService:
             import pyvisa  # type: ignore[import-not-found]
         except ImportError:
             return ProbeResult(ProbeState.DRIVER_MISSING, "未安装 PyVISA")
-        manager = None
+        lease = None
         instrument = None
         try:
-            manager = pyvisa.ResourceManager()
+            lease = acquire_visa_manager()
+            manager = lease.manager
             instrument = manager.open_resource(record.resource, open_timeout=800)
             instrument.timeout = 800
             identity = str(instrument.query("*IDN?")).strip()
@@ -259,9 +262,9 @@ class DeviceProbeService:
                     instrument.close()
                 except Exception:
                     pass
-            if manager is not None:
+            if lease is not None:
                 try:
-                    manager.close()
+                    lease.release()
                 except Exception:
                     pass
 

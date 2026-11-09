@@ -98,6 +98,137 @@ def _check_default_data_directory(default_data: Path, report: dict) -> None:
     report["default_data_mode"] = mode
 
 
+def _check_visa_session_lifetime() -> dict:
+    """Exercise shared VISA-manager cleanup using only disposable fake resources."""
+    from unittest.mock import patch
+    from rigol_control.connections import DeviceConnectionManager
+    from rigol_control.models import DeviceKind, DeviceRecord
+    from rigol_control.services import DeviceDiscoveryService, DeviceProbeService, ProbeState
+
+    class SharedVisaResource:
+        timeout = 5000
+
+        def __init__(self, manager, address):
+            self.manager = manager
+            self.address = address
+            self.closed = False
+            self.frequency = 1000.0
+            self.commands = []
+
+        def write(self, command):
+            if self.closed or self.manager.closed:
+                raise RuntimeError("BUNDLE_VISA_RESOURCE_CLOSED")
+            self.commands.append(command)
+            if command.startswith(":SOUR1:FREQ "):
+                self.frequency = float(command.split()[-1])
+
+        def query(self, command):
+            self.write(command)
+            if "IDN-FAIL" in self.address:
+                raise TimeoutError("BUNDLE_VISA_IDENTITY_TIMEOUT")
+            if command == "*IDN?":
+                return f"RIGOL,DG4162,{self.address},1.0"
+            if command == ":SOUR1:FREQ?":
+                return str(self.frequency)
+            raise AssertionError(f"Unexpected lifecycle query: {command}")
+
+        def close(self):
+            self.closed = True
+
+    class SharedVisaManager:
+        def __init__(self):
+            self.resources = []
+            self.closed = False
+            self.close_calls = 0
+
+        def open_resource(self, address, **_kwargs):
+            if self.closed:
+                raise RuntimeError("BUNDLE_VISA_MANAGER_CLOSED")
+            if "OPEN-FAIL" in address:
+                raise TimeoutError("BUNDLE_VISA_OPEN_TIMEOUT")
+            resource = SharedVisaResource(self, address)
+            self.resources.append(resource)
+            return resource
+
+        def list_resources(self):
+            if self.closed:
+                raise RuntimeError("BUNDLE_VISA_MANAGER_CLOSED")
+            return ("USB::BUNDLE-PEER", "USB::BUNDLE-PROBE")
+
+        def close(self):
+            self.close_calls += 1
+            self.closed = True
+            # PyVISA ResourceManager.close also closes its still-live resources.
+            for resource in self.resources:
+                resource.close()
+
+    def record(name):
+        return DeviceRecord.create(kind=DeviceKind.DG4000, name=name,
+                                   resource=f"USB::{name}")
+
+    shared = SharedVisaManager()
+    connections = DeviceConnectionManager()
+    first, peer = record("BUNDLE-FIRST"), record("BUNDLE-PEER")
+    probe = DeviceProbeService()
+    with patch("pyvisa.ResourceManager", return_value=shared):
+        try:
+            connections.connect(first)
+            connections.connect(peer)
+            if len(shared.resources) != 2:
+                raise AssertionError("Lifecycle fixture did not open two VISA instruments")
+            peer_resource = shared.resources[1]
+            peer_session = connections.session_for(peer)
+            peer_session.write(":SOUR1:FREQ 1250000")
+
+            def require_peer(operation):
+                if (shared.close_calls or peer_resource.closed
+                        or sum(not resource.closed for resource in shared.resources) != 1
+                        or peer_session.query(":SOUR1:FREQ?") != "1250000.0"
+                        or not connections.is_connected(peer)):
+                    raise AssertionError(f"{operation} invalidated another VISA instrument")
+
+            connections.disconnect(first)
+            if not shared.resources[0].closed:
+                raise AssertionError("Explicit disconnect did not close its own VISA resource")
+            require_peer("Disconnecting one instrument")
+            discovered = DeviceDiscoveryService()._discover_visa()
+            if {item.resource for item in discovered} != set(shared.list_resources()):
+                raise AssertionError("VISA discovery lost the fake instrument addresses")
+            require_peer("VISA resource discovery")
+            if probe.probe(record("BUNDLE-PROBE")).state is not ProbeState.ONLINE:
+                raise AssertionError("Fake successful VISA probe was not available")
+            require_peer("Successful identity probe")
+            for name in ("BUNDLE-IDN-FAIL", "BUNDLE-OPEN-FAIL"):
+                if probe.probe(record(name)).state is not ProbeState.OFFLINE:
+                    raise AssertionError("Fake failed VISA probe was not reported offline")
+                require_peer(name)
+            try:
+                connections.connect(record("BUNDLE-IDN-FAIL"))
+            except RuntimeError as exc:
+                if "BUNDLE_VISA_IDENTITY_TIMEOUT" not in str(exc):
+                    raise
+            else:
+                raise AssertionError("A failed VISA identity query was accepted as connected")
+            require_peer("Failed persistent connection cleanup")
+            if (peer_resource.commands.count(":SOUR1:FREQ 1250000") != 1
+                    or any(command != "*IDN?" for resource in shared.resources
+                           if "IDN-FAIL" in resource.address for command in resource.commands)):
+                raise AssertionError("Identity failure replayed or introduced instrument settings")
+        finally:
+            connections.close_all()
+        if (shared.close_calls != 1 or not shared.closed
+                or any(not resource.closed for resource in shared.resources)
+                or connections.is_connected(peer)):
+            raise AssertionError("Final explicit cleanup did not close the shared VISA manager once")
+    return {
+        "two_instruments_share_manager": True, "disconnect_preserves_peer": True,
+        "discovery_preserves_peer": True, "successful_probe_preserves_peer": True,
+        "failed_probe_and_open_preserve_peer": True,
+        "failed_identity_preserves_peer": True, "no_parameter_replay": True,
+        "final_cleanup_closes_manager_once": True, "hardware_access": False,
+    }
+
+
 def _bundle_self_test(report_path: Path) -> int:
     """Check the bundled interpreter, dependencies and six virtual UI windows.
 
@@ -1783,6 +1914,7 @@ def _bundle_self_test(report_path: Path) -> int:
             "safety_write_allowed": True, "original_timeout_restored": True,
             "hardware_access": False,
         }
+        report["visa_session_lifetime"] = _check_visa_session_lifetime()
         if home.connection_manager.active_leases():
             raise AssertionError("Virtual windows retained an unexpected device operation lease")
         if not home.close():

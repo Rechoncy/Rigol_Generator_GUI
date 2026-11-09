@@ -8,6 +8,8 @@ from threading import Lock, RLock
 import time
 from typing import Protocol
 
+from .visa_resource_manager import acquire_visa_manager
+
 
 class ScpiError(RuntimeError):
     pass
@@ -56,6 +58,10 @@ class VisaBackend:
         except (TypeError, ValueError, OverflowError) as exc:
             raise ScpiConnectionError("VISA 查询超时必须为正数毫秒") from exc
         self._reply_unsynchronized = False
+        self._close_lock = Lock()
+        self._closed = False
+        self._instrument = None
+        self._manager_lease = None
         try:
             import pyvisa  # type: ignore[import-not-found]
         except ImportError as exc:
@@ -63,15 +69,20 @@ class VisaBackend:
                 "未安装 PyVISA；请执行 python -m pip install -e \".[instrument]\""
             ) from exc
         try:
-            self._manager = pyvisa.ResourceManager()
+            self._manager_lease = acquire_visa_manager()
+            self._manager = self._manager_lease.manager
             self._instrument = self._manager.open_resource(resource, open_timeout=timeout_ms)
             self._instrument.timeout = timeout_ms
             self._instrument.write_termination = "\n"
             self._instrument.read_termination = "\n"
         except Exception as exc:
-            manager = getattr(self, "_manager", None)
-            if manager is not None:
-                manager.close()
+            # A partially configured resource is ours to close; other active
+            # connections retain their manager leases. Keep the open/setup
+            # error even if cleanup also fails.
+            try:
+                self.close()
+            except Exception:
+                pass
             raise ScpiConnectionError(f"无法打开 VISA 资源 {resource}：{exc}") from exc
 
     def write(self, command: str) -> object:
@@ -153,10 +164,18 @@ class VisaBackend:
         self._reply_unsynchronized = True
 
     def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            instrument = self._instrument
+            lease, self._manager_lease = self._manager_lease, None
         try:
-            self._instrument.close()
+            if instrument is not None:
+                instrument.close()
         finally:
-            self._manager.close()
+            if lease is not None:
+                lease.release()
 
 
 class ScpiSession:
