@@ -1085,9 +1085,11 @@ class LinkageTaskWindow(QMainWindow):
             self.connection_manager.note_output_change(record)
         self.bridge.flush()
         error, self._start_error = self._start_error, None
-        if self._pending_stop:
-            self._stop()
-        elif error:
+        if error:
+            # A cancellation request is consumed by the startup worker. If
+            # its cleanup failed, it must not also authorize a new recovery
+            # attempt before the user has seen and explicitly retried it.
+            self._pending_stop = False
             if self.controller is not None and not self.controller.is_quiescent:
                 self.start_button.setText("等待停止")
                 self.start_button.setEnabled(False)
@@ -1097,6 +1099,8 @@ class LinkageTaskWindow(QMainWindow):
                 self.run_log.appendPlainText("启动失败且原生扫描停止尚未确认；设备占用保留，请显式重试停止。")
             else:
                 self._finish_stopped()
+        elif self._pending_stop:
+            self._stop()
         if error:
             QMessageBox.warning(self, "无法启动跨设备联动", error)
 

@@ -69,7 +69,7 @@ def wait_until(predicate, timeout=15):
 
 
 class OwnedWindowsProcess:
-    def __init__(self, pid):
+    def __init__(self, pid, *, expected_executable=None):
         self.pid = pid
         self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         self.kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
@@ -79,9 +79,28 @@ class OwnedWindowsProcess:
         self.kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
         self.kernel.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
         self.kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self.kernel.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+        )
+        self.kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
         self.handle = self.kernel.OpenProcess(0x00100000 | 0x1000 | 0x0001, False, pid)
         if not self.handle:
             raise OSError(ctypes.get_last_error(), "Cannot bind our known helper process")
+        self.image_path = None
+        if expected_executable is not None:
+            try:
+                buffer = ctypes.create_unicode_buffer(32768)
+                size = wintypes.DWORD(len(buffer))
+                if not self.kernel.QueryFullProcessImageNameW(self.handle, 0, buffer, ctypes.byref(size)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                self.image_path = Path(buffer.value).resolve()
+                if os.path.normcase(str(self.image_path)) != os.path.normcase(str(Path(expected_executable).resolve())):
+                    raise RuntimeError("Captured process does not belong to this fixture executable")
+            except BaseException:
+                # An unverified handle must never reach termination cleanup.
+                self.kernel.CloseHandle(self.handle)
+                self.handle = None
+                raise
 
     def exit_code(self):
         if self.kernel.WaitForSingleObject(self.handle, 0) != 0:
@@ -100,6 +119,14 @@ class OwnedWindowsProcess:
                 self.kernel.WaitForSingleObject(self.handle, 5000)
             self.kernel.CloseHandle(self.handle)
             self.handle = None
+
+    def wait_for_exit(self, timeout_seconds=10):
+        result = self.kernel.WaitForSingleObject(self.handle, round(timeout_seconds * 1000))
+        if result == 0x102:
+            raise TimeoutError("Owned fixture process did not exit after its release sentinel")
+        if result != 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return self.exit_code()
 
 
 class StatusFileReadLock:
@@ -143,6 +170,7 @@ def run_case(fixture_root, compiled, *, status_read_lock=False):
     assert installer.read_bytes()[:2] == b"MZ"
     installer_receipt = installer.parent / "installer-arguments.json"
     application_receipt = program / "application-arguments.json"
+    application_release = program / "release-application.txt"
     config = {
         "asset": {"name": installer.name,
                   "url": "https://github.com/Rechoncy/Rigol_Generator_GUI/releases/download/v99.0.0/" + installer.name,
@@ -155,6 +183,7 @@ def run_case(fixture_root, compiled, *, status_read_lock=False):
     save(config_path, config)
     helper = None
     actual_parent = None
+    actual_application = None
     status_lock = None
     child_environment = dict(os.environ)
     child_environment.pop("PSModulePath", None)
@@ -233,8 +262,11 @@ def run_case(fixture_root, compiled, *, status_read_lock=False):
             wait_until(application_receipt.exists)
             install_call = json.loads(installer_receipt.read_text(encoding="utf-8-sig"))
             app_call = json.loads(application_receipt.read_text(encoding="utf-8-sig"))
-            # The inert app returns immediately after publishing its receipt.
-            # Do not open/terminate its reported PID, which may already be gone.
+            # This fixture waits after its receipt, so the PID is still live.
+            # Verify its unique executable before owning any cleanup rights.
+            actual_application = OwnedWindowsProcess(app_call["pid"], expected_executable=application)
+            assert actual_application.exit_code() is None
+            assert not application_release.exists()
             expected_installer_arguments = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOAUTORUN",
                                             "/DATADIR=" + str(data), "/DIR=" + str(program),
                                             "/LOG=" + ticket["install_log"]]
@@ -245,6 +277,8 @@ def run_case(fixture_root, compiled, *, status_read_lock=False):
             assert installer_calls == application_calls == 1, "An action was replayed after a status-write failure"
             assert sentinel.read_bytes() == sentinel_bytes
             assert hashlib.sha256(installer.read_bytes()).hexdigest() == digest
+            application_release.write_text("fixture assertions complete", encoding="utf-8")
+            assert actual_application.wait_for_exit() == 0
             return {"success": True, "parent_exit_code": 0, "helper_exit_code": 0, "phase": state["phase"],
                     "confirmed_but_live_parent_did_not_execute": True,
                     "original_data_argument_preserved": True, "original_install_argument_preserved": True,
@@ -253,12 +287,20 @@ def run_case(fixture_root, compiled, *, status_read_lock=False):
                     "fixture_user_bytes_preserved": True, "installer_sha256_verified": digest,
                     "installer_bytes": installer.stat().st_size, "fixture_root": str(case),
                     "sharing_lock_released_after_pending_publication": status_read_lock,
-                    "installer_calls": installer_calls, "application_calls": application_calls}
+                    "installer_calls": installer_calls, "application_calls": application_calls,
+                    "application_owned_image_verified": True,
+                    "application_exit_confirmed_before_cleanup": True}
         finally:
             if status_lock is not None:
                 status_lock.close()
+            application_release.write_text("fixture controller cleanup", encoding="utf-8")
             if helper is not None:
                 helper.close()
+            if actual_application is not None:
+                try:
+                    actual_application.wait_for_exit()
+                finally:
+                    actual_application.close()
             if actual_parent is not None:
                 actual_parent.close()
             Path(config["release"]).write_text("fixture controller cleanup", encoding="utf-8")
@@ -271,7 +313,7 @@ def run_case(fixture_root, compiled, *, status_read_lock=False):
 
 
 
-CSHARP_FIXTURE = 'using System;\nusing System.Collections.Generic;\nusing System.Diagnostics;\nusing System.IO;\nusing System.Reflection;\nusing System.Text;\nusing System.Web.Script.Serialization;\npublic static class InertFixture {\n  [STAThread] public static int Main(string[] args) {\n    string executable = Assembly.GetExecutingAssembly().Location;\n    string role = Path.GetFileName(executable).StartsWith("Lab-Control-Center-") ? "installer" : "application";\n    string receipt = Path.Combine(Path.GetDirectoryName(executable), role + "-arguments.json");\n    var value = new Dictionary<string, object>();\n    value["kind"] = role; value["args"] = args; value["executable"] = executable;\n    value["pid"] = Process.GetCurrentProcess().Id; value["utc"] = DateTime.UtcNow.ToString("o");\n    File.AppendAllText(receipt + ".calls", Process.GetCurrentProcess().Id.ToString() + Environment.NewLine, new UTF8Encoding(false));\n    File.WriteAllText(receipt + ".tmp", new JavaScriptSerializer().Serialize(value), new UTF8Encoding(false));\n    File.Move(receipt + ".tmp", receipt);\n    return 0;\n  }\n}\n'
+CSHARP_FIXTURE = 'using System;\nusing System.Collections.Generic;\nusing System.Diagnostics;\nusing System.IO;\nusing System.Reflection;\nusing System.Text;\nusing System.Web.Script.Serialization;\npublic static class InertFixture {\n  [STAThread] public static int Main(string[] args) {\n    string executable = Assembly.GetExecutingAssembly().Location;\n    string role = Path.GetFileName(executable).StartsWith("Lab-Control-Center-") ? "installer" : "application";\n    string receipt = Path.Combine(Path.GetDirectoryName(executable), role + "-arguments.json");\n    var value = new Dictionary<string, object>();\n    value["kind"] = role; value["args"] = args; value["executable"] = executable;\n    value["pid"] = Process.GetCurrentProcess().Id; value["utc"] = DateTime.UtcNow.ToString("o");\n    File.AppendAllText(receipt + ".calls", Process.GetCurrentProcess().Id.ToString() + Environment.NewLine, new UTF8Encoding(false));\n    File.WriteAllText(receipt + ".tmp", new JavaScriptSerializer().Serialize(value), new UTF8Encoding(false));\n    File.Move(receipt + ".tmp", receipt);\n    if (role == "application") {\n      string release = Path.Combine(Path.GetDirectoryName(executable), "release-application.txt");\n      DateTime deadline = DateTime.UtcNow.AddSeconds(60);\n      while (!File.Exists(release)) {\n        if (DateTime.UtcNow >= deadline) return 124;\n        System.Threading.Thread.Sleep(25);\n      }\n    }\n    return 0;\n  }\n}\n'
 
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell 5 acceptance requires Windows")

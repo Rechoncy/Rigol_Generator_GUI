@@ -404,6 +404,74 @@ class MultiSourceLinkageUiTests(unittest.TestCase):
         self.assertFalse(self.manager.active_leases())
         self.assertGreater(self.manager.session_for(self.ssg).connection_generation, old_generation)
 
+    def test_cancel_during_native_reprepare_with_failed_off_waits_for_new_explicit_retry(self):
+        from rigol_control.siglent_linkage import SsgNativeLinkageParticipant
+        entered, release = threading.Event(), threading.Event()
+        self.release_events.append(release)
+        attempts, recoveries = [], []
+        class CancelledNativePrepare(SsgNativeLinkageParticipant):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                original_prepare = self.driver.prepare_sweep
+                calls = []
+                def prepare(config):
+                    result = original_prepare(config)
+                    calls.append(True)
+                    if len(calls) == 2:
+                        entered.set()
+                        if not release.wait(3):
+                            raise RuntimeError("NATIVE_REPREPARE_FIXTURE_NOT_RELEASED")
+                        # An in-flight preparation can fail after the user has
+                        # requested cancellation, leaving conservative cleanup.
+                        raise RuntimeError("NATIVE_REPREPARE_FAILED_DURING_CANCEL")
+                    return result
+                self.driver.prepare_sweep = prepare
+
+            def stop(self):
+                attempts.append(True)
+                if len(attempts) == 1:
+                    raise RuntimeError("NATIVE_CANCEL_OFF_NOT_CONFIRMED")
+                return super().stop()
+
+            def recover_and_stop(self):
+                recoveries.append(True)
+                return super().recover_and_stop()
+
+        window = self.window()
+        self.axis(window, self.ssg, StepParameter.FREQUENCY, "GHz", 1.5, .1)
+        window.ssg_mode.setCurrentIndex(window.ssg_mode.findData(SsgLinkageMode.NATIVE_EXTERNAL))
+        window._generate_table(show_message=False)
+        generation = self.manager.session_for(self.ssg).connection_generation
+        with patch("rigol_control.siglent_linkage.SsgNativeLinkageParticipant", CancelledNativePrepare):
+            window._start()
+            owner = window._lease_owner
+            self.assertTrue(self.wait_for(entered.is_set))
+            window._stop()
+            self.assertTrue(window._pending_stop)
+            release.set()
+            self.assertTrue(self.wait_for(lambda: not window._call_tasks))
+        observed = {
+            "stop_attempts": len(attempts), "recovery_attempts": len(recoveries),
+            "generation": self.manager.session_for(self.ssg).connection_generation,
+            "controller_kept": window.controller is not None,
+            "owner": self.manager.lease_owner(self.ssg.id),
+        }
+        self.assertEqual(observed, {
+            "stop_attempts": 1, "recovery_attempts": 0, "generation": generation,
+            "controller_kept": True, "owner": owner,
+        }, "One cancellation click was reused to recover and release a later failed stop")
+        self.assertFalse(window._pending_stop)
+        self.assertFalse(window.controller.is_quiescent)
+        self.assertEqual(window.stop_button.text(), "重试停止")
+        self.assertTrue(window.stop_button.isEnabled())
+        self.assertTrue(self.warning.called)
+        window._stop()
+        self.assertTrue(self.wait_for(lambda: not window._call_tasks))
+        self.assertEqual(len(recoveries), 1)
+        self.assertIsNone(window.controller)
+        self.assertFalse(self.manager.active_leases())
+        self.assertGreater(self.manager.session_for(self.ssg).connection_generation, generation)
+
 
 if __name__ == "__main__":
     unittest.main()
