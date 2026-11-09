@@ -2,13 +2,13 @@
 
 这是一个面向 RIGOL DG4000、鼎阳 SIGLENT SSG、Vaunix Lab Brick LMS/BLX 信号源、Newport SMC100CC / PR50CC 旋转台与 NI DAQ 的多设备桌面控制程序。首页用于保存和管理多台设备；点击设备卡片后，会打开独立的设备设置窗口，多台设备窗口可同时存在。
 
-**Windows 发行包：** 当前公开正式版本 [v0.7.29](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.29) 提供安装程序 EXE、便携目录 ZIP 和独立 EXE，内置 Python/Qt、Python 仪器接口与 Vaunix x64 SDK DLL；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。推荐使用安装程序；目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。正式标签从本次发布文档提交重新构建，实际构建与发布状态以工作流和同组 `release-manifest.json` 为准。具体文件、数据迁移、实机驱动及编译方法见 [发行版使用与构建说明](release/README.md)和[0.7.29 发行说明](release/NOTES-0.7.29.md)。
+**Windows 发行包：** 本次正式版本 [v0.7.30](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.30) 提供安装程序 EXE、便携目录 ZIP 和独立 EXE，内置 Python/Qt、Python 仪器接口与 Vaunix x64 SDK DLL；目标电脑无需安装 Python 或 pip，首次运行无需联网安装依赖。推荐使用安装程序；目录 ZIP 完整解压后，双击其中的 `Lab Control Center.exe` 即可启动。正式标签从本次发布文档提交重新构建，实际构建与发布状态以工作流和同组 `release-manifest.json` 为准。具体文件、数据迁移、实机驱动及编译方法见[发行版使用与构建说明](release/README.md)和[0.7.30 发行说明](release/NOTES-0.7.30.md)。
 
-当前源码版本为 **0.7.30 本地候选**，修复多台 VISA 仪器共用资源管理器时，断开一台、搜索资源或探测其他设备可能同时关闭已有连接的问题。所有应用内 VISA 入口统一租用共享管理器，只有最后一个使用者释放后才关闭；设备本身仍独立打开、串行通信和关闭。用户在 0.7.29 连续运行十几天后遇到 `*IDN?` 超时，截图尚不能确定本次实机失联的直接原因；本修复不通过周期性重连、复位或重放参数掩盖故障。方案、恢复步骤和本轮验证状态见[0.7.30 说明](release/NOTES-0.7.30.md)。当前公开正式版仍为上方的 v0.7.29，候选与正式交付分开保存，未创建新标签或 Release。
+当前源码版本为 **0.7.30**。本版修复多台 VISA 仪器共用资源管理器时，断开一台、搜索资源或探测其他设备可能同时关闭已有连接的问题。所有应用内 VISA 入口统一租用共享管理器，只有最后一个使用者释放后才关闭；设备本身仍独立打开、串行通信和关闭。用户在 0.7.29 连续运行十几天后遇到 `*IDN?` 超时，截图尚不能确定本次实机失联的直接原因；本修复不通过周期性重连、复位或重放参数掩盖故障。方案、恢复步骤和验证分组见[0.7.30 说明](release/NOTES-0.7.30.md)，不以前期候选通过代替本次新标签产物验收。
 
-0.7.30 的回归、源码虚拟自检、冻结与打包结果单独记录于本轮说明及 `dist/verification/0.7.30/`；不沿用历史结果，也不声称已完成十几天实机连续运行验收。0.7.29 的单位跟随、回复同步与 809 项历史回归记录仍见[原版说明](release/NOTES-0.7.29.md)。Vpp/mVpp 跟随、原生 dBm/Vrms、回复未同步后暂停查询等既有行为保持。
+0.7.30 本机完整回归 **827 项、119.412 秒、OK**（1 项因本机 Windows 符号链接权限跳过），源码自检及新增 VISA 生命周期八项通过。前期候选源码 `4b351286` 的 Windows 检查 [42575278808](https://github.com/Rechoncy/Rigol_Generator_GUI/actions/runs/42575278808) 和 main 构建 [42575279306](https://github.com/Rechoncy/Rigol_Generator_GUI/actions/runs/42575279306) 均通过，已核对三种冻结、隔离安装、每格式生命周期八项和 194 个源码文件。候选记录保留于 `dist/verification/0.7.30/`；新正式标签从本次文档提交重新构建并独立验收，实际结果以正式组清单为准。尚未进行十几天实机连续运行验收。Vpp/mVpp 跟随、原生 dBm/Vrms、回复未同步后暂停查询等既有行为保持。
 
-安装版在发现正式新版后可自动下载、核对大小与 SHA-256，等待设备空闲并正常退出，然后备份用户数据、卸载已登记的旧版、安装新版并核对恢复数据。用户数据位于独立目录，卸载保留数据与升级备份；便携 ZIP 和独立 EXE 继续采用原有手动升级流程。正式附件本地副本使用 `dist/published/v0.7.29/`；原 `dist/local/v0.7.29/` 候选（源码 `3237f58`）、v0.7.28 正式/候选（候选源码 `9a5c0a8`）及历史交付分别保留。启用正式运行副本时沿用用户数据，不覆盖原候选或删除 DATA。具体操作见[安装与升级说明](docs/USER_MANUAL_CN.md#45-安装版-exe-与保留数据升级)。
+安装版在发现正式新版后可自动下载、核对大小与 SHA-256，等待设备空闲并正常退出，然后备份用户数据、卸载已登记的旧版、安装新版并核对恢复数据。用户数据位于独立目录，卸载保留数据与升级备份；便携 ZIP 和独立 EXE 继续采用原有手动升级流程。正式附件本地副本使用 `dist/published/v0.7.30/`；前期 `dist/local/v0.7.30/` 候选（源码 `4b351286`）、v0.7.29 正式/候选及历史交付分别保留。启用正式运行副本时沿用用户数据，不覆盖原候选或删除 DATA。具体操作见[安装与升级说明](docs/USER_MANUAL_CN.md#45-安装版-exe-与保留数据升级)。
 
 软件图标以波形、采样点和旋转箭头表示信号源、采集与循环扫描。仓库根目录原有的 `Lab Control Center.exe` 是供源码运行的小型启动器，依赖目标电脑的 64 位 Python 3.10+ / PyQt6；它不是上述发行附件。开发者可继续使用它或 `run_app.cmd`。
 
@@ -78,7 +78,7 @@
 
 ### 使用安装程序 EXE
 
-从 [v0.7.29 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.29) 下载 `Lab-Control-Center-0.7.29-windows-x64-setup.exe`，正式附件本地副本目录为 `dist/published/v0.7.29/`，内含 Python/Qt 和 Python 仪器接口。安装默认仅针对当前 Windows 用户，程序位于 `%LOCALAPPDATA%\Programs\LabControlCenter`，数据位于 `%LOCALAPPDATA%\RigolGeneratorControl\data`。目标电脑无需安装 Python；真实设备的 VISA、NI-DAQmx、串口或 USB 驱动仍需准备。
+从 [v0.7.30 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.30) 下载 `Lab-Control-Center-0.7.30-windows-x64-setup.exe`，正式附件本地副本目录为 `dist/published/v0.7.30/`，内含 Python/Qt 和 Python 仪器接口。安装默认仅针对当前 Windows 用户，程序位于 `%LOCALAPPDATA%\Programs\LabControlCenter`，数据位于 `%LOCALAPPDATA%\RigolGeneratorControl\data`。目标电脑无需安装 Python；真实设备的 VISA、NI-DAQmx、串口或 USB 驱动仍需准备。
 
 安装版首页提供“下载后自动安装（空闲时）”，也可关闭后点击“安装更新”。升级不会强制终止实验：存在扫描、采集、后台通信或未确认清理时，先保留程序与任务；只有正常关闭被接受后才启动安装程序。卸载保留独立用户数据和备份，恢复失败或同名文件内容冲突时保留现场，不能把失败当作升级成功。旧便携版迁移步骤见[使用说明](docs/USER_MANUAL_CN.md#45-安装版-exe-与保留数据升级)。
 
@@ -86,10 +86,10 @@
 
 ### 使用便携发行版
 
-从 [v0.7.29 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.29) 下载便携文件和校验清单。正式发行由版本标签对应的提交构建，生成与验收状态以同组附件 `release-manifest.json` 为准。本地保存的正式发行附件目录为 `dist/published/v0.7.29/`；自行构建的输出目录为 `dist/release/`。本版文件为：
+从 [v0.7.30 GitHub Release](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.30) 下载便携文件和校验清单。正式发行由版本标签对应的提交构建，生成与验收状态以同组附件 `release-manifest.json` 为准。本地保存的正式发行附件目录为 `dist/published/v0.7.30/`；自行构建的输出目录为 `dist/release/`。本版文件为：
 
-- `Lab-Control-Center-0.7.29-windows-x64-portable.zip`：完整解压后运行 `Lab Control Center.exe`，保留 `_internal/`。
-- `Lab-Control-Center-0.7.29-windows-x64.exe`：单文件启动，内置运行时临时解压，持久化配置保存在 EXE 旁 `data/`。
+- `Lab-Control-Center-0.7.30-windows-x64-portable.zip`：完整解压后运行 `Lab Control Center.exe`，保留 `_internal/`。
+- `Lab-Control-Center-0.7.30-windows-x64.exe`：单文件启动，内置运行时临时解压，持久化配置保存在 EXE 旁 `data/`。
 
 两种格式默认使用 EXE 旁的 `data/`；`--data-dir` 和 `RIGOL_GUI_DATA_DIR` 可以覆盖。迁移时复制程序与 `data/`，用户另选位置的采集文件需一并迁移。旧源码版 AppData 配置不会自动迁移，可用首页“导出配置 / 导入配置”。详见[便携迁移与升级](release/README.md#3-保存迁移与升级)。
 
@@ -159,7 +159,7 @@ python -m rigol_control --data-dir .\runtime-data
 
 ## Vaunix LMS/BLX 实机配置
 
-1. 使用发行清单确认内置 DLL 的 0.7.29 安装版、便携 ZIP 或单文件 EXE 时，直接使用内置 SDK 1.15 DLL。源码运行可将 Windows x64 `vnx_fmsynth.dll` 放在项目主目录，或保留仓库 SDK 目录；也可通过 `VAUNIX_LMS_DLL` 指定 DLL。
+1. 使用发行清单确认内置 DLL 的 0.7.30 安装版、便携 ZIP 或单文件 EXE 时，直接使用内置 SDK 1.15 DLL。源码运行可将 Windows x64 `vnx_fmsynth.dll` 放在项目主目录，或保留仓库 SDK 目录；也可通过 `VAUNIX_LMS_DLL` 指定 DLL。
 2. 插入 Vaunix Lab Brick 后，在首页添加 `Vaunix LMS/BLX`；资源下拉框会显示型号、序列号和 `VAUNIX::LMS::<序列号>`。资源身份使用序列号，不依赖 DLL 每次枚举得到的临时设备句柄。首页后台探测只枚举设备，不调用 `fnLMS_InitDevice` 或 `fnLMS_CloseDevice`，不会抢占或关闭正式控制会话。
 3. 连接后先在“总览”核对型号、序列号、SDK 版本、频率/功率范围以及 BLX 序列、快速脉冲、Chirp 能力；不支持的功能按钮会被禁用。
 4. “射频输出”使用 Hz/GHz 与绝对 dBm；DLL 功率参数以 0.25 dB 为编码单位，但仪器实际功率分辨率为 0.5 dB，软件会拒绝不在 0.5 dB 网格上的输出、序列和扫描值。先保持 RF 关闭，应用低风险参数后再开 RF。
@@ -211,7 +211,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build_release.ps1
 
 0.7.15 修复高频小步长点表的有效数字丢失，DG 幅度下发明确使用 VPP 单位，基本波频率按已知型号与波形校验，相位/PSK 限定 0–360°。触发布防时检查一次耦合并读取 CH1/CH2 实际波形，频率点按该快照校验，不增加逐点查询。DG 自动重连发现型号或序列号变化时拒绝旧设置；Vaunix 输出、扫频和完整序列在调用 SDK 前完成输入与编码校验。另修复虚拟设备状态锁冲突及后台任务派发失败后的界面状态。此前各版的触发顺序、停止重试和资源占用保护保留，未新增实机性能结论。详见[流程核对](docs/DG4000_TRIGGER_AUDIT_CN.md)及[本版说明](release/NOTES-0.7.15.md)。
 
-0.7.15 源码完整自动回归 406 项及源码自检已通过；0.7.16 的 444 项和 0.7.17 的 465 项结果分别保留在[采集修复历史](release/NOTES-0.7.16.md)与[DG 回读历史](release/NOTES-0.7.17.md)。0.7.18 正式发行验证保留在[发行说明](release/NOTES-0.7.18.md)和同组清单，0.7.19 的回读缓存修复保留在[历史说明](release/NOTES-0.7.19.md)，Newport 恢复修复保留在[0.7.20 说明](release/NOTES-0.7.20.md)。0.7.23 安装升级记录和 0.7.24 虚拟设备重启探测修复分别见[安装历史](release/NOTES-0.7.23.md)与[0.7.24 说明](release/NOTES-0.7.24.md)。0.7.25 的 API 限流修复及正式标签产物范围见[更新修复记录](release/NOTES-0.7.25.md)；0.7.26 的 DG 单位空回复兼容和源码验证见[兼容修复记录](release/NOTES-0.7.26.md)；0.7.27 的 mVpp/dBm 显示及源码记录见[显示修复说明](release/NOTES-0.7.27.md)；0.7.28 的事件自动回读、触发让位及正式发行/前期候选记录见[历史说明](release/NOTES-0.7.28.md)；当前 0.7.29 的单位跟随、回复同步及正式发行记录见[本版说明](release/NOTES-0.7.29.md)及对应清单，各组验收分别记录，尚未在用户 DG4162 USB 实机验证。
+0.7.15 源码完整自动回归 406 项及源码自检已通过；0.7.16 的 444 项和 0.7.17 的 465 项结果分别保留在[采集修复历史](release/NOTES-0.7.16.md)与[DG 回读历史](release/NOTES-0.7.17.md)。0.7.18 正式发行验证保留在[发行说明](release/NOTES-0.7.18.md)和同组清单，0.7.19 的回读缓存修复保留在[历史说明](release/NOTES-0.7.19.md)，Newport 恢复修复保留在[0.7.20 说明](release/NOTES-0.7.20.md)。0.7.23 安装升级记录和 0.7.24 虚拟设备重启探测修复分别见[安装历史](release/NOTES-0.7.23.md)与[0.7.24 说明](release/NOTES-0.7.24.md)。0.7.25 的 API 限流修复及正式标签产物范围见[更新修复记录](release/NOTES-0.7.25.md)；0.7.26 的 DG 单位空回复兼容和源码验证见[兼容修复记录](release/NOTES-0.7.26.md)；0.7.27 的 mVpp/dBm 显示及源码记录见[显示修复说明](release/NOTES-0.7.27.md)；0.7.28 的事件自动回读、触发让位及正式发行/前期候选记录见[历史说明](release/NOTES-0.7.28.md)；0.7.29 的单位跟随、回复同步及正式发行记录见[原版说明](release/NOTES-0.7.29.md)；当前 0.7.30 的多台 VISA 连接隔离、前期候选与正式交付记录见[本版说明](release/NOTES-0.7.30.md)及对应清单，各组验收分别记录，尚未在用户 DG4162 USB 实机验证。
 
 ## 测试
 

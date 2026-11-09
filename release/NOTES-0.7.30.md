@@ -1,6 +1,8 @@
 # 0.7.30：多台 VISA 设备的连接隔离
 
-日期：2026-11-09。状态：源码修复与本地候选，当前公开正式版仍为 [v0.7.29](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.29)。本次未创建标签或 GitHub Release；候选的构建、验证和本地交付以本轮实际记录及同组 `release-manifest.json` 为准。
+日期：2026-11-09。正式版本： [v0.7.30](https://github.com/Rechoncy/Rigol_Generator_GUI/releases/tag/v0.7.30)。正式标签从本次发布文档提交重新构建、验证后发布，实际结果以 v0.7.30 标签工作流及正式组 `release-manifest.json` 为准；以下前期候选通过不代替新标签产物验收。
+
+正式附件本地副本保存到 `dist/published/v0.7.30/`，包含安装 EXE、便携 ZIP、独立 EXE、源码快照及同组说明、清单和校验和。前期 `dist/local/v0.7.30/` 候选（源码 `4b351286`）、v0.7.29 正式/候选与历史交付保留，不覆盖旧包或删除用户数据。两组提交身份、文件校验值和验收证据分别记录。
 
 ## 用户现象与可确认的问题
 
@@ -25,11 +27,11 @@
 2. 确认收尾后显式断开受影响设备，再连接并手动回读。核对频率、幅度和输出状态后重新布防；软件不补发旧任务积压或未知接受结果的参数。
 3. 仍超时时，只在实验空闲且程序能够正常退出后重启应用。若仍失败，检查 USB 连接、系统 VISA 中的资源识别，并保留完整错误、仪器型号和固件信息。运行中的实验不以拔线或强制退出代替停止确认。
 
-候选修复不能恢复当前已失效的旧进程会话；换用新版前仍需要正常完成任务收尾并保留原数据。总操作见[连接生命周期](../docs/USER_MANUAL_CN.md#43-连接生命周期)。
+本修复不能恢复当前已失效的旧进程会话；换用新版前仍需要正常完成任务收尾并保留原数据。总操作见[连接生命周期](../docs/USER_MANUAL_CN.md#43-连接生命周期)。
 
-## 本轮验证与交付
+## 前期候选验证与正式交付
 
-验证记录使用独立的 `dist/verification/0.7.30/`，目前已完成：
+源码 `4b351286e379c3957289b2c62c2e9f0ee6faac71` 的前期候选记录保留在 `dist/verification/0.7.30/`，已完成：
 
 - 新增生命周期回归先复现失败，修复后 **18 项，0.229 秒，通过**；覆盖双连接断开隔离、发现/探测成功及失败、资源打开/初始化失败、最后释放、重复清理与并发边界。日志为 `visa-manager-lifetime-red.log` / `visa-manager-lifetime-green.log`。
 - 生命周期与相邻传输、连接、发现组合 **67 项，0.726 秒，通过**，见 `visa-manager-adjacent.log`。
@@ -37,8 +39,10 @@
 - 完整 `full-unittest.log`：**827 项，119.412 秒，OK**，其中 1 项因本机 Windows 符号链接权限跳过。
 - 2026-11-09 的完整源码入口 `source-self-test.json`：`success=true`、软件版本 `0.7.30`、`hardware_access=false`，新增 `visa_session_lifetime` 八项标志及全部既有自检通过。此记录为源码运行，`frozen=false`。
 
-Windows CI、三种冻结格式和隔离安装验收随本候选构建执行，结果以对应工作流、同组 `release-manifest.json` 和本轮证据文件记录为准。本说明记录上述已完成的本机回归和源码自检，不将它们或 0.7.29 的历史结果替代候选产物验收。源码与冻结自检使用模拟资源，不访问真实仪器。
+- 候选 [Windows 检查 42575278808](https://github.com/Rechoncy/Rigol_Generator_GUI/actions/runs/42575278808)：**827 项，139.865 秒，通过**，源码虚拟自检成功。
+- 候选 [main 构建 42575279306](https://github.com/Rechoncy/Rigol_Generator_GUI/actions/runs/42575279306)：**827 项，118.978 秒，通过**；目录、独立 EXE、ZIP 解压后三种冻结自检、Windows 普通启动和隔离安装验收通过，发布步骤按候选规则跳过。
+- 同组候选附件本地核验成功：三种冻结格式各有 `visa_session_lifetime` 八项 true，`hardware_access=false`；**194 个源码文件**与候选提交及工作区核对，源码快照、包内运行时、SDK DLL、文件大小和 SHA-256 已校验，见 `artifact-verification.json` / `delivery-summary.json`。七个候选文件保存在 `dist/local/v0.7.30/`，未执行生产安装程序或操作真实仪器。
 
-本地候选使用 `dist/local/v0.7.30/`，与 `dist/published/v0.7.29/`、旧候选和备份分开保存，不覆盖旧交付或用户数据。候选安装 EXE、便携 ZIP、独立 EXE、源码快照、说明和校验清单使用同一组构建身份；包内仍提供 Python/Qt、Python 仪器接口和 Vaunix x64 DLL，目标电脑无需外部 Python，系统仪器驱动仍需准备。
+本次正式标签从新的发布文档提交重新构建 Setup、便携 ZIP、独立 EXE 和源码快照，重新运行回归、冻结与隔离安装验收后发布同组附件。正式包使用 `dist/published/v0.7.30/`，与前期候选及旧正式包分开保存；实际提交、工作流结果和正式文件校验值以该组 `release-manifest.json`、`SHA256SUMS.txt` 及发布证据为准，不沿用候选的构建身份或预写新标签成功。包内继续提供 Python/Qt、Python 仪器接口和 Vaunix x64 DLL，目标电脑无需外部 Python，系统仪器驱动仍需准备。
 
-尚未进行用户实机十几天连续运行验收；无硬件回归及候选打包验收的范围是软件生命周期和交付，不据此承诺 USB 链路的长期稳定性。
+尚未进行用户实机十几天连续运行验收；无硬件回归与打包验收的范围是软件生命周期和交付，不据此承诺 USB 链路的长期稳定性。
