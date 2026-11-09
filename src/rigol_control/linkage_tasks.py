@@ -15,7 +15,8 @@ from .linkage import (
     LinkageStepValue,
     validate_linkage_axes,
 )
-from .models import utc_now
+from .models import DeviceKind, utc_now
+from .linkage_parameters import LinkageParameter, SsgLinkageMode, linkage_parameter, validate_source_axis
 from .repository import default_data_dir
 from .scan import ScanMode
 
@@ -34,6 +35,9 @@ class LinkageTaskRecord:
     points: tuple[LinkagePoint, ...]
     created_at: str
     updated_at: str
+    source_kinds: tuple[tuple[str, DeviceKind], ...] = ()
+    ssg_mode: SsgLinkageMode = SsgLinkageMode.SOFTWARE
+    ssg_dwell_s: float = 0.01
 
     @classmethod
     def create(
@@ -48,6 +52,9 @@ class LinkageTaskRecord:
         axes: tuple[LinkageAxis, ...] | list[LinkageAxis],
         points: tuple[LinkagePoint, ...] | list[LinkagePoint],
         dispatch_mode: DispatchMode = DispatchMode.STRICT_SERIAL,
+        source_kinds: tuple[tuple[str, DeviceKind], ...] = (),
+        ssg_mode: SsgLinkageMode = SsgLinkageMode.SOFTWARE,
+        ssg_dwell_s: float = 0.01,
     ) -> "LinkageTaskRecord":
         now = utc_now()
         task = cls(
@@ -63,6 +70,9 @@ class LinkageTaskRecord:
             points=tuple(points),
             created_at=now,
             updated_at=now,
+            source_kinds=tuple(source_kinds),
+            ssg_mode=ssg_mode,
+            ssg_dwell_s=ssg_dwell_s,
         )
         task.validate()
         return task
@@ -77,6 +87,23 @@ class LinkageTaskRecord:
         if not self.axes or not self.points:
             raise ValueError("联动任务必须包含扫描轴和联合点表")
         axes = validate_linkage_axes(self.axes)
+        if not isinstance(self.ssg_mode, SsgLinkageMode):
+            raise ValueError("鼎阳联动方式无效")
+        if (not isinstance(self.ssg_dwell_s, (int, float))
+                or not math.isfinite(self.ssg_dwell_s) or not .01 <= self.ssg_dwell_s <= 100):
+            raise ValueError("鼎阳原生驻留时间必须在 0.01 至 100 秒之间")
+        kinds = dict(self.source_kinds)
+        referenced = {axis.device_id for axis in axes}
+        if len(kinds) != len(self.source_kinds) or (kinds and set(kinds) != referenced):
+            raise ValueError("联动设备类型绑定必须唯一且完整")
+        for axis in axes:
+            # Unversioned legacy bindings were exclusively DG4000. Never
+            # reinterpret their voltage data as another source's RF power.
+            validate_source_axis(axis, kinds.get(axis.device_id, DeviceKind.DG4000))
+        if (DeviceKind.SIGLENT_SSG in kinds.values()
+                and self.ssg_mode is SsgLinkageMode.NATIVE_EXTERNAL
+                and not 2 <= len(self.points) <= 500):
+            raise ValueError("鼎阳原生列表联动的展开联合点数必须为 2 至 500")
         expected_targets = tuple(axis.target for axis in axes)
         for point_index, point in enumerate(self.points, start=1):
             targets = tuple(
@@ -107,6 +134,9 @@ class LinkageTaskRecord:
             "rising": self.rising,
             "scan_mode": self.scan_mode.value,
             "dispatch_mode": self.dispatch_mode.value,
+            "source_kinds": {key: kind.value for key, kind in self.source_kinds},
+            "ssg_mode": self.ssg_mode.value,
+            "ssg_dwell_s": self.ssg_dwell_s,
             "axes": [
                 {
                     "device_id": axis.device_id,
@@ -139,6 +169,9 @@ class LinkageTaskRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LinkageTaskRecord":
+        raw_kinds = data.get("source_kinds", {})
+        if not isinstance(raw_kinds, dict):
+            raise ValueError("联动设备类型绑定格式无效")
         task = cls(
             id=str(data["id"]),
             name=str(data["name"]),
@@ -153,7 +186,7 @@ class LinkageTaskRecord:
             axes=tuple(
                 LinkageAxis(
                     device_id=str(axis["device_id"]),
-                    parameter=StepParameter(axis["parameter"]),
+                    parameter=linkage_parameter(axis["parameter"]),
                     channel=int(axis["channel"]),
                     unit_key=str(axis["unit_key"]),
                     start=float(axis["start"]),
@@ -167,7 +200,7 @@ class LinkageTaskRecord:
                     tuple(
                         LinkageStepValue(
                             device_id=str(item["device_id"]),
-                            parameter=StepParameter(item["parameter"]),
+                            parameter=linkage_parameter(item["parameter"]),
                             channel=int(item["channel"]),
                             value=float(item["value"]),
                             display_value=float(item["display_value"]),
@@ -180,6 +213,9 @@ class LinkageTaskRecord:
             ),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
+            source_kinds=tuple((str(key), DeviceKind(kind)) for key, kind in raw_kinds.items()),
+            ssg_mode=SsgLinkageMode(data.get("ssg_mode", SsgLinkageMode.SOFTWARE.value)),
+            ssg_dwell_s=float(data.get("ssg_dwell_s", .01)),
         )
         task.validate()
         return task

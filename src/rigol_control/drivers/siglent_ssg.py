@@ -428,7 +428,7 @@ class SiglentSsgDriver:
             raise ScpiError(f"列表回读不完整：期望 {count} 行，收到 {len(result)} 行")
         return tuple(result)
 
-    def start(self):
+    def start(self, *, should_continue: Callable[[], bool] | None = None):
         with self.session.transaction():
             self._idle()
             if self.prepared is None:
@@ -436,6 +436,10 @@ class SiglentSsgDriver:
             # Recheck RF/IQ/closed-loop constraints if the front panel changed meanwhile.
             config = self.prepared
             self.prepare_sweep(config)
+            if should_continue is not None and not should_continue():
+                # Preparation has verified OFF. A queued stop must not be
+                # followed by a new scan enable that has not begun yet.
+                return False
             self.state = "unknown"
             self._batch([f":SWEep:STATe {config.target}"])
             self._verify(":SWEep:STATe", config.target)

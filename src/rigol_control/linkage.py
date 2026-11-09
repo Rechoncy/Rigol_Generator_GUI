@@ -9,11 +9,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from threading import Condition, Event, RLock, Thread
+from threading import Condition, Event, RLock, Thread, current_thread
 from typing import Protocol
 
 from .controller_lifecycle import ControllerLifecycle
 from .drivers.dg4000 import StepParameter, StepValue
+from .linkage_parameters import LinkageParameter, RfPowerStepValue
 from .poll_waiter import wait_for_poll
 from .scan import MAX_SCAN_AXES, ScanMode
 from .sequence import CyclicSequence, MAX_SCAN_POINTS, linear_scan_points
@@ -26,7 +27,7 @@ class LinkageAxis:
     """One scan axis addressed to an explicit generator device."""
 
     device_id: str
-    parameter: StepParameter
+    parameter: StepParameter | LinkageParameter
     channel: int
     unit_key: str
     start: float
@@ -39,7 +40,7 @@ class LinkageAxis:
 
     def validate(self) -> None:
         if not self.device_id.strip():
-            raise ValueError("扫描轴必须指定 DG4000 设备")
+            raise ValueError("扫描轴必须指定信号源设备")
         if self.channel not in (1, 2):
             raise ValueError("扫描轴通道只能是 1 或 2")
         unit_spec(self.parameter.unit_family, self.unit_key)
@@ -52,13 +53,16 @@ class LinkageAxis:
 @dataclass(frozen=True, slots=True)
 class LinkageStepValue:
     device_id: str
-    parameter: StepParameter
+    parameter: StepParameter | LinkageParameter
     channel: int
     value: float
     display_value: float
     unit_key: str
 
-    def as_step_value(self) -> StepValue:
+    def as_step_value(self) -> StepValue | RfPowerStepValue:
+        if self.parameter is LinkageParameter.RF_POWER:
+            return RfPowerStepValue(self.parameter, self.channel, self.value,
+                                    self.display_value, self.unit_key)
         return StepValue(
             parameter=self.parameter,
             channel=self.channel,
@@ -76,8 +80,8 @@ class LinkagePoint:
         if not self.values:
             raise ValueError("跨设备联合点至少包含一个参数")
 
-    def grouped(self) -> dict[str, tuple[StepValue, ...]]:
-        groups: dict[str, list[StepValue]] = defaultdict(list)
+    def grouped(self) -> dict[str, tuple[StepValue | RfPowerStepValue, ...]]:
+        groups: dict[str, list[StepValue | RfPowerStepValue]] = defaultdict(list)
         for item in self.values:
             groups[item.device_id].append(item.as_step_value())
         return {device_id: tuple(values) for device_id, values in groups.items()}
@@ -260,12 +264,28 @@ class LinkageRunLogger:
             )
 
 
+class NativeScanParticipant(Protocol):
+    """A preloaded instrument driven directly by the shared external edge."""
+
+    @property
+    def requires_stop(self) -> bool:
+        """Return a cached flag; this property must never perform I/O."""
+        ...
+
+    def prepare(self) -> None: ...
+
+    def arm(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+
 class MultiDeviceTriggerController(ControllerLifecycle):
     """Map cumulative NI edges to ordered multi-generator joint points.
 
-    The first edge applies P0. A point is counted as applied only after every
-    participating generator has completed its device-local SCPI batch. There is
-    deliberately no minimum trigger interval; cumulative edges form a backlog.
+    The first edge applies software point P0. Software completion says nothing
+    about a native participant's accepted external edges or physical point.
+    There is no minimum software trigger interval; cumulative edges form a
+    software backlog. Native scans are preloaded, armed and stopped separately.
     """
 
     def __init__(
@@ -275,6 +295,7 @@ class MultiDeviceTriggerController(ControllerLifecycle):
         points: list[LinkagePoint] | tuple[LinkagePoint, ...],
         *,
         device_order: list[str] | tuple[str, ...] | None = None,
+        native_participants: Mapping[str, NativeScanParticipant] | None = None,
         dispatch_mode: DispatchMode = DispatchMode.STRICT_SERIAL,
         monitor_poll_seconds: float = 0.002,
         logger: LinkageRunLogger | None = None,
@@ -284,8 +305,11 @@ class MultiDeviceTriggerController(ControllerLifecycle):
             raise ValueError("跨设备联动任务至少需要一个联合点")
         if not math.isfinite(monitor_poll_seconds) or monitor_poll_seconds <= 0:
             raise ValueError("累计计数读取周期必须大于 0")
+        native = dict(native_participants or {})
+        if set(writers).intersection(native):
+            raise ValueError("同一设备不能同时参与软件步进和原生扫描")
         referenced = {item.device_id for point in normalized_points for item in point.values}
-        missing = sorted(referenced.difference(writers))
+        missing = sorted(referenced.difference(set(writers) | set(native)))
         if missing:
             raise ValueError(f"缺少设备写入器：{', '.join(missing)}")
         order = tuple(writers.keys() if device_order is None else device_order)
@@ -294,6 +318,7 @@ class MultiDeviceTriggerController(ControllerLifecycle):
 
         self.counter = counter
         self.writers = dict(writers)
+        self.native_participants = native
         self._active_writers = dict(writers)
         self.sequence = CyclicSequence(normalized_points)
         self.device_order = order
@@ -315,7 +340,101 @@ class MultiDeviceTriggerController(ControllerLifecycle):
         self._snapshot_revision = 0
         self._monitor_thread: Thread | None = None
         self._writer_thread: Thread | None = None
+        self._native_cleanup_lock = RLock()
+        self._native_cleanup_active = False
+        self._native_cleanup_failures: set[str] = set()
+        self._explicit_native_retry = False
+        self._explicit_native_retry_thread: Thread | None = None
         self._init_lifecycle()
+
+    def _quiescent_locked(self) -> bool:
+        if (self._native_cleanup_active or self._native_cleanup_failures
+                or not super()._quiescent_locked()):
+            return False
+        try:
+            return all(not item.requires_stop for item in self.native_participants.values())
+        except Exception:
+            # Missing state is never evidence that an instrument has stopped.
+            return False
+
+    def _close_counter(self) -> None:
+        if not self.native_participants:
+            super()._close_counter()
+            return
+        # Serialize cleanup requested by either failure or explicit stop. Do
+        # not hold the controller's condition across NI or instrument I/O.
+        with self._native_cleanup_lock:
+            with self._condition:
+                self._native_cleanup_active = True
+            errors = []
+            try:
+                try:
+                    super()._close_counter()
+                except Exception as exc:
+                    errors.append(f"NI：{exc}")
+                for device_id, participant in self.native_participants.items():
+                    try:
+                        with self._condition:
+                            retry = device_id in self._native_cleanup_failures
+                            recover_allowed = (retry and self._explicit_native_retry
+                                               and self._explicit_native_retry_thread is current_thread())
+                        if participant.requires_stop or retry:
+                            recovery = getattr(participant, "recover_and_stop", None)
+                            if recover_allowed and callable(recovery):
+                                recovery()
+                            else:
+                                participant.stop()
+                            if participant.requires_stop:
+                                raise RuntimeError("原生扫描停止尚未确认")
+                        with self._condition:
+                            self._native_cleanup_failures.discard(device_id)
+                    except Exception as exc:
+                        with self._condition:
+                            self._native_cleanup_failures.add(device_id)
+                        errors.append(f"原生扫描设备 {device_id}：{exc}")
+                if errors:
+                    raise RuntimeError("联动清理未确认，已保留设备占用：" + "；".join(errors))
+            finally:
+                with self._condition:
+                    self._native_cleanup_active = False
+
+    def _cancel_start(self) -> None:
+        try:
+            self._close_counter()
+        except Exception as exc:
+            with self._condition:
+                self._state = ControllerState.ERROR
+                self._error = f"取消启动后的清理未确认：{exc}；请重试停止"
+            self._publish()
+            # _fail and the base start() must not automatically repeat a
+            # failed stop; explicit stop() owns the next cleanup attempt.
+            raise
+        with self._condition:
+            self._state = ControllerState.STOPPED
+        self._publish()
+
+    def stop(self, timeout_seconds: float = 3.0) -> None:
+        # Only this explicit stop caller may reconcile a previously failed
+        # native cleanup. Concurrent automatic _fail cleanup cannot borrow it.
+        with self._shutdown_lock:
+            with self._condition:
+                previous = self._explicit_native_retry, self._explicit_native_retry_thread
+                self._explicit_native_retry = bool(self._native_cleanup_failures)
+                self._explicit_native_retry_thread = current_thread() if self._explicit_native_retry else None
+            try:
+                super().stop(timeout_seconds)
+            except RuntimeError as exc:
+                with self._condition:
+                    native_pending = bool(self._native_cleanup_failures)
+                if native_pending:
+                    raise RuntimeError(
+                        "原生扫描停止尚未确认，已保留设备占用；请重试停止："
+                        + str(exc.__cause__ or exc)
+                    ) from exc
+                raise
+            finally:
+                with self._condition:
+                    self._explicit_native_retry, self._explicit_native_retry_thread = previous
 
     def add_callback(self, callback: LinkageUpdateCallback) -> None:
         with self._lock:
@@ -355,14 +474,34 @@ class MultiDeviceTriggerController(ControllerLifecycle):
                     break
                 prepare = getattr(writer, "prepare_trigger", None)
                 self._active_writers[device_id] = prepare() if callable(prepare) else writer
-            with self._condition:
+            for participant in self.native_participants.values():
                 if self._stop_event.is_set():
-                    self._state = ControllerState.STOPPED
-                    self._publish()
-                    return
+                    break
+                set_probe = getattr(participant, "set_cancellation_probe", None)
+                if callable(set_probe):
+                    set_probe(lambda: not self._stop_event.is_set())
+                participant.prepare()
+            if self._stop_event.is_set():
+                self._cancel_start()
+                return
             self._open_counter()
+            for participant in self.native_participants.values():
+                if self._stop_event.is_set():
+                    break
+                participant.arm()
+            if self._stop_event.is_set():
+                self._cancel_start()
+                return
+            if self.native_participants:
+                baseline = int(self.counter.read_count())
+                if baseline != 0:
+                    raise RuntimeError(
+                        "原生扫描布防期间已检测到触发，无法确认各设备首点一致；"
+                        "请暂停外部触发至全部布防完成，再重新启动联动"
+                    )
         except Exception as exc:
-            self._fail(f"启动 NI 累计计数器失败：{exc}")
+            prefix = "启动跨设备联动失败" if self.native_participants else "启动 NI 累计计数器失败"
+            self._fail(f"{prefix}：{exc}")
             raise
 
         with self._condition:
@@ -370,9 +509,7 @@ class MultiDeviceTriggerController(ControllerLifecycle):
             if not cancelled:
                 self._start_workers_locked()
         if cancelled:
-            self._close_counter()
-            with self._condition:
-                self._state = ControllerState.STOPPED
+            self._cancel_start()
         self._publish()
 
     def _start_workers_locked(self) -> None:
@@ -382,11 +519,12 @@ class MultiDeviceTriggerController(ControllerLifecycle):
         )
         self._writer_thread = Thread(
             target=self._writer_loop, name="multi-device-scpi-coordinator", daemon=True
-        )
+        ) if self.writers else None
         monitor = self._monitor_thread
         writer = self._writer_thread
         monitor.start()
-        writer.start()
+        if writer is not None:
+            writer.start()
 
     def _monitor_loop(self) -> None:
         try:
@@ -490,8 +628,10 @@ class MultiDeviceTriggerController(ControllerLifecycle):
             self._condition.notify_all()
         try:
             self._close_counter()
-        except Exception:
-            pass
+        except Exception as exc:
+            if self.native_participants:
+                with self._condition:
+                    self._error += f"；清理未确认：{exc}；请重试停止"
         self._publish()
 
     def _publish(self) -> None:

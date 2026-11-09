@@ -3,7 +3,41 @@ $ErrorActionPreference = 'Stop'
 $handoff = $null
 function Write-State([string]$phase, [string]$message) {
     $body = @{phase=$phase; message=$message; utc=[DateTime]::UtcNow.ToString('o')}
-    $body | ConvertTo-Json -Compress | Set-Content -LiteralPath $handoff.status_file -Encoding UTF8
+    $temporary = $handoff.status_file + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        # Readers must see a complete JSON document. The temporary file lives
+        # beside the destination so Move/Replace publishes it atomically.
+        $json = ($body | ConvertTo-Json -Compress) + [Environment]::NewLine
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($true))
+        while ($true) {
+            try {
+                if ([IO.File]::Exists($handoff.status_file)) {
+                    # Windows PowerShell 5 otherwise converts $null to an
+                    # empty backup path for this .NET string parameter.
+                    [IO.File]::Replace($temporary, $handoff.status_file, [NullString]::Value)
+                } else {
+                    [IO.File]::Move($temporary, $handoff.status_file)
+                }
+                return
+            } catch {
+                # A status reader may briefly omit FILE_SHARE_DELETE/WRITE.
+                # Retry only this idempotent publication, never an installer
+                # or application action. Other I/O errors fail immediately.
+                $cause = $_.Exception
+                while ($cause.InnerException) { $cause = $cause.InnerException }
+                $nativeCode = $cause.HResult -band 0xFFFF
+                if (-not ($cause -is [IO.IOException]) -or $nativeCode -notin @(32, 33) -or $clock.ElapsedMilliseconds -ge 3000) { throw }
+                Start-Sleep -Milliseconds 25
+            }
+        }
+    } finally {
+        $clock.Stop()
+        if ([IO.File]::Exists($temporary)) {
+            try { [IO.File]::Delete($temporary) }
+            catch { [Console]::Error.WriteLine('无法清理临时升级状态文件：' + $_.Exception.Message) }
+        }
+    }
 }
 try {
     $handoff = Get-Content -LiteralPath $Ticket -Raw -Encoding UTF8 | ConvertFrom-Json

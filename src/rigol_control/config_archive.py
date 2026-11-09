@@ -101,6 +101,7 @@ class ConfigBundle:
 def _validate_files(files: dict) -> tuple[str, ...]:
     from .step_tasks import StepTaskRecord
     from .linkage_tasks import LinkageTaskRecord
+    from .linkage_parameters import validate_source_axis
 
     if not isinstance(files, dict) or set(files) != set(DEFAULTS):
         raise ValueError("配置包必须包含四个受支持的配置文件，不允许额外文件或路径")
@@ -163,11 +164,16 @@ def _validate_files(files: dict) -> tuple[str, ...]:
             if filename == "step_tasks.json":
                 reference(task.generator_device_id, {DeviceKind.DG4000})
             else:
+                source_kinds = dict(task.source_kinds)
                 for axis in task.axes:
-                    reference(axis.device_id, {DeviceKind.DG4000})
+                    kind = source_kinds.get(axis.device_id, DeviceKind.DG4000)
+                    validate_source_axis(axis, kind)
+                    reference(axis.device_id, {kind})
                 for point in task.points:
                     for value in point.values:
-                        reference(value.device_id, {DeviceKind.DG4000})
+                        kind = source_kinds.get(value.device_id, DeviceKind.DG4000)
+                        validate_source_axis(value, kind)
+                        reference(value.device_id, {kind})
         active = files[filename].get("active_task_id")
         if active is not None and active not in ids:
             raise ValueError("当前跨设备任务 ID 不存在")

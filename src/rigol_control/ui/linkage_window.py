@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 from PyQt6.QtCore import QThreadPool, Qt, pyqtSignal
@@ -44,6 +45,12 @@ from ..linkage import (
     linkage_point_count,
 )
 from ..linkage_tasks import LinkageTaskRecord, LinkageTaskRepository
+from ..linkage_parameters import (
+    LinkageParameter,
+    SsgLinkageMode,
+    parameters_for_kind,
+    validate_source_axis,
+)
 from ..models import DeviceKind, DeviceRecord
 from ..repository import DeviceRepository
 from ..scan import MAX_SCAN_AXES, ScanMode
@@ -88,6 +95,7 @@ class LinkageAxisEditor(QFrame):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("AxisEditor")
+        self._generators = {record.id: record for record in generators}
         self._active_unit = axis.unit_key if axis else "kHz"
         layout = QGridLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -95,13 +103,9 @@ class LinkageAxisEditor(QFrame):
 
         self.device = QComboBox()
         for record in generators:
-            self.device.addItem(f"{record.name} ({record.resource})", record.id)
+            self.device.addItem(f"{record.name} · {record.kind.label} ({record.resource})", record.id)
         self.channel = QComboBox()
-        self.channel.addItem("CH1", 1)
-        self.channel.addItem("CH2", 2)
         self.parameter = QComboBox()
-        for parameter in StepParameter:
-            self.parameter.addItem(parameter.label, parameter)
         self.unit = QComboBox()
         self.start = CompactDoubleSpinBox()
         self.step = CompactDoubleSpinBox()
@@ -127,6 +131,8 @@ class LinkageAxisEditor(QFrame):
         )
         for column, (label, control) in enumerate(zip(labels, controls)):
             caption = QLabel(label)
+            if column == 5:
+                self.step_caption = caption
             caption.setObjectName("Muted")
             layout.addWidget(caption, 0, column)
             layout.addWidget(control, 1, column)
@@ -136,7 +142,7 @@ class LinkageAxisEditor(QFrame):
 
         self.parameter.currentIndexChanged.connect(self._parameter_changed)
         self.unit.currentIndexChanged.connect(self._unit_changed)
-        self.device.currentIndexChanged.connect(self.changed.emit)
+        self.device.currentIndexChanged.connect(self._device_changed)
         self.channel.currentIndexChanged.connect(self.changed.emit)
         self.start.valueChanged.connect(self.changed.emit)
         self.step.valueChanged.connect(self.changed.emit)
@@ -146,17 +152,52 @@ class LinkageAxisEditor(QFrame):
         )
 
         if axis is None:
+            self._device_changed()
             self._populate_units("kHz")
             self.start.setValue(1.0)
             self.step.setValue(1.0)
         else:
             self.device.setCurrentIndex(self.device.findData(axis.device_id))
+            self._device_changed()
             self.channel.setCurrentIndex(self.channel.findData(axis.channel))
             self.parameter.setCurrentIndex(self.parameter.findData(axis.parameter))
             self._populate_units(axis.unit_key)
             self.start.setValue(axis.start)
             self.step.setValue(axis.step)
             self.count.setValue(axis.count)
+
+    def _device_changed(self) -> None:
+        record = self._generators.get(str(self.device.currentData() or ""))
+        old_parameter = self.parameter.currentData()
+        old_channel = self.channel.currentData()
+        old_unit = self.unit.currentData()
+        self.parameter.blockSignals(True)
+        self.channel.blockSignals(True)
+        try:
+            self.parameter.clear()
+            self.channel.clear()
+            if record is None:
+                return
+            for parameter in parameters_for_kind(record.kind):
+                self.parameter.addItem(parameter.label, parameter)
+            self.channel.addItem("CH1" if record.kind is DeviceKind.DG4000 else "RF 输出", 1)
+            if record.kind is DeviceKind.DG4000:
+                self.channel.addItem("CH2", 2)
+            self.channel.setEnabled(record.kind is DeviceKind.DG4000)
+            parameter_index = self.parameter.findData(old_parameter)
+            self.parameter.setCurrentIndex(max(0, parameter_index))
+            channel_index = self.channel.findData(old_channel)
+            self.channel.setCurrentIndex(max(0, channel_index))
+        finally:
+            self.parameter.blockSignals(False)
+            self.channel.blockSignals(False)
+        # Preserve values only when their meaning survives the device change.
+        # In particular, a DG Vpp amplitude never becomes an RF dBm value.
+        if self.parameter.currentData() is old_parameter:
+            self._populate_units(str(old_unit) if old_unit else None)
+        else:
+            self._parameter_changed()
+        self.changed.emit()
 
     def model(self) -> LinkageAxis:
         return LinkageAxis(
@@ -170,7 +211,9 @@ class LinkageAxisEditor(QFrame):
         )
 
     def _populate_units(self, requested: str | None = None) -> None:
-        parameter: StepParameter = self.parameter.currentData()
+        parameter = self.parameter.currentData()
+        if parameter is None:
+            return
         selected = requested or default_unit(parameter.unit_family)
         self.unit.blockSignals(True)
         self.unit.clear()
@@ -183,7 +226,10 @@ class LinkageAxisEditor(QFrame):
 
     def _parameter_changed(self) -> None:
         self._populate_units()
-        self.start.setValue(1.0)
+        self.step_caption.setText(
+            "步长 / dB" if self.parameter.currentData() is LinkageParameter.RF_POWER else "步长"
+        )
+        self.start.setValue(-20.0 if self.parameter.currentData() is LinkageParameter.RF_POWER else 1.0)
         self.step.setValue(1.0)
         self.changed.emit()
 
@@ -191,7 +237,7 @@ class LinkageAxisEditor(QFrame):
         new_unit = str(self.unit.currentData() or "")
         if not new_unit or new_unit == self._active_unit:
             return
-        parameter: StepParameter = self.parameter.currentData()
+        parameter = self.parameter.currentData()
         try:
             start_base = to_base(self.start.value(), parameter.unit_family, self._active_unit)
             step_base = to_base(self.step.value(), parameter.unit_family, self._active_unit)
@@ -210,7 +256,7 @@ class RuntimeDeviceRow:
 
 
 class LinkageTaskWindow(QMainWindow):
-    """Top-level editor and runtime monitor for NI-triggered multi-DG scans."""
+    """Edit NI-driven software groups and SSG native external participants."""
 
     def __init__(
         self,
@@ -224,7 +270,9 @@ class LinkageTaskWindow(QMainWindow):
         self.connection_manager = connection_manager
         self.task_repository = task_repository or LinkageTaskRepository(repository.data_dir)
         self.devices = repository.list()
-        self.generators = [item for item in self.devices if item.kind is DeviceKind.DG4000]
+        self.generators = [item for item in self.devices if item.kind in {
+            DeviceKind.DG4000, DeviceKind.VAUNIX_LMS, DeviceKind.SIGLENT_SSG,
+        }]
         self.ni_devices = [item for item in self.devices if item.kind is DeviceKind.NI_DAQ]
         self.axis_editors: list[LinkageAxisEditor] = []
         self._table_axes: tuple[LinkageAxis, ...] = ()
@@ -239,6 +287,11 @@ class LinkageTaskWindow(QMainWindow):
         self._start_task: CallTask | None = None
         self._stop_task: CallTask | None = None
         self._stop_error: str | None = None
+        self._connect_task: CallTask | None = None
+        self._connect_error: str | None = None
+        self._connect_cancel = Event()
+        self._native_participants: dict[str, Any] = {}
+        self._native_records: tuple[DeviceRecord, ...] = ()
         self.bridge = LinkageBridge(self)
         self.bridge.updated.connect(self._controller_updated)
         self._runtime_rows: dict[str, RuntimeDeviceRow] = {}
@@ -259,7 +312,8 @@ class LinkageTaskWindow(QMainWindow):
         title = QLabel("跨设备联动任务")
         title.setObjectName("Title")
         subtitle = QLabel(
-            "一个 NI 累计触发源驱动多台 DG4000；首个触发应用 P0，末点后循环，不设置最小触发间隔。"
+            "一个 NI 累计触发源驱动 DG4000、Vaunix 与鼎阳软件步进；首触发应用 P0，末点后循环。"
+            "鼎阳也可使用仪器原生列表与公共外部触发，实际接收状态单独显示。"
         )
         subtitle.setObjectName("Muted")
         subtitle.setWordWrap(True)
@@ -283,6 +337,7 @@ class LinkageTaskWindow(QMainWindow):
         scroll.setWidget(content)
         outer.addWidget(scroll, 1)
         self.setCentralWidget(root)
+        self._ssg_mode_changed()
 
         if self.generators:
             self._add_axis()
@@ -316,7 +371,7 @@ class LinkageTaskWindow(QMainWindow):
         task_row.addWidget(self.delete_task_button)
         layout.addLayout(task_row)
         save_scope = QLabel(
-            "保存范围：NI 触发设备、计数器/PFI/边沿、扫描模式、每个轴绑定的 DG/通道/参数/单位、"
+            "保存范围：NI 触发设备、计数器/PFI/边沿、扫描模式、每个轴绑定的设备类型/通道/参数/单位、"
             "起点/步长/点数，以及手工修改后的完整联合点表。保存后下次打开自动恢复。"
         )
         save_scope.setObjectName("Muted")
@@ -346,6 +401,15 @@ class LinkageTaskWindow(QMainWindow):
         self.dispatch_mode.addItem(
             DispatchMode.STRICT_SERIAL.label, DispatchMode.STRICT_SERIAL
         )
+        self.ssg_mode = QComboBox()
+        for mode in SsgLinkageMode:
+            self.ssg_mode.addItem(mode.label, mode)
+        self.ssg_dwell = CompactDoubleSpinBox()
+        self.ssg_dwell.setDecimals(3)
+        self.ssg_dwell.setRange(0.01, 100)
+        self.ssg_dwell.setValue(0.01)
+        self.ssg_dwell.setKeyboardTracking(False)
+        self.ssg_dwell.setEnabled(False)
         form.addRow("任务名称", self.task_name)
         form.addRow("NI 触发设备", self.ni_source)
         form.addRow("计数器", self.counter)
@@ -353,9 +417,35 @@ class LinkageTaskWindow(QMainWindow):
         form.addRow("有效边沿", self.edge)
         form.addRow("扫描组合", self.scan_mode)
         form.addRow("设备下发", self.dispatch_mode)
+        form.addRow("鼎阳参与方式", self.ssg_mode)
+        form.addRow("鼎阳原生驻留 / s", self.ssg_dwell)
         layout.addLayout(form)
+        self.ssg_mode_note = QLabel()
+        self.ssg_mode_note.setObjectName("Muted")
+        self.ssg_mode_note.setWordWrap(True)
+        layout.addWidget(self.ssg_mode_note)
+        self.ssg_mode.currentIndexChanged.connect(self._ssg_mode_changed)
         self.scan_mode.currentIndexChanged.connect(self._configuration_changed)
         return frame
+
+    def _ssg_mode_changed(self) -> None:
+        native = self.ssg_mode.currentData() is SsgLinkageMode.NATIVE_EXTERNAL
+        self.ssg_dwell.setEnabled(native and self.controller is None and not self._call_tasks)
+        self.ssg_mode_note.setText(
+            "鼎阳原生：联合点表预装为 2–500 行 LIST；将同一外部边沿分接 NI PFI 与鼎阳 EXT TRIG。"
+            "全部布防完成前请暂停触发。NI 计数不等于鼎阳实际接收，实际接收/积压/点位无法查询时为未知；"
+            "触发须满足仪器驻留时间，软件不会补发原生触发。"
+            if native else
+            "鼎阳软件步进：收到 NI 累计触发后按联合点表设置频率和功率，启动检查不改变输出；"
+            "软件顺序下发不表示多台仪器在电气上同时更新。"
+        )
+        if hasattr(self, "metric_captions"):
+            self.metric_captions["received"].setText("NI 已接收触发")
+            self.metric_captions["applied"].setText("软件已处理点" if native else "已完成联合点")
+            self.metric_captions["backlog"].setText("软件积压" if native else "积压")
+            self.metric_captions["current"].setText("软件当前点" if native else "当前点")
+        if hasattr(self, "preflight"):
+            self._configuration_changed()
 
     def _axis_panel(self) -> QFrame:
         frame, layout = _panel("跨设备扫描轴")
@@ -398,6 +488,7 @@ class LinkageTaskWindow(QMainWindow):
         frame, layout = _panel("运行与设备屏障")
         metrics = QHBoxLayout()
         self.metrics: dict[str, QLabel] = {}
+        self.metric_captions: dict[str, QLabel] = {}
         for key, caption in (
             ("state", "任务状态"),
             ("received", "已接收触发"),
@@ -410,6 +501,7 @@ class LinkageTaskWindow(QMainWindow):
             card.setObjectName("MetricCard")
             card_layout = QVBoxLayout(card)
             label = QLabel(caption)
+            self.metric_captions[key] = label
             label.setObjectName("Muted")
             value = QLabel("停止" if key == "state" else ("—" if key in {"current", "skew"} else "0"))
             value.setObjectName("CardTitle")
@@ -420,8 +512,8 @@ class LinkageTaskWindow(QMainWindow):
         layout.addLayout(metrics)
 
         controls = QHBoxLayout()
-        connect = QPushButton("连接参与设备")
-        connect.clicked.connect(self._connect_required_devices)
+        self.connect_button = QPushButton("连接参与设备")
+        self.connect_button.clicked.connect(self._connect_required_devices)
         self.start_button = QPushButton("启动联动")
         self.start_button.setObjectName("PrimaryButton")
         self.start_button.clicked.connect(self._start)
@@ -432,7 +524,7 @@ class LinkageTaskWindow(QMainWindow):
         virtual_one.clicked.connect(lambda: self._emit_virtual(1))
         virtual_ten = QPushButton("虚拟触发 +10")
         virtual_ten.clicked.connect(lambda: self._emit_virtual(10))
-        controls.addWidget(connect)
+        controls.addWidget(self.connect_button)
         controls.addWidget(self.start_button)
         controls.addWidget(self.stop_button)
         controls.addStretch()
@@ -467,7 +559,7 @@ class LinkageTaskWindow(QMainWindow):
             QMessageBox.information(self, "扫描轴已满", f"最多支持 {MAX_SCAN_AXES} 个扫描轴。")
             return
         if not self.generators:
-            QMessageBox.warning(self, "缺少 DG4000", "请先在设备中心添加 DG4000。")
+            QMessageBox.warning(self, "缺少信号源", "请先添加 DG4000、Vaunix 或鼎阳 SSG。")
             return
         editor = LinkageAxisEditor(self.generators, axis)
         editor.changed.connect(self._configuration_changed)
@@ -487,11 +579,31 @@ class LinkageTaskWindow(QMainWindow):
     def _axes(self) -> tuple[LinkageAxis, ...]:
         return tuple(editor.model() for editor in self.axis_editors)
 
+    def _validate_live_axes(self, axes: tuple[LinkageAxis, ...]) -> dict[str, DeviceRecord]:
+        current = {item.id: item for item in self.repository.list()}
+        original = {item.id: item for item in self.generators}
+        for axis in axes:
+            record = current.get(axis.device_id)
+            previous = original.get(axis.device_id)
+            if record is None or previous is None:
+                raise ValueError("扫描轴设备已经不存在，请重新打开任务窗口并选择设备")
+            if record.kind is not previous.kind:
+                raise ValueError(f"设备“{record.name}”的类型已改变，请重新打开窗口并确认参数单位")
+            if record.resource != previous.resource:
+                raise ValueError(f"设备“{record.name}”的资源地址已改变，请重新打开窗口并确认绑定")
+            validate_source_axis(axis, record.kind)
+        return current
+
     def _configuration_changed(self, _value: Any = None) -> None:
         try:
             axes = self._axes()
             mode: ScanMode = self.scan_mode.currentData()
             total = linkage_point_count(axes, mode)
+            records = self._validate_live_axes(axes)
+            if (self.ssg_mode.currentData() is SsgLinkageMode.NATIVE_EXTERNAL
+                    and any(records[axis.device_id].kind is DeviceKind.SIGLENT_SSG for axis in axes)
+                    and not 2 <= total <= 500):
+                raise ValueError("鼎阳原生 LIST 参与时，联合点表必须为 2 至 500 行")
             device_count = len({axis.device_id for axis in axes})
         except (TypeError, ValueError) as exc:
             self.preflight.setText(str(exc))
@@ -500,8 +612,8 @@ class LinkageTaskWindow(QMainWindow):
             return
         mode_note = "最后一轴变化最快" if mode is ScanMode.CARTESIAN else "各轴同序号联动"
         self.preflight.setText(
-            f"预检通过：{device_count} 台 DG · {len(axes)} 个轴 · {total} 个联合点 · "
-            f"每触发 {len(axes)} 条 SCPI · {mode_note}"
+            f"点表通过：{device_count} 台信号源 · {len(axes)} 个轴 · {total} 个联合点 · "
+            f"{mode_note}；启动前按各仪器能力逐点检查"
         )
         self.preflight.setStyleSheet("color:#54d6a3;")
         self.generate_button.setEnabled(True)
@@ -510,7 +622,13 @@ class LinkageTaskWindow(QMainWindow):
         try:
             axes = self._axes()
             mode: ScanMode = self.scan_mode.currentData()
+            self._validate_live_axes(axes)
             points = generate_linkage_points(axes, mode)
+            kinds = {item.id: item.kind for item in self.generators}
+            if (self.ssg_mode.currentData() is SsgLinkageMode.NATIVE_EXTERNAL
+                    and any(kinds[axis.device_id] is DeviceKind.SIGLENT_SSG for axis in axes)
+                    and not 2 <= len(points) <= 500):
+                raise ValueError("鼎阳原生 LIST 参与时，联合点表必须为 2 至 500 行")
         except (TypeError, ValueError) as exc:
             QMessageBox.warning(self, "无法生成联合点表", str(exc))
             return
@@ -551,7 +669,11 @@ class LinkageTaskWindow(QMainWindow):
             self.point_table.setItem(
                 row,
                 len(headers) - 1,
-                QTableWidgetItem("起始点（第一个触发）" if row == 0 else ""),
+                QTableWidgetItem(
+                    ("软件 P0（首个 NI 触发）；鼎阳原生点位未知"
+                     if self.ssg_mode.currentData() is SsgLinkageMode.NATIVE_EXTERNAL
+                     else "起始点（第一个触发）") if row == 0 else ""
+                ),
             )
 
     def _points_from_table(self) -> tuple[LinkagePoint, ...]:
@@ -587,6 +709,8 @@ class LinkageTaskWindow(QMainWindow):
 
     def _build_task(self) -> LinkageTaskRecord:
         points = self._points_from_table()
+        axes = self._axes()
+        current = self._validate_live_axes(axes)
         values = dict(
             name=self.task_name.text(),
             ni_device_id=str(self.ni_source.currentData() or ""),
@@ -595,8 +719,12 @@ class LinkageTaskWindow(QMainWindow):
             rising=self.edge.currentIndex() == 0,
             scan_mode=self.scan_mode.currentData(),
             dispatch_mode=self.dispatch_mode.currentData(),
-            axes=self._axes(),
+            axes=axes,
             points=points,
+            source_kinds=tuple((device_id, current[device_id].kind)
+                               for device_id in dict.fromkeys(axis.device_id for axis in axes)),
+            ssg_mode=self.ssg_mode.currentData(),
+            ssg_dwell_s=self.ssg_dwell.value(),
         )
         if self._current_task_id:
             existing = next(
@@ -664,6 +792,8 @@ class LinkageTaskWindow(QMainWindow):
         self.edge.setCurrentIndex(0 if task.rising else 1)
         self.scan_mode.setCurrentIndex(self.scan_mode.findData(task.scan_mode))
         self.dispatch_mode.setCurrentIndex(self.dispatch_mode.findData(task.dispatch_mode))
+        self.ssg_mode.setCurrentIndex(self.ssg_mode.findData(task.ssg_mode))
+        self.ssg_dwell.setValue(task.ssg_dwell_s)
         for editor in self.axis_editors:
             editor.deleteLater()
         self.axis_editors.clear()
@@ -695,17 +825,21 @@ class LinkageTaskWindow(QMainWindow):
             )
         if current[task.ni_device_id].kind is not DeviceKind.NI_DAQ:
             raise ValueError("保存的 NI 绑定当前已不是 NI 采集卡，请重新选择并保存任务。")
-        invalid_dg = list(
-            dict.fromkeys(
-                current[axis.device_id].name
-                for axis in task.axes
-                if current[axis.device_id].kind is not DeviceKind.DG4000
-            )
-        )
-        if invalid_dg:
+        expected = dict(task.source_kinds) if task.source_kinds else {
+            axis.device_id: DeviceKind.DG4000 for axis in task.axes
+        }
+        invalid = list(dict.fromkeys(
+            current[axis.device_id].name for axis in task.axes
+            if current[axis.device_id].kind is not expected.get(axis.device_id)
+        ))
+        if invalid:
             raise ValueError(
-                "以下保存绑定当前已不是 DG4000：" + "、".join(invalid_dg)
+                "以下保存绑定的信号源类型已改变：" + "、".join(invalid)
+                + "。旧 DG4000 幅度不会自动改为射频功率，请重新选择并保存。"
             )
+        for axis in task.axes:
+            validate_source_axis(axis, current[axis.device_id].kind)
+        self._validate_live_axes(task.axes)
 
     def _new_task(self) -> None:
         if self.controller is not None:
@@ -713,6 +847,8 @@ class LinkageTaskWindow(QMainWindow):
             return
         self._current_task_id = None
         self.task_name.setText("跨设备扫描 1")
+        self.ssg_mode.setCurrentIndex(self.ssg_mode.findData(SsgLinkageMode.SOFTWARE))
+        self.ssg_dwell.setValue(0.01)
         for editor in self.axis_editors:
             editor.deleteLater()
         self.axis_editors.clear()
@@ -753,18 +889,63 @@ class LinkageTaskWindow(QMainWindow):
         missing = [device_id for device_id in ids if device_id not in by_id]
         if missing:
             raise ValueError("任务引用的设备记录已经不存在，请重新选择扫描轴")
+        if by_id[ids[0]].kind is not DeviceKind.NI_DAQ:
+            raise ValueError("触发设备当前已不是 NI 采集卡，请重新选择")
+        original_ni = next((item for item in self.ni_devices if item.id == ids[0]), None)
+        if original_ni is None or original_ni.resource != by_id[ids[0]].resource:
+            raise ValueError("NI 触发设备资源已改变，请重新打开窗口并确认绑定")
+        self._validate_live_axes(axes)
         return tuple(by_id[device_id] for device_id in ids)
 
     def _connect_required_devices(self) -> None:
+        if self.controller is not None or self._call_tasks:
+            return
         try:
             records = self._required_records()
-            for record in records:
-                if not self.connection_manager.is_connected(record):
-                    self.connection_manager.connect(record)
         except Exception as exc:
             QMessageBox.warning(self, "连接失败", str(exc))
             return
-        self.statusBar().showMessage(f"已连接 {len(records)} 台参与设备", 5000)
+        self._connect_cancel.clear()
+        self._connect_error = None
+        self._pending_stop = False
+        def connect_records():
+            for record in records:
+                if self._connect_cancel.is_set():
+                    return
+                if not self.connection_manager.is_connected(record):
+                    self.connection_manager.connect(record)
+        task = CallTask(connect_records)
+        self._connect_task = task
+        self._call_tasks.add(task)
+        self._set_editing_enabled(False)
+        self.connect_button.setText("连接中…")
+        task.signals.failed.connect(lambda message, item=task: self._connect_failed(message, item))
+        task.signals.finished.connect(lambda item=task: self._connect_finished(item, len(records)))
+        try:
+            self.thread_pool.start(task)
+        except Exception as exc:
+            self._connect_failed(f"后台连接任务未能提交：{exc}", task)
+            self._connect_finished(task, len(records))
+
+    def _connect_failed(self, message: str, task: CallTask) -> None:
+        if task is self._connect_task:
+            self._connect_error = message
+
+    def _connect_finished(self, task: CallTask, count: int) -> None:
+        self._call_tasks.discard(task)
+        if task is not self._connect_task:
+            return
+        self._connect_task = None
+        self.connect_button.setText("连接参与设备")
+        error, self._connect_error = self._connect_error, None
+        self._set_editing_enabled(True)
+        if self._pending_stop:
+            self._pending_stop = False
+            self._finish_stopped()
+        elif error:
+            QMessageBox.warning(self, "连接失败", error)
+        else:
+            self.statusBar().showMessage(f"已连接 {count} 台参与设备", 5000)
 
     def _start(self) -> None:
         if self.controller is not None or self._call_tasks:
@@ -781,20 +962,47 @@ class LinkageTaskWindow(QMainWindow):
                 raise ValueError("以下设备尚未连接：" + "、".join(disconnected))
             ni_id = str(self.ni_source.currentData() or "")
             ni_record = next(item for item in records if item.id == ni_id)
-            dg_records = [item for item in records if item.kind is DeviceKind.DG4000]
-            writers = {
-                record.id: self.connection_manager.dg_driver_for(record)
-                for record in dg_records
-            }
+            owner = f"linkage:{self._current_task_id or id(self)}"
+            source_records = [item for item in records if item.kind is not DeviceKind.NI_DAQ]
+            writers = {}
+            native_participants = {}
+            for record in source_records:
+                device_points = tuple(point.grouped()[record.id] for point in points)
+                if record.kind is DeviceKind.DG4000:
+                    writers[record.id] = self.connection_manager.dg_driver_for(record)
+                elif record.kind is DeviceKind.VAUNIX_LMS:
+                    from ..vaunix_linkage import VaunixLinkageWriter
+                    writers[record.id] = VaunixLinkageWriter(
+                        self.connection_manager.vaunix_device_for(record)
+                    )
+                elif record.kind is DeviceKind.SIGLENT_SSG:
+                    from ..siglent_linkage import SsgNativeLinkageParticipant, SsgSoftwareLinkageWriter
+                    session = self.connection_manager.session_for(record)
+                    if self.ssg_mode.currentData() is SsgLinkageMode.NATIVE_EXTERNAL:
+                        if is_virtual_resource(ni_record.resource) and not is_virtual_resource(record.resource):
+                            raise ValueError("鼎阳原生外触发不能使用虚拟 NI 搭配真实鼎阳；请连接公共物理触发源")
+                        if not 2 <= len(points) <= 500:
+                            raise ValueError("鼎阳原生 LIST 参与时，联合点表必须为 2 至 500 行")
+                        native_participants[record.id] = SsgNativeLinkageParticipant(
+                            session, device_points, rising=self.edge.currentIndex() == 0,
+                            dwell_s=self.ssg_dwell.value(),
+                            reconnect_for_stop=lambda record=record: self.connection_manager.connect(
+                                record, owner=owner
+                            ),
+                        )
+                    else:
+                        writers[record.id] = SsgSoftwareLinkageWriter(session, device_points)
+                else:
+                    raise ValueError(f"设备“{record.name}”不能作为跨设备联动信号源")
+            participants = {**writers, **native_participants}
             for point_index, point in enumerate(points, start=1):
                 for device_id, values in point.grouped().items():
                     try:
-                        writers[device_id].validate_step_values(values)
+                        participants[device_id].validate_step_values(values)
                     except ValueError as exc:
                         raise ValueError(
                             f"第 {point_index} 个跨设备联合点：{exc}"
                         ) from exc
-            owner = f"linkage:{self._current_task_id or id(self)}"
             self.connection_manager.acquire_devices(owner, tuple(item.id for item in records))
             self._lease_owner = owner
             counter = self.connection_manager.counter_for(
@@ -809,18 +1017,31 @@ class LinkageTaskWindow(QMainWindow):
                 counter,
                 writers,
                 points,
-                device_order=tuple(record.id for record in dg_records),
+                device_order=tuple(record.id for record in source_records if record.id in writers),
                 dispatch_mode=self.dispatch_mode.currentData(),
                 logger=LinkageRunLogger(log_path),
+                **({"native_participants": native_participants} if native_participants else {}),
             )
-            self.connection_manager.watch_output_task(owner, dg_records, controller)
+            self.connection_manager.watch_output_task(owner, source_records, controller)
             controller.add_callback(self.bridge.begin_session())
             self.controller = controller
-            self._prepare_runtime_table(dg_records)
-            self.log_path.setText(f"运行日志：{log_path}")
+            self._native_participants = native_participants
+            self._native_records = tuple(record for record in source_records if record.id in native_participants)
+            self._prepare_runtime_table(source_records)
+            self.log_path.setText(
+                "原生参与者实际接收未知；仅监测 NI，本任务无软件联合点 CSV"
+                if native_participants and not writers else
+                (f"软件下发日志（不含鼎阳原生接收确认）：{log_path}"
+                 if native_participants else f"运行日志：{log_path}")
+            )
             self._last_error = None
             self._last_logged_applied = 0
             self.run_log.clear()
+            if native_participants:
+                self.run_log.appendPlainText(
+                    "鼎阳按自身 EXT 输入执行原生 LIST；NI 计数只表示公共输入边沿，"
+                    "不能确认鼎阳实际接收、积压或当前点。全部布防完成前请暂停外部触发。"
+                )
             self._set_editing_enabled(False)
             self._pending_stop = False
             self._start_error = None
@@ -858,10 +1079,24 @@ class LinkageTaskWindow(QMainWindow):
         if task is not self._start_task:
             return
         self._start_task = None
+        # Native scans can change output without a software point completing.
+        # Invalidate old optional readback snapshots using memory-only state.
+        for record in self._native_records:
+            self.connection_manager.note_output_change(record)
         self.bridge.flush()
         error, self._start_error = self._start_error, None
-        if error or self._pending_stop:
+        if self._pending_stop:
             self._stop()
+        elif error:
+            if self.controller is not None and not self.controller.is_quiescent:
+                self.start_button.setText("等待停止")
+                self.start_button.setEnabled(False)
+                self.stop_button.setText("重试停止")
+                self.stop_button.setToolTip("显式重试会为待停止的鼎阳原生参与者重连核对身份，仅关闭扫描并确认 OFF；不恢复扫描或参数。")
+                self.stop_button.setEnabled(True)
+                self.run_log.appendPlainText("启动失败且原生扫描停止尚未确认；设备占用保留，请显式重试停止。")
+            else:
+                self._finish_stopped()
         if error:
             QMessageBox.warning(self, "无法启动跨设备联动", error)
 
@@ -870,6 +1105,8 @@ class LinkageTaskWindow(QMainWindow):
             return
         if self._call_tasks:
             self._pending_stop = True
+            if self._connect_task is not None:
+                self._connect_cancel.set()
             if self.controller is not None:
                 self.controller.request_stop()
             self.start_button.setText("正在取消…")
@@ -914,6 +1151,7 @@ class LinkageTaskWindow(QMainWindow):
             self.start_button.setText("等待停止")
             self.start_button.setEnabled(False)
             self.stop_button.setText("重试停止")
+            self.stop_button.setToolTip("显式重试会为待停止的鼎阳原生参与者重连核对身份，仅关闭扫描并确认 OFF；不恢复扫描或参数。")
             self.stop_button.setEnabled(True)
             return
         self._finish_stopped()
@@ -928,13 +1166,22 @@ class LinkageTaskWindow(QMainWindow):
         self.start_button.setText("启动联动")
         self.stop_button.setEnabled(False)
         self.stop_button.setText("停止")
+        self.stop_button.setToolTip("")
+        for device_id in self._native_participants:
+            row = self._runtime_rows.get(device_id)
+            if row:
+                row.status.setText("原生扫描已停止；实际接收/积压/点位未知")
+                row.elapsed.setText("—")
 
     def _prepare_runtime_table(self, records: list[DeviceRecord]) -> None:
         self.device_table.setRowCount(len(records))
         self._runtime_rows.clear()
         for row, record in enumerate(records):
             name = QTableWidgetItem(record.name)
-            status = QTableWidgetItem("等待首个触发")
+            status = QTableWidgetItem(
+                "原生准备中；实际接收/积压/点位未知"
+                if record.id in self._native_participants else "等待首个触发"
+            )
             elapsed = QTableWidgetItem("—")
             for column, item in enumerate((name, status, elapsed)):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -951,11 +1198,16 @@ class LinkageTaskWindow(QMainWindow):
         }
         self.metrics["state"].setText(labels[snapshot.state])
         self.metrics["received"].setText(str(snapshot.received_count))
-        self.metrics["applied"].setText(str(snapshot.applied_count))
-        self.metrics["backlog"].setText(str(snapshot.backlog))
+        native_only = bool(self._native_participants) and not getattr(self.controller, "writers", None)
+        self.metrics["applied"].setText("—" if native_only else str(snapshot.applied_count))
+        self.metrics["backlog"].setText("—" if native_only else str(snapshot.backlog))
         self.metrics["current"].setText(
-            "—" if snapshot.current_index is None else f"P{snapshot.current_index}"
+            "—" if native_only or snapshot.current_index is None else f"P{snapshot.current_index}"
         )
+        if self._native_participants:
+            self.metric_captions["applied"].setText("软件处理（无）" if native_only else "软件已处理点")
+            self.metric_captions["backlog"].setText("软件积压（无）" if native_only else "软件积压")
+            self.metric_captions["current"].setText("软件当前点（无）" if native_only else "软件当前点")
         self.metrics["skew"].setText(
             "—" if not snapshot.device_results else f"{snapshot.skew_ms:.3f} ms"
         )
@@ -964,11 +1216,24 @@ class LinkageTaskWindow(QMainWindow):
             if row:
                 row.status.setText("完成" if result.success else f"失败：{result.error}")
                 row.elapsed.setText(f"{result.elapsed_ms:.3f} ms")
+        for device_id, participant in self._native_participants.items():
+            row = self._runtime_rows.get(device_id)
+            if row is None:
+                continue
+            if snapshot.state is ControllerState.STARTING:
+                prefix = "原生准备中"
+            elif participant.requires_stop:
+                prefix = "原生已布防" if snapshot.state is ControllerState.RUNNING else "原生停止待确认"
+            else:
+                prefix = "原生未启用或已停止"
+            row.status.setText(f"{prefix}；实际接收/积压/点位未知")
+            row.elapsed.setText("—")
         if snapshot.applied_count > self._last_logged_applied:
             self._last_logged_applied = snapshot.applied_count
             self.run_log.appendPlainText(
-                f"触发 {snapshot.applied_count} → P{snapshot.current_index} 完成；"
+                f"NI 触发 {snapshot.applied_count} → 软件 P{snapshot.current_index} 完成；"
                 f"积压 {snapshot.backlog}；设备偏差 {snapshot.skew_ms:.3f} ms"
+                + ("；鼎阳原生实际接收未知" if self._native_participants else "")
             )
         running = snapshot.state in {ControllerState.STARTING, ControllerState.RUNNING}
         if self._stop_task is not None or (self._pending_stop and self._call_tasks):
@@ -993,6 +1258,20 @@ class LinkageTaskWindow(QMainWindow):
         if record is None or not is_virtual_resource(record.resource):
             QMessageBox.information(self, "不是虚拟 NI", "当前 NI 触发源不是内置虚拟设备。")
             return
+        if self.controller is not None and self.controller.snapshot().state is ControllerState.RUNNING:
+            for device_id, participant in self._native_participants.items():
+                source = next((item for item in self.generators if item.id == device_id), None)
+                if source is None or not is_virtual_resource(source.resource):
+                    QMessageBox.information(self, "无法模拟公共触发", "虚拟公共触发只适用于全部为内置模拟器的原生参与者。")
+                    return
+            try:
+                for participant in self._native_participants.values():
+                    # Simulate shared wiring only. Burst edges are not delayed
+                    # or replayed to make a native scan appear to accept them.
+                    participant.emit_virtual_trigger(count)
+            except Exception as exc:
+                QMessageBox.warning(self, "虚拟触发失败", str(exc))
+                return
         self.connection_manager.virtual_lab.emit_trigger(record.resource, count)
 
     def _set_editing_enabled(self, enabled: bool) -> None:
@@ -1009,6 +1288,9 @@ class LinkageTaskWindow(QMainWindow):
             self.edge,
             self.scan_mode,
             self.dispatch_mode,
+            self.ssg_mode,
+            self.ssg_dwell,
+            self.connect_button,
             self.add_axis_button,
             self.generate_button,
         ):
@@ -1023,6 +1305,8 @@ class LinkageTaskWindow(QMainWindow):
             else QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.start_button.setEnabled(enabled)
+        self.ni_source.setEnabled(enabled and bool(self.ni_devices))
+        self.ssg_dwell.setEnabled(enabled and self.ssg_mode.currentData() is SsgLinkageMode.NATIVE_EXTERNAL)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._call_tasks or (self.controller is not None and not self.controller.is_quiescent):

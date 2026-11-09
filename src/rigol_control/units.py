@@ -31,6 +31,7 @@ UNIT_FAMILIES: dict[str, tuple[UnitSpec, ...]] = {
         UnitSpec("Vpp", "Vpp", 1.0),
         UnitSpec("mVpp", "mVpp", 0.001),
     ),
+    "power_dbm": (UnitSpec("dBm", "dBm", 1.0),),
     "voltage": (
         UnitSpec("V", "V", 1.0),
         UnitSpec("mV", "mV", 0.001),

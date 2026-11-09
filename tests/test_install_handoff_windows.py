@@ -102,9 +102,31 @@ class OwnedWindowsProcess:
             self.handle = None
 
 
-def run_case(fixture_root, compiled):
+class StatusFileReadLock:
+    """A reader that permits other readers but briefly denies write/delete."""
+    def __init__(self, path):
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel.CreateFileW.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        self.kernel.CreateFileW.restype = wintypes.HANDLE
+        self.kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self.handle = self.kernel.CreateFileW(
+            str(path), 0x80000000, 0x00000001, None, 3, 0x00000080, None,
+        )
+        if self.handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self):
+        if self.handle is not None:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
+
+
+def run_case(fixture_root, compiled, *, status_read_lock=False):
     commit = True
-    case = fixture_root / 'positive'
+    case = fixture_root / ('sharing-lock' if status_read_lock else 'positive')
     data = case / "用户 data O'Brien & {保留}"
     program = case / "程序 O'Brien & {安装}"
     data.mkdir(parents=True)
@@ -133,6 +155,7 @@ def run_case(fixture_root, compiled):
     save(config_path, config)
     helper = None
     actual_parent = None
+    status_lock = None
     child_environment = dict(os.environ)
     child_environment.pop("PSModulePath", None)
     with (case / "dummy-parent.log").open("w", encoding="utf-8") as parent_log:
@@ -173,8 +196,28 @@ def run_case(fixture_root, compiled):
             assert parent.poll() is None and actual_parent.exit_code() is None and helper.exit_code() is None
             assert not installer_receipt.exists() and not application_receipt.exists()
             assert json.loads(status_file.read_text(encoding="utf-8-sig"))["phase"] == "waiting-parent"
+            if status_read_lock:
+                status_lock = StatusFileReadLock(status_file)
             Path(config["release"]).write_text("normal exit allowed", encoding="utf-8")
             assert parent.wait(timeout=10) == 0
+            if status_read_lock:
+                # The real publisher has a complete temporary JSON while the
+                # destination is locked. Release only after it reaches that
+                # point; no timing guess or lower polling rate hides the race.
+                def publication_pending():
+                    for candidate in status_file.parent.glob(status_file.name + ".*.tmp"):
+                        try:
+                            pending = json.loads(candidate.read_text(encoding="utf-8-sig"))
+                        except (OSError, ValueError):
+                            continue
+                        if pending["phase"] == "installing":
+                            return True
+                    return False
+                wait_until(publication_pending, timeout=4)
+                assert json.loads(status_file.read_text(encoding="utf-8-sig"))["phase"] == "waiting-parent"
+                assert not installer_receipt.exists(), "Installer ran before status publication succeeded"
+                status_lock.close()
+                status_lock = None
             def complete():
                 if status_file.exists():
                     try:
@@ -197,6 +240,9 @@ def run_case(fixture_root, compiled):
                                             "/LOG=" + ticket["install_log"]]
             assert install_call["args"] == expected_installer_arguments, install_call["args"]
             assert app_call["args"] == ["--data-dir", str(data)], app_call["args"]
+            installer_calls = len(Path(str(installer_receipt) + ".calls").read_text().splitlines())
+            application_calls = len(Path(str(application_receipt) + ".calls").read_text().splitlines())
+            assert installer_calls == application_calls == 1, "An action was replayed after a status-write failure"
             assert sentinel.read_bytes() == sentinel_bytes
             assert hashlib.sha256(installer.read_bytes()).hexdigest() == digest
             return {"success": True, "parent_exit_code": 0, "helper_exit_code": 0, "phase": state["phase"],
@@ -205,8 +251,12 @@ def run_case(fixture_root, compiled):
                     "installer_arguments": install_call["args"], "application_arguments": app_call["args"],
                     "no_autorun_and_no_restart": True, "restarted_application_with_data_dir": True,
                     "fixture_user_bytes_preserved": True, "installer_sha256_verified": digest,
-                    "installer_bytes": installer.stat().st_size, "fixture_root": str(case)}
+                    "installer_bytes": installer.stat().st_size, "fixture_root": str(case),
+                    "sharing_lock_released_after_pending_publication": status_read_lock,
+                    "installer_calls": installer_calls, "application_calls": application_calls}
         finally:
+            if status_lock is not None:
+                status_lock.close()
             if helper is not None:
                 helper.close()
             if actual_parent is not None:
@@ -221,12 +271,12 @@ def run_case(fixture_root, compiled):
 
 
 
-CSHARP_FIXTURE = 'using System;\nusing System.Collections.Generic;\nusing System.Diagnostics;\nusing System.IO;\nusing System.Reflection;\nusing System.Text;\nusing System.Web.Script.Serialization;\npublic static class InertFixture {\n  [STAThread] public static int Main(string[] args) {\n    string executable = Assembly.GetExecutingAssembly().Location;\n    string role = Path.GetFileName(executable).StartsWith("Lab-Control-Center-") ? "installer" : "application";\n    string receipt = Path.Combine(Path.GetDirectoryName(executable), role + "-arguments.json");\n    var value = new Dictionary<string, object>();\n    value["kind"] = role; value["args"] = args; value["executable"] = executable;\n    value["pid"] = Process.GetCurrentProcess().Id; value["utc"] = DateTime.UtcNow.ToString("o");\n    File.WriteAllText(receipt + ".tmp", new JavaScriptSerializer().Serialize(value), new UTF8Encoding(false));\n    File.Move(receipt + ".tmp", receipt);\n    return 0;\n  }\n}\n'
+CSHARP_FIXTURE = 'using System;\nusing System.Collections.Generic;\nusing System.Diagnostics;\nusing System.IO;\nusing System.Reflection;\nusing System.Text;\nusing System.Web.Script.Serialization;\npublic static class InertFixture {\n  [STAThread] public static int Main(string[] args) {\n    string executable = Assembly.GetExecutingAssembly().Location;\n    string role = Path.GetFileName(executable).StartsWith("Lab-Control-Center-") ? "installer" : "application";\n    string receipt = Path.Combine(Path.GetDirectoryName(executable), role + "-arguments.json");\n    var value = new Dictionary<string, object>();\n    value["kind"] = role; value["args"] = args; value["executable"] = executable;\n    value["pid"] = Process.GetCurrentProcess().Id; value["utc"] = DateTime.UtcNow.ToString("o");\n    File.AppendAllText(receipt + ".calls", Process.GetCurrentProcess().Id.ToString() + Environment.NewLine, new UTF8Encoding(false));\n    File.WriteAllText(receipt + ".tmp", new JavaScriptSerializer().Serialize(value), new UTF8Encoding(false));\n    File.Move(receipt + ".tmp", receipt);\n    return 0;\n  }\n}\n'
 
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell 5 acceptance requires Windows")
 class NativeInstallerHandoffTests(unittest.TestCase):
-    def test_committed_handoff_waits_for_parent_and_preserves_literal_arguments(self):
+    def run_fixture(self, *, status_read_lock=False):
         framework = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Microsoft.NET/Framework64/v4.0.30319"
         compiler, reference = framework / "csc.exe", framework / "System.Web.Extensions.dll"
         if not compiler.is_file() or not reference.is_file():
@@ -240,15 +290,72 @@ class NativeInstallerHandoffTests(unittest.TestCase):
                             "/reference:" + str(reference), "/out:" + str(executable), str(code)],
                            cwd=fixture, check=True, creationflags=CREATE_NO_WINDOW,
                            capture_output=True, text=True)
-            result = run_case(fixture, executable)
-            self.assertTrue(result["success"])
-            self.assertTrue(result["confirmed_but_live_parent_did_not_execute"])
-            self.assertTrue(result["original_data_argument_preserved"])
-            self.assertTrue(result["original_install_argument_preserved"])
-            self.assertTrue(result["no_autorun_and_no_restart"])
-            self.assertTrue(result["restarted_application_with_data_dir"])
-            self.assertTrue(result["fixture_user_bytes_preserved"])
-            self.assertEqual(result["helper_exit_code"], 0)
+            return run_case(fixture, executable, status_read_lock=status_read_lock)
+
+    def test_committed_handoff_waits_for_parent_and_preserves_literal_arguments(self):
+        result = self.run_fixture()
+        self.assertTrue(result["success"])
+        self.assertTrue(result["confirmed_but_live_parent_did_not_execute"])
+        self.assertTrue(result["original_data_argument_preserved"])
+        self.assertTrue(result["original_install_argument_preserved"])
+        self.assertTrue(result["no_autorun_and_no_restart"])
+        self.assertTrue(result["restarted_application_with_data_dir"])
+        self.assertTrue(result["fixture_user_bytes_preserved"])
+        self.assertEqual(result["helper_exit_code"], 0)
+
+    def test_status_reader_lock_retries_publication_without_replaying_actions(self):
+        result = self.run_fixture(status_read_lock=True)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["sharing_lock_released_after_pending_publication"])
+        self.assertEqual(result["installer_calls"], 1)
+        self.assertEqual(result["application_calls"], 1)
+
+    def test_status_nonsharing_io_error_fails_without_a_retry_delay(self):
+        with tempfile.TemporaryDirectory(prefix="handoff-status-error-") as temporary:
+            fixture = Path(temporary)
+            target = fixture / "status-is-a-directory"
+            target.mkdir()
+            script = fixture / "state-function-only.ps1"
+            report = fixture / "result.json"
+            # Extract just the committed function. The production ticket,
+            # installer and application-launch paths are never executed here.
+            script.write_text(r'''
+param([string]$Source, [string]$Status, [string]$ResultPath)
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$sourceText = Get-Content -LiteralPath $Source -Raw -Encoding UTF8
+$tree = [Management.Automation.Language.Parser]::ParseInput($sourceText, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Committed helper has parse errors' }
+$definition = $tree.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-State'}, $true)
+if (-not $definition) { throw 'Missing committed state publisher' }
+. ([ScriptBlock]::Create($definition.Extent.Text))
+$handoff = @{status_file=$Status}
+$stateReport = @{failed=$false}
+$measure = [Diagnostics.Stopwatch]::StartNew()
+try { Write-State 'waiting-parent' 'inert status-only fixture' }
+catch {
+    $cause = $_.Exception
+    while ($cause.InnerException) { $cause = $cause.InnerException }
+    $stateReport.failed = $true
+    $stateReport.native_code = $cause.HResult -band 0xFFFF
+    $stateReport.exception = $cause.GetType().FullName
+}
+$stateReport.elapsed_ms = $measure.ElapsedMilliseconds
+[IO.File]::WriteAllText($ResultPath, ($stateReport | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+''', encoding="utf-8-sig")
+            process = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-File", str(script), "-Source", str(ROOT / "src/rigol_control/assets/apply_update.ps1"),
+                 "-Status", str(target), "-ResultPath", str(report)],
+                creationflags=CREATE_NO_WINDOW, capture_output=True, text=True,
+            )
+            self.assertEqual(process.returncode, 0, process.stderr)
+            result = json.loads(report.read_text(encoding="utf-8"))
+            self.assertTrue(result["failed"])
+            self.assertNotIn(result["native_code"], (32, 33))
+            self.assertLess(result["elapsed_ms"], 2500, result)
+            self.assertFalse(list(fixture.glob(target.name + ".*.tmp")))
 
 
 if __name__ == "__main__":

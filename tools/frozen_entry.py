@@ -229,6 +229,229 @@ def _check_visa_session_lifetime() -> dict:
     }
 
 
+def _check_multi_source_linkage() -> dict:
+    """Run actual multi-source writers against isolated, in-memory instruments."""
+    from unittest.mock import patch
+    from rigol_control.connections import DeviceBusyError, DeviceConnectionManager
+    from rigol_control.drivers.dg4000 import StepParameter
+    from rigol_control.drivers.scpi import ScpiError
+    from rigol_control.drivers.siglent_ssg import VirtualSsgBackend
+    from rigol_control.linkage import LinkageAxis, LinkagePoint, MultiDeviceTriggerController, generate_linkage_points
+    from rigol_control.linkage_parameters import LinkageParameter
+    from rigol_control.models import DeviceKind, DeviceRecord
+    from rigol_control.scan import ScanMode
+    from rigol_control.siglent_linkage import SsgNativeLinkageParticipant, SsgSoftwareLinkageWriter
+    from rigol_control.vaunix_linkage import VaunixLinkageWriter
+    from rigol_control.virtual_lab import VirtualLab
+
+    def require(condition, message):
+        if not condition:
+            raise AssertionError(message)
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 3
+        while not predicate():
+            if time.monotonic() >= deadline:
+                raise AssertionError("Mixed linkage virtual controller did not finish its expected edges")
+            time.sleep(.002)
+
+    lab = VirtualLab()
+    connections = DeviceConnectionManager(virtual_lab=lab)
+    sources = (
+        DeviceRecord.create(kind=DeviceKind.DG4000, name="Bundle DG", resource="SIM::DG4000::BUNDLE-LINKAGE"),
+        DeviceRecord.create(kind=DeviceKind.VAUNIX_LMS, name="Bundle Vaunix", resource="SIM::VAUNIX_LMS::BUNDLE-LINKAGE"),
+        DeviceRecord.create(kind=DeviceKind.SIGLENT_SSG, name="Bundle SSG", resource="SIM::SIGLENT_SSG::BUNDLE-LINKAGE"),
+    )
+    ni = DeviceRecord.create(kind=DeviceKind.NI_DAQ, name="Bundle NI", resource="SIM::NI_DAQ::BUNDLE-LINKAGE")
+    dg_record, vaunix_record, ssg_record = sources
+    controllers, owners = [], []
+    with patch("pyvisa.ResourceManager", side_effect=AssertionError("Physical VISA used by mixed linkage")), \
+            patch("rigol_control.connections.VaunixLmsDevice",
+                  side_effect=AssertionError("Physical Vaunix used by mixed linkage")), \
+            patch("rigol_control.connections.NIDaqEdgeCounter",
+                  side_effect=AssertionError("Physical NI counter used by mixed linkage")), \
+            patch("nidaqmx.system.System.local", side_effect=AssertionError("Physical NI probed by mixed linkage")):
+        try:
+            for record in (*sources, ni):
+                connections.connect(record)
+            lab.set_scpi_delay(dg_record.resource, 0)
+            dg = connections.dg_driver_for(dg_record)
+            vaunix = connections.vaunix_device_for(vaunix_record)
+            vaunix.command_delay_ms = 0
+            ssg_session = connections.session_for(ssg_record)
+            backend = ssg_session._backend
+            require(isinstance(backend, VirtualSsgBackend), "Mixed linkage did not use the virtual SSG")
+            initial_ch1 = lab.generator_snapshot(dg_record.resource).channels[0]
+            axes = (
+                LinkageAxis(dg_record.id, StepParameter.FREQUENCY, 2, "kHz", 1.234, 1, 2),
+                LinkageAxis(vaunix_record.id, StepParameter.FREQUENCY, 1, "GHz", 5, .1, 2),
+                LinkageAxis(vaunix_record.id, LinkageParameter.RF_POWER, 1, "dBm", -10, .5, 2),
+                LinkageAxis(ssg_record.id, StepParameter.FREQUENCY, 1, "GHz", 1.5, .1, 2),
+                LinkageAxis(ssg_record.id, LinkageParameter.RF_POWER, 1, "dBm", -20, .5, 2),
+            )
+
+            def outputs():
+                return (lab.generator_snapshot(dg_record.resource).channels,
+                        vaunix.frequency_hz, vaunix.power_dbm, vaunix.rf_on,
+                        backend.get("FREQuency"), backend.get("POWer"),
+                        backend.get("OUTPut"), backend.get("OUTPut:MODulation"))
+
+            def check_software_point(point, include_ssg=True):
+                mapped = {(item.device_id, item.parameter): item.value for item in point.values}
+                snapshot = lab.generator_snapshot(dg_record.resource)
+                require(snapshot.channels[0] == initial_ch1, "Mixed linkage modified DG CH1 while controlling CH2")
+                require(snapshot.channels[1].frequency_hz == mapped[dg_record.id, StepParameter.FREQUENCY],
+                        "Mixed linkage applied the wrong DG frequency")
+                require(vaunix.frequency_hz == mapped[vaunix_record.id, StepParameter.FREQUENCY]
+                        and vaunix.power_dbm == mapped[vaunix_record.id, LinkageParameter.RF_POWER],
+                        "Mixed linkage changed Vaunix frequency or absolute dBm semantics")
+                if include_ssg:
+                    require(float(backend.get("FREQuency")) == mapped[ssg_record.id, StepParameter.FREQUENCY]
+                            and float(backend.get("POWer")) == mapped[ssg_record.id, LinkageParameter.RF_POWER],
+                            "Mixed linkage changed SSG frequency or dBm semantics")
+
+            def attach(controller, owner, records=sources):
+                connections.acquire_devices(owner, tuple(record.id for record in (*records, ni)))
+                connections.watch_output_task(owner, records, controller)
+                controllers.append(controller)
+                owners.append(owner)
+
+            for mode in (ScanMode.SYNCHRONOUS, ScanMode.CARTESIAN):
+                points = generate_linkage_points(axes, mode)
+                writers = {
+                    dg_record.id: dg,
+                    vaunix_record.id: VaunixLinkageWriter(vaunix),
+                    ssg_record.id: SsgSoftwareLinkageWriter(
+                        ssg_session, tuple(point.grouped()[ssg_record.id] for point in points)),
+                }
+                for point in points:
+                    for device_id, values in point.grouped().items():
+                        writers[device_id].validate_step_values(values)
+                controller = MultiDeviceTriggerController(connections.counter_for(ni), writers, points,
+                    device_order=tuple(record.id for record in sources))
+                owner = "bundle-mixed-software-" + mode.value
+                attach(controller, owner)
+                before = outputs()
+                controller.start()
+                require(outputs() == before and controller.snapshot().applied_count == 0,
+                        "Arming mixed software linkage changed an output before the first edge")
+                lab.emit_trigger(ni.resource)
+                wait_for(lambda: controller.snapshot().applied_count == 1)
+                check_software_point(points[0])
+                lab.emit_trigger(ni.resource, len(points) - 1)
+                wait_for(lambda: controller.snapshot().applied_count == len(points))
+                check_software_point(points[-1])
+                lab.emit_trigger(ni.resource)
+                wait_for(lambda: controller.snapshot().applied_count == len(points) + 1)
+                check_software_point(points[0])
+                require(controller.snapshot().backlog == 0
+                        and backend.get("SWEep:STATe") == "OFF",
+                        "Mixed software linkage lost an edge or enabled an SSG native sweep")
+                controller.stop()
+                connections.release_devices(owner)
+
+            points = generate_linkage_points(axes, ScanMode.CARTESIAN)
+            native_values = tuple(point.grouped()[ssg_record.id] for point in points)
+            participant = SsgNativeLinkageParticipant(ssg_session, native_values, rising=False, dwell_s=.01)
+            preparation_checked = []
+            original_prepare = participant.prepare
+            def checked_prepare():
+                original_prepare()
+                require(backend.get("SWEep:STATe") == "OFF", "Native LIST preload armed the instrument")
+                require(backend.get("SWEep:TYPE") == "LIST"
+                        and backend.get("SWEep:POINt:TRIGger:TYPE") == "EXT"
+                        and backend.get("SWEep:SWEep:TRIGger:TYPE") == "AUTO"
+                        and backend.get("INPut:TRIGger:SLOPe") == "NEGATIVE",
+                        "Native linkage did not configure the requested external point trigger")
+                expected = [(values[0].value, values[1].value, .01) for values in native_values]
+                require([(point.frequency_hz, point.power_dbm, point.dwell_s) for point in backend.table] == expected
+                        and len(backend.table) == 32,
+                        "Native LIST did not preserve the full Cartesian joint-table expansion")
+                preparation_checked.append(True)
+            participant.prepare = checked_prepare
+            controller = MultiDeviceTriggerController(connections.counter_for(ni),
+                {dg_record.id: dg, vaunix_record.id: VaunixLinkageWriter(vaunix)}, points,
+                device_order=(dg_record.id, vaunix_record.id),
+                native_participants={ssg_record.id: participant})
+            owner = "bundle-mixed-native"
+            attach(controller, owner)
+            controller.start()
+            require(preparation_checked == [True] and participant.requires_stop,
+                    "Native participant was not prepared and armed once")
+            commands = list(backend.commands)
+            lab.emit_trigger(ni.resource, 3)
+            wait_for(lambda: controller.snapshot().applied_count == 3)
+            require(backend.commands == commands and "*TRG" not in commands,
+                    "NI software edges wrote per-point parameters or sent a bus trigger to native SSG")
+            require(ssg_record.id not in {item.device_id for item in controller.snapshot().device_results},
+                    "Software completion incorrectly reported native SSG trigger acceptance")
+            original_write = ssg_session.write
+            attempts = []
+            def fail_off(command, *args, **kwargs):
+                if command.strip().upper() == ":SWEEP:STATE OFF":
+                    attempts.append(command)
+                    raise ScpiError("BUNDLE_NATIVE_OFF_NOT_CONFIRMED")
+                return original_write(command, *args, **kwargs)
+            with patch.object(ssg_session, "write", side_effect=fail_off):
+                try:
+                    controller.stop()
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("Native stop failure was accepted as a successful stop")
+                require(not controller.is_quiescent and participant.requires_stop and len(attempts) == 1,
+                        "Failed native stop lost its pending state or was automatically replayed")
+                try:
+                    connections.release_devices(owner)
+                except DeviceBusyError:
+                    pass
+                else:
+                    raise AssertionError("Failed native stop released the instrument lease")
+                require(all(connections.lease_owner(record.id) == owner for record in (*sources, ni)),
+                        "Failed native stop did not retain every participating device lease")
+            controller.stop()
+            require(controller.is_quiescent and not participant.requires_stop
+                    and backend.get("SWEep:STATe") == "OFF", "Explicit retry failed to confirm native OFF")
+            connections.release_devices(owner)
+
+            # NI receives its own edges. Native-only linkage must not invent an
+            # accepted count or current point from those independent counts.
+            native_points = tuple(LinkagePoint(tuple(value for value in point.values
+                                  if value.device_id == ssg_record.id)) for point in points)
+            participant = SsgNativeLinkageParticipant(ssg_session, native_values)
+            controller = MultiDeviceTriggerController(connections.counter_for(ni), {}, native_points,
+                native_participants={ssg_record.id: participant})
+            owner = "bundle-native-only"
+            attach(controller, owner, (ssg_record,))
+            controller.start()
+            commands = list(backend.commands)
+            lab.emit_trigger(ni.resource, 3)
+            wait_for(lambda: controller.snapshot().received_count == 3)
+            snapshot = controller.snapshot()
+            require(snapshot.applied_count == 0 and snapshot.current_index is None
+                    and not snapshot.device_results and backend.commands == commands,
+                    "Native-only linkage inferred accepted triggers or a current point from NI input")
+            controller.stop()
+            connections.release_devices(owner)
+        finally:
+            for controller in reversed(controllers):
+                controller.stop()
+            for owner in owners:
+                connections.release_devices(owner)
+            connections.close_all()
+        require(not connections.active_leases()
+                and not any(connections.is_connected(record) for record in (*sources, ni)),
+                "Mixed linkage acceptance left an active lease or open virtual connection")
+    return {
+        "software_three_source_synchronous": True, "software_three_source_cartesian": True,
+        "no_parameter_write_before_first_edge": True, "first_p0_and_ch1_preserved": True,
+        "frequency_and_absolute_dbm_preserved": True, "native_expanded_list_preloaded_off": True,
+        "native_ext_configuration_verified": True, "native_no_per_edge_scpi_or_bus_trigger": True,
+        "native_acceptance_not_inferred_from_ni": True, "failed_native_stop_retains_all_leases": True,
+        "explicit_stop_retry_releases_and_closes": True, "hardware_access": False,
+    }
+
+
 def _bundle_self_test(report_path: Path) -> int:
     """Check the bundled interpreter, dependencies and six virtual UI windows.
 
@@ -1915,6 +2138,7 @@ def _bundle_self_test(report_path: Path) -> int:
             "hardware_access": False,
         }
         report["visa_session_lifetime"] = _check_visa_session_lifetime()
+        report["multi_source_linkage"] = _check_multi_source_linkage()
         if home.connection_manager.active_leases():
             raise AssertionError("Virtual windows retained an unexpected device operation lease")
         if not home.close():
